@@ -1,6 +1,10 @@
+pub mod error;
+
 use std::future::Future;
 
-use crate::{AssistantMessage, Conversation, ProviderError};
+pub use error::ProviderError;
+
+use crate::{AssistantMessage, Conversation};
 
 pub trait Provider {
     fn complete(
