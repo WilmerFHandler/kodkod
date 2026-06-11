@@ -1,4 +1,4 @@
-use crate::{AssistantMessage, Message, SystemMessage, UserMessage};
+use crate::{AssistantMessage, Message, SystemMessage, ToolResult, UserMessage};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Conversation {
@@ -39,5 +39,9 @@ impl Conversation {
     pub fn push_system_message(&mut self, content: impl Into<String>) {
         self.messages
             .push(Message::System(SystemMessage::new(content)));
+    }
+
+    pub fn push_tool_result(&mut self, result: ToolResult) {
+        self.messages.push(Message::ToolResult(result));
     }
 }
