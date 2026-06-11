@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{ToolCall, ToolResult};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserMessage {
     content: String,
 }
@@ -17,7 +19,7 @@ impl UserMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantMessage {
     content: String,
     tool_calls: Vec<ToolCall>,
@@ -45,7 +47,7 @@ impl AssistantMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemMessage {
     content: String,
 }
@@ -62,10 +64,15 @@ impl SystemMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "role")]
 pub enum Message {
+    #[serde(rename = "system")]
     System(SystemMessage),
+    #[serde(rename = "user")]
     User(UserMessage),
+    #[serde(rename = "assistant")]
     Assistant(AssistantMessage),
+    #[serde(rename = "tool")]
     ToolResult(ToolResult),
 }

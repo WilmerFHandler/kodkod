@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{AssistantMessage, Message, SystemMessage, ToolResult, UserMessage};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conversation {
     system_prompt: Option<String>,
     messages: Vec<Message>,

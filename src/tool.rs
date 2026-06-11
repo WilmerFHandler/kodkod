@@ -12,7 +12,7 @@ use serde_json::Value;
 pub use call::ToolCall;
 pub use error::{ToolError, ToolExecutorError};
 pub use executor::ToolExecutor;
-pub use result::ToolResult;
+pub use result::{ToolResult, ToolResultOutcome};
 pub use spec::ToolSpec;
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + 'a>>;

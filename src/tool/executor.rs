@@ -33,17 +33,15 @@ impl ToolExecutor {
 
     pub async fn execute(&self, call: &ToolCall) -> ToolResult {
         let Some(tool) = self.tools.get(call.name()) else {
-            return ToolResult::error(
+            return ToolResult::failure(
                 call.id(),
                 ToolExecutorError::UnknownTool(call.name().to_owned()),
             );
         };
 
-        let result = tool
-            .execute(call.arguments())
-            .await
-            .map_err(ToolExecutorError::Tool);
-
-        ToolResult::new(call.id(), result)
+        match tool.execute(call.arguments()).await {
+            Ok(value) => ToolResult::success(call.id(), value),
+            Err(error) => ToolResult::failure(call.id(), ToolExecutorError::Tool(error)),
+        }
     }
 }

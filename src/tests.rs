@@ -9,7 +9,8 @@ use serde_json::{Value, json};
 
 use crate::{
     Agent, AgentError, AssistantMessage, Conversation, Message, Provider, ProviderError, Tool,
-    ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolResult, ToolSpec,
+    ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolResult,
+    ToolResultOutcome, ToolSpec, UserMessage,
 };
 
 struct EchoProvider;
@@ -203,7 +204,7 @@ fn agent_executes_tool_calls_until_final_response() {
     ));
     assert!(matches!(
         &conversation.messages()[2],
-        Message::ToolResult(result) if result.result() == &Ok(json!({ "value": "hello" }))
+        Message::ToolResult(result) if result.value() == Some(&json!({ "value": "hello" }))
     ));
     assert!(matches!(
         &conversation.messages()[3],
@@ -255,7 +256,10 @@ fn tool_executor_registers_and_executes_tools() {
     let result = block_on(executor.execute(&call));
 
     assert_eq!(result.tool_call_id(), "call_1");
-    assert_eq!(result.result(), &Ok(json!({ "value": "hello" })));
+    assert_eq!(
+        result.outcome(),
+        &ToolResultOutcome::Success(json!({ "value": "hello" }))
+    );
     assert!(executor.has_tool("echo"));
     assert_eq!(executor.specs()[0].name(), "echo");
 }
@@ -269,8 +273,8 @@ fn tool_executor_reports_unknown_tools() {
 
     assert_eq!(result.tool_call_id(), "call_1");
     assert_eq!(
-        result.result(),
-        &Err(ToolExecutorError::UnknownTool("missing".to_owned()))
+        result.outcome(),
+        &ToolResultOutcome::Error(ToolExecutorError::UnknownTool("missing".to_owned()))
     );
 }
 
@@ -284,8 +288,101 @@ fn tool_executor_wraps_tool_failures() {
 
     assert_eq!(result.tool_call_id(), "call_1");
     assert_eq!(
-        result.result(),
-        &Err(ToolExecutorError::Tool(ToolError::new("boom")))
+        result.outcome(),
+        &ToolResultOutcome::Error(ToolExecutorError::Tool(ToolError::new("boom")))
+    );
+}
+
+#[test]
+fn conversation_round_trips_through_json() {
+    let mut conversation = Conversation::new().with_system_prompt("Be concise.");
+    conversation.push_user_message("hello");
+    conversation.push_assistant_message(AssistantMessage::new("").with_tool_calls(vec![
+        ToolCall::new("call_1", "echo", json!({ "value": "hello" })),
+    ]));
+    conversation.push_tool_result(ToolResult::success("call_1", json!({ "value": "hello" })));
+    conversation.push_assistant_message(AssistantMessage::new("done"));
+
+    let encoded = serde_json::to_string(&conversation).unwrap();
+    let decoded: Conversation = serde_json::from_str(&encoded).unwrap();
+
+    assert_eq!(decoded, conversation);
+}
+
+#[test]
+fn messages_serialize_as_role_tagged_objects() {
+    assert_eq!(
+        serde_json::to_value(Message::User(UserMessage::new("hello"))).unwrap(),
+        json!({
+            "role": "user",
+            "content": "hello"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(Message::Assistant(AssistantMessage::new("hi"))).unwrap(),
+        json!({
+            "role": "assistant",
+            "content": "hi",
+            "tool_calls": []
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(Message::ToolResult(ToolResult::success(
+            "call_1",
+            json!({ "value": "hello" })
+        )))
+        .unwrap(),
+        json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "outcome": {
+                "type": "success",
+                "value": { "value": "hello" }
+            }
+        })
+    );
+}
+
+#[test]
+fn tool_spec_round_trips_through_json() {
+    let spec = EchoTool.spec();
+
+    let encoded = serde_json::to_string(&spec).unwrap();
+    let decoded: ToolSpec = serde_json::from_str(&encoded).unwrap();
+
+    assert_eq!(decoded, spec);
+}
+
+#[test]
+fn tool_result_outcomes_serialize_with_explicit_shape() {
+    let success = ToolResult::success("call_1", json!({ "value": "hello" }));
+    let error = ToolResult::failure(
+        "call_2",
+        ToolExecutorError::UnknownTool("missing".to_owned()),
+    );
+
+    assert_eq!(
+        serde_json::to_value(&success).unwrap(),
+        json!({
+            "tool_call_id": "call_1",
+            "outcome": {
+                "type": "success",
+                "value": { "value": "hello" }
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(&error).unwrap(),
+        json!({
+            "tool_call_id": "call_2",
+            "outcome": {
+                "type": "error",
+                "value": {
+                    "type": "unknown_tool",
+                    "value": "missing"
+                }
+            }
+        })
     );
 }
 

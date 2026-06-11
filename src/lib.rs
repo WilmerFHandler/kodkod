@@ -9,7 +9,8 @@ pub use conversation::Conversation;
 pub use message::{AssistantMessage, Message, SystemMessage, UserMessage};
 pub use provider::{Provider, ProviderError};
 pub use tool::{
-    Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolResult, ToolSpec,
+    Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolResult,
+    ToolResultOutcome, ToolSpec,
 };
 
 #[cfg(test)]

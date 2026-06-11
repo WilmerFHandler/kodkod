@@ -1,6 +1,8 @@
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolError {
     message: String,
 }
@@ -25,9 +27,12 @@ impl fmt::Display for ToolError {
 
 impl std::error::Error for ToolError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value")]
 pub enum ToolExecutorError {
+    #[serde(rename = "unknown_tool")]
     UnknownTool(String),
+    #[serde(rename = "tool")]
     Tool(ToolError),
 }
 
