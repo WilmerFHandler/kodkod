@@ -4,7 +4,7 @@ pub mod message;
 pub mod provider;
 pub mod tool;
 
-pub use agent::Agent;
+pub use agent::{Agent, AgentError};
 pub use conversation::Conversation;
 pub use message::{AssistantMessage, Message, SystemMessage, UserMessage};
 pub use provider::{Provider, ProviderError};

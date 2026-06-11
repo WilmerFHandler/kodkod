@@ -1,13 +1,15 @@
 use std::future::{Future, ready};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use serde_json::{Value, json};
 
 use crate::{
-    Agent, AssistantMessage, Conversation, Message, Provider, ProviderError, Tool, ToolCall,
-    ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolResult, ToolSpec,
+    Agent, AgentError, AssistantMessage, Conversation, Message, Provider, ProviderError, Tool,
+    ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolResult, ToolSpec,
 };
 
 struct EchoProvider;
@@ -16,6 +18,7 @@ impl Provider for EchoProvider {
     fn complete(
         &self,
         conversation: &Conversation,
+        _tools: &[ToolSpec],
     ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
         let prompt = conversation.messages().iter().rev().find_map(|message| {
             if let Message::User(message) = message {
@@ -28,6 +31,72 @@ impl Provider for EchoProvider {
         ready(Ok(AssistantMessage::new(
             prompt.unwrap_or_else(|| "no prompt".to_owned()),
         )))
+    }
+}
+
+#[derive(Default)]
+struct RecordingProvider {
+    seen_tool_names: Arc<Mutex<Vec<String>>>,
+}
+
+impl Provider for RecordingProvider {
+    fn complete(
+        &self,
+        _conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+        self.seen_tool_names
+            .lock()
+            .unwrap()
+            .extend(tools.iter().map(|tool| tool.name().to_owned()));
+
+        ready(Ok(AssistantMessage::new("done")))
+    }
+}
+
+#[derive(Default)]
+struct ToolCallingProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Provider for ToolCallingProvider {
+    fn complete(
+        &self,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+        let call_count = self.calls.fetch_add(1, Ordering::SeqCst);
+        assert!(tools.iter().any(|tool| tool.name() == "echo"));
+
+        let has_tool_result = conversation
+            .messages()
+            .iter()
+            .any(|message| matches!(message, Message::ToolResult(_)));
+
+        ready(Ok(if call_count == 0 {
+            AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+                "call_1",
+                "echo",
+                json!({ "value": "hello" }),
+            )])
+        } else {
+            assert!(has_tool_result);
+            AssistantMessage::new("done")
+        }))
+    }
+}
+
+struct AlwaysToolCallingProvider;
+
+impl Provider for AlwaysToolCallingProvider {
+    fn complete(
+        &self,
+        _conversation: &Conversation,
+        _tools: &[ToolSpec],
+    ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+        ready(Ok(AssistantMessage::new("").with_tool_calls(vec![
+            ToolCall::new("call_1", "missing", json!({})),
+        ])))
     }
 }
 
@@ -101,6 +170,59 @@ fn agent_appends_user_and_assistant_messages() {
         &conversation.messages()[1],
         Message::Assistant(message) if message.content() == "hello"
     ));
+}
+
+#[test]
+fn agent_passes_registered_tool_specs_to_provider() {
+    let provider = RecordingProvider::default();
+    let seen_tool_names = provider.seen_tool_names.clone();
+    let agent = Agent::new(provider).with_tool(Arc::new(EchoTool));
+    let mut conversation = Conversation::new();
+
+    block_on(agent.run(&mut conversation, "hello")).unwrap();
+
+    assert_eq!(*seen_tool_names.lock().unwrap(), vec!["echo"]);
+}
+
+#[test]
+fn agent_executes_tool_calls_until_final_response() {
+    let provider = ToolCallingProvider::default();
+    let calls = provider.calls.clone();
+    let agent = Agent::new(provider).with_tool(Arc::new(EchoTool));
+    let mut conversation = Conversation::new();
+
+    let response = block_on(agent.run(&mut conversation, "hello")).unwrap();
+
+    assert_eq!(response.content(), "done");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(conversation.messages().len(), 4);
+    assert!(matches!(&conversation.messages()[0], Message::User(_)));
+    assert!(matches!(
+        &conversation.messages()[1],
+        Message::Assistant(message) if message.tool_calls().len() == 1
+    ));
+    assert!(matches!(
+        &conversation.messages()[2],
+        Message::ToolResult(result) if result.result() == &Ok(json!({ "value": "hello" }))
+    ));
+    assert!(matches!(
+        &conversation.messages()[3],
+        Message::Assistant(message) if message.content() == "done"
+    ));
+}
+
+#[test]
+fn agent_stops_after_max_tool_rounds() {
+    let agent = Agent::new(AlwaysToolCallingProvider).with_max_tool_rounds(0);
+    let mut conversation = Conversation::new();
+
+    let result = block_on(agent.run(&mut conversation, "hello"));
+
+    assert!(matches!(
+        result,
+        Err(AgentError::MaxToolRoundsExceeded { max: 0 })
+    ));
+    assert_eq!(conversation.messages().len(), 2);
 }
 
 #[test]
