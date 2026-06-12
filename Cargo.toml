@@ -2,10 +2,20 @@
 name = "lynx-agent"
 version = "0.1.0"
 edition = "2024"
+description = "A small provider-agnostic agent loop with tool calling support."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/WilmerFHandler/lynx-agent"
+keywords = ["agent", "llm", "tools", "openai"]
+categories = ["api-bindings", "asynchronous"]
+exclude = [".raven/"]
 
 [features]
 default = []
 openai-compatible = ["dep:reqwest"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
