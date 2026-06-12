@@ -3,6 +3,11 @@ name = "lynx-agent"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+openai-compatible = ["dep:reqwest"]
+
 [dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
