@@ -35,6 +35,11 @@ impl Provider for EchoProvider {
     }
 }
 
+#[test]
+fn provider_models_default_to_empty() {
+    assert!(EchoProvider.models().is_empty());
+}
+
 #[derive(Default)]
 struct RecordingProvider {
     seen_tool_names: Arc<Mutex<Vec<String>>>,
