@@ -14,7 +14,7 @@ pub mod message;
 pub mod provider;
 pub mod tool;
 
-pub use agent::{Agent, AgentError};
+pub use agent::{Agent, AgentError, AgentEvent};
 pub use conversation::Conversation;
 pub use message::{AssistantMessage, Message, SystemMessage, UserMessage};
 pub use provider::{Model, Provider, ProviderError};

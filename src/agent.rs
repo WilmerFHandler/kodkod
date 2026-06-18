@@ -1,10 +1,15 @@
 pub mod error;
+pub mod event;
 
 use std::sync::Arc;
 
-pub use error::AgentError;
+use async_stream::try_stream;
+use futures::stream::BoxStream;
 
-use crate::{AssistantMessage, Conversation, Provider, Tool, ToolExecutor};
+pub use error::AgentError;
+pub use event::AgentEvent;
+
+use crate::{Conversation, Provider, Tool, ToolExecutor};
 
 const DEFAULT_MAX_TOOL_ROUNDS: usize = 8;
 
@@ -16,7 +21,7 @@ pub struct Agent<P> {
 
 impl<P> Agent<P>
 where
-    P: Provider,
+    P: Provider + Sync,
 {
     pub fn new(provider: P) -> Self {
         Self {
@@ -52,42 +57,50 @@ where
         self.tools.register(tool);
     }
 
-    pub async fn run(
-        &self,
-        conversation: &mut Conversation,
+    pub fn run<'a>(
+        &'a self,
+        conversation: &'a mut Conversation,
         prompt: impl Into<String>,
-    ) -> Result<AssistantMessage, AgentError> {
-        conversation.push_user_message(prompt);
+    ) -> BoxStream<'a, Result<AgentEvent, AgentError>> {
+        let prompt = prompt.into();
 
-        let tool_specs = self.tools.specs();
-        let mut tool_rounds_executed = 0;
+        Box::pin(try_stream! {
+            conversation.push_user_message(prompt);
 
-        loop {
-            let message = self
-                .provider
-                .complete(conversation, &tool_specs)
-                .await
-                .map_err(AgentError::Provider)?;
-            let tool_calls = message.tool_calls().to_vec();
+            let tool_specs = self.tools.specs();
+            let mut tool_rounds_executed = 0;
 
-            conversation.push_assistant_message(message.clone());
+            loop {
+                let message = self
+                    .provider
+                    .complete(conversation, &tool_specs)
+                    .await
+                    .map_err(AgentError::Provider)?;
+                let tool_calls = message.tool_calls().to_vec();
 
-            if tool_calls.is_empty() {
-                return Ok(message);
+                yield AgentEvent::AssistantReply(message.clone());
+                conversation.push_assistant_message(message.clone());
+
+                if tool_calls.is_empty() {
+                    yield AgentEvent::Completed(message);
+                    return;
+                }
+
+                if tool_rounds_executed >= self.max_tool_rounds {
+                    Err(AgentError::MaxToolRoundsExceeded {
+                        max: self.max_tool_rounds,
+                    })?;
+                }
+
+                for tool_call in &tool_calls {
+                    yield AgentEvent::ToolStarted(tool_call.clone());
+                    let result = self.tools.execute(tool_call).await;
+                    yield AgentEvent::ToolFinished(result.clone());
+                    conversation.push_tool_result(result);
+                }
+
+                tool_rounds_executed += 1;
             }
-
-            if tool_rounds_executed >= self.max_tool_rounds {
-                return Err(AgentError::MaxToolRoundsExceeded {
-                    max: self.max_tool_rounds,
-                });
-            }
-
-            for tool_call in &tool_calls {
-                let result = self.tools.execute(tool_call).await;
-                conversation.push_tool_result(result);
-            }
-
-            tool_rounds_executed += 1;
-        }
+        })
     }
 }

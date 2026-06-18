@@ -5,12 +5,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
+use futures::StreamExt;
+
 use serde_json::{Value, json};
 
 use crate::{
-    Agent, AgentError, AssistantMessage, Conversation, Message, Provider, ProviderError, Tool,
-    ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolResult,
-    ToolResultOutcome, ToolSpec, UserMessage,
+    Agent, AgentError, AgentEvent, AssistantMessage, Conversation, Message, Provider,
+    ProviderError, Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture,
+    ToolResult, ToolResultOutcome, ToolSpec, UserMessage,
 };
 
 struct EchoProvider;
@@ -164,7 +166,7 @@ fn agent_appends_user_and_assistant_messages() {
     let agent = Agent::new(EchoProvider);
     let mut conversation = Conversation::new();
 
-    let response = block_on(agent.run(&mut conversation, "hello")).unwrap();
+    let response = block_on(collect_run(&agent, &mut conversation, "hello")).unwrap();
 
     assert_eq!(response.content(), "hello");
     assert_eq!(conversation.messages().len(), 2);
@@ -185,7 +187,7 @@ fn agent_passes_registered_tool_specs_to_provider() {
     let agent = Agent::new(provider).with_tool(Arc::new(EchoTool));
     let mut conversation = Conversation::new();
 
-    block_on(agent.run(&mut conversation, "hello")).unwrap();
+    block_on(collect_run(&agent, &mut conversation, "hello")).unwrap();
 
     assert_eq!(*seen_tool_names.lock().unwrap(), vec!["echo"]);
 }
@@ -197,7 +199,7 @@ fn agent_executes_tool_calls_until_final_response() {
     let agent = Agent::new(provider).with_tool(Arc::new(EchoTool));
     let mut conversation = Conversation::new();
 
-    let response = block_on(agent.run(&mut conversation, "hello")).unwrap();
+    let response = block_on(collect_run(&agent, &mut conversation, "hello")).unwrap();
 
     assert_eq!(response.content(), "done");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -218,11 +220,35 @@ fn agent_executes_tool_calls_until_final_response() {
 }
 
 #[test]
+fn run_reports_tool_progress_in_order() {
+    let provider = ToolCallingProvider::default();
+    let agent = Agent::new(provider).with_tool(Arc::new(EchoTool));
+    let mut conversation = Conversation::new();
+
+    let events = block_on(collect_events(&agent, &mut conversation, "hello")).unwrap();
+
+    assert!(matches!(&events[0], AgentEvent::AssistantReply(message) if message.tool_calls().len() == 1));
+    assert!(matches!(&events[1], AgentEvent::ToolStarted(call) if call.name() == "echo"));
+    assert!(matches!(
+        &events[2],
+        AgentEvent::ToolFinished(result) if result.tool_call_id() == "call_1" && result.value().is_some()
+    ));
+    assert!(matches!(
+        &events[3],
+        AgentEvent::AssistantReply(message) if message.content() == "done" && message.tool_calls().is_empty()
+    ));
+    assert!(matches!(
+        &events[4],
+        AgentEvent::Completed(message) if message.content() == "done"
+    ));
+}
+
+#[test]
 fn agent_stops_after_max_tool_rounds() {
     let agent = Agent::new(AlwaysToolCallingProvider).with_max_tool_rounds(0);
     let mut conversation = Conversation::new();
 
-    let result = block_on(agent.run(&mut conversation, "hello"));
+    let result = block_on(collect_run(&agent, &mut conversation, "hello"));
 
     assert!(matches!(
         result,
@@ -389,6 +415,38 @@ fn tool_result_outcomes_serialize_with_explicit_shape() {
             }
         })
     );
+}
+
+async fn collect_events<P: Provider + Sync>(
+    agent: &Agent<P>,
+    conversation: &mut Conversation,
+    prompt: &str,
+) -> Result<Vec<AgentEvent>, AgentError> {
+    let mut stream = agent.run(conversation, prompt);
+    let mut events = Vec::new();
+
+    while let Some(item) = stream.next().await {
+        events.push(item?);
+    }
+
+    Ok(events)
+}
+
+async fn collect_run<P: Provider + Sync>(
+    agent: &Agent<P>,
+    conversation: &mut Conversation,
+    prompt: &str,
+) -> Result<AssistantMessage, AgentError> {
+    let mut stream = agent.run(conversation, prompt);
+
+    while let Some(item) = stream.next().await {
+        if let Ok(AgentEvent::Completed(message)) = item {
+            return Ok(message);
+        }
+        item?;
+    }
+
+    Err(AgentError::Provider(ProviderError::new("agent stream ended without completion")))
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
