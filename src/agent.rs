@@ -11,12 +11,10 @@ pub use event::AgentEvent;
 
 use crate::{Conversation, Provider, Tool, ToolExecutor};
 
-const DEFAULT_MAX_TOOL_ROUNDS: usize = 8;
-
 pub struct Agent<P> {
     provider: P,
     tools: ToolExecutor,
-    max_tool_rounds: usize,
+    max_tool_rounds: Option<usize>,
 }
 
 impl<P> Agent<P>
@@ -27,7 +25,7 @@ where
         Self {
             provider,
             tools: ToolExecutor::new(),
-            max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
+            max_tool_rounds: None,
         }
     }
 
@@ -39,7 +37,7 @@ where
         &self.tools
     }
 
-    pub fn max_tool_rounds(&self) -> usize {
+    pub fn max_tool_rounds(&self) -> Option<usize> {
         self.max_tool_rounds
     }
 
@@ -49,7 +47,7 @@ where
     }
 
     pub fn with_max_tool_rounds(mut self, max_tool_rounds: usize) -> Self {
-        self.max_tool_rounds = max_tool_rounds;
+        self.max_tool_rounds = Some(max_tool_rounds);
         self
     }
 
@@ -86,10 +84,10 @@ where
                     return;
                 }
 
-                if tool_rounds_executed >= self.max_tool_rounds {
-                    Err(AgentError::MaxToolRoundsExceeded {
-                        max: self.max_tool_rounds,
-                    })?;
+                if let Some(max) = self.max_tool_rounds
+                    && tool_rounds_executed >= max
+                {
+                    Err(AgentError::MaxToolRoundsExceeded { max })?;
                 }
 
                 for tool_call in &tool_calls {
