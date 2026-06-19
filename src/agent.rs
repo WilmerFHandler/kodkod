@@ -1,6 +1,7 @@
 pub mod error;
 pub mod event;
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use async_stream::try_stream;
@@ -9,7 +10,7 @@ use futures::stream::BoxStream;
 pub use error::AgentError;
 pub use event::AgentEvent;
 
-use crate::{Conversation, Provider, Tool, ToolExecutor};
+use crate::{Conversation, Image, Model, Provider, Tool, ToolExecutor};
 
 pub struct Agent<P> {
     provider: P,
@@ -55,23 +56,35 @@ where
         self.tools.register(tool);
     }
 
+    /// Run one user turn, streaming progress events.
+    ///
+    /// The `images` are attached to the user's prompt. The provider uses `model`
+    /// to determine the request target and whether image content is supported.
     pub fn run<'a>(
         &'a self,
         conversation: &'a mut Conversation,
         prompt: impl Into<String>,
+        images: Vec<Image>,
+        model: &'a Model,
     ) -> BoxStream<'a, Result<AgentEvent, AgentError>> {
         let prompt = prompt.into();
 
         Box::pin(try_stream! {
-            conversation.push_user_message(prompt);
+            conversation.push_user_message_with_images(prompt, images);
 
             let tool_specs = self.tools.specs();
             let mut tool_rounds_executed = 0;
 
             loop {
+                let provider_input: Cow<'_, Conversation> = if model.vision() {
+                    Cow::Borrowed(conversation)
+                } else {
+                    Cow::Owned(conversation.without_images())
+                };
+
                 let message = self
                     .provider
-                    .complete(conversation, &tool_specs)
+                    .complete(model, &provider_input, &tool_specs)
                     .await
                     .map_err(AgentError::Provider)?;
                 let tool_calls = message.tool_calls().to_vec();

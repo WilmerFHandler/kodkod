@@ -16,7 +16,7 @@ pub mod tool;
 
 pub use agent::{Agent, AgentError, AgentEvent};
 pub use conversation::Conversation;
-pub use message::{AssistantMessage, Message, SystemMessage, UserMessage};
+pub use message::{AssistantMessage, Image, Message, SystemMessage, UserMessage};
 pub use provider::{Model, Provider, ProviderError};
 pub use tool::{
     Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolResult,

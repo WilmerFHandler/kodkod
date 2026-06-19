@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{AssistantMessage, Message, SystemMessage, ToolResult, UserMessage};
+use crate::{AssistantMessage, Image, Message, SystemMessage, ToolResult, UserMessage};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conversation {
@@ -31,7 +31,16 @@ impl Conversation {
     }
 
     pub fn push_user_message(&mut self, content: impl Into<String>) {
-        self.messages.push(Message::User(UserMessage::new(content)));
+        self.push_user_message_with_images(content, Vec::new());
+    }
+
+    pub fn push_user_message_with_images(
+        &mut self,
+        content: impl Into<String>,
+        images: Vec<Image>,
+    ) {
+        self.messages
+            .push(Message::User(UserMessage::new(content).with_images(images)));
     }
 
     pub fn push_assistant_message(&mut self, message: AssistantMessage) {
@@ -45,5 +54,22 @@ impl Conversation {
 
     pub fn push_tool_result(&mut self, result: ToolResult) {
         self.messages.push(Message::ToolResult(result));
+    }
+
+    /// Return a copy of this conversation with all image attachments removed.
+    pub fn without_images(&self) -> Self {
+        Self {
+            system_prompt: self.system_prompt.clone(),
+            messages: self
+                .messages
+                .iter()
+                .map(|message| match message {
+                    Message::User(user) => Message::User(
+                        UserMessage::new(user.content()).with_images(Vec::new()),
+                    ),
+                    _ => message.clone(),
+                })
+                .collect(),
+        }
     }
 }

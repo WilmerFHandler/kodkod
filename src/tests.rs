@@ -10,9 +10,9 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::{
-    Agent, AgentError, AgentEvent, AssistantMessage, Conversation, Message, Provider,
-    ProviderError, Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture,
-    ToolResult, ToolResultOutcome, ToolSpec, UserMessage,
+    Agent, AgentError, AgentEvent, AssistantMessage, Conversation, Image, Message, Model,
+    Provider, ProviderError, Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError,
+    ToolFuture, ToolResult, ToolResultOutcome, ToolSpec, UserMessage,
 };
 
 struct EchoProvider;
@@ -20,6 +20,7 @@ struct EchoProvider;
 impl Provider for EchoProvider {
     fn complete(
         &self,
+        _model: &Model,
         conversation: &Conversation,
         _tools: &[ToolSpec],
     ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
@@ -50,6 +51,7 @@ struct RecordingProvider {
 impl Provider for RecordingProvider {
     fn complete(
         &self,
+        _model: &Model,
         _conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
@@ -70,6 +72,7 @@ struct ToolCallingProvider {
 impl Provider for ToolCallingProvider {
     fn complete(
         &self,
+        _model: &Model,
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
@@ -99,6 +102,7 @@ struct AlwaysToolCallingProvider;
 impl Provider for AlwaysToolCallingProvider {
     fn complete(
         &self,
+        _model: &Model,
         _conversation: &Conversation,
         _tools: &[ToolSpec],
     ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
@@ -166,7 +170,8 @@ fn agent_appends_user_and_assistant_messages() {
     let agent = Agent::new(EchoProvider);
     let mut conversation = Conversation::new();
 
-    let response = block_on(collect_run(&agent, &mut conversation, "hello")).unwrap();
+    let model = Model::new("echo", "Echo");
+    let response = block_on(collect_run(&agent, &mut conversation, "hello", &model)).unwrap();
 
     assert_eq!(response.content(), "hello");
     assert_eq!(conversation.messages().len(), 2);
@@ -187,7 +192,8 @@ fn agent_passes_registered_tool_specs_to_provider() {
     let agent = Agent::new(provider).with_tool(Arc::new(EchoTool));
     let mut conversation = Conversation::new();
 
-    block_on(collect_run(&agent, &mut conversation, "hello")).unwrap();
+    let model = Model::new("echo", "Echo");
+    block_on(collect_run(&agent, &mut conversation, "hello", &model)).unwrap();
 
     assert_eq!(*seen_tool_names.lock().unwrap(), vec!["echo"]);
 }
@@ -199,7 +205,8 @@ fn agent_executes_tool_calls_until_final_response() {
     let agent = Agent::new(provider).with_tool(Arc::new(EchoTool));
     let mut conversation = Conversation::new();
 
-    let response = block_on(collect_run(&agent, &mut conversation, "hello")).unwrap();
+    let model = Model::new("echo", "Echo");
+    let response = block_on(collect_run(&agent, &mut conversation, "hello", &model)).unwrap();
 
     assert_eq!(response.content(), "done");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -225,9 +232,12 @@ fn run_reports_tool_progress_in_order() {
     let agent = Agent::new(provider).with_tool(Arc::new(EchoTool));
     let mut conversation = Conversation::new();
 
-    let events = block_on(collect_events(&agent, &mut conversation, "hello")).unwrap();
+    let model = Model::new("echo", "Echo");
+    let events = block_on(collect_events(&agent, &mut conversation, "hello", &model)).unwrap();
 
-    assert!(matches!(&events[0], AgentEvent::AssistantReply(message) if message.tool_calls().len() == 1));
+    assert!(
+        matches!(&events[0], AgentEvent::AssistantReply(message) if message.tool_calls().len() == 1)
+    );
     assert!(matches!(&events[1], AgentEvent::ToolStarted(call) if call.name() == "echo"));
     assert!(matches!(
         &events[2],
@@ -248,7 +258,8 @@ fn agent_stops_after_max_tool_rounds() {
     let agent = Agent::new(AlwaysToolCallingProvider).with_max_tool_rounds(0);
     let mut conversation = Conversation::new();
 
-    let result = block_on(collect_run(&agent, &mut conversation, "hello"));
+    let model = Model::new("echo", "Echo");
+    let result = block_on(collect_run(&agent, &mut conversation, "hello", &model));
 
     assert!(matches!(
         result,
@@ -341,6 +352,28 @@ fn conversation_round_trips_through_json() {
 }
 
 #[test]
+fn conversation_without_images_strips_image_attachments() {
+    let mut conversation = Conversation::new();
+    conversation.push_user_message_with_images(
+        "describe this",
+        vec![Image::new("image/png", vec![0x89, 0x50])],
+    );
+    conversation.push_assistant_message(AssistantMessage::new("ok"));
+
+    let stripped = conversation.without_images();
+
+    assert_eq!(stripped.messages().len(), 2);
+    assert!(matches!(
+        &stripped.messages()[0],
+        Message::User(user) if user.content() == "describe this" && user.images().is_empty()
+    ));
+    assert!(matches!(
+        &stripped.messages()[1],
+        Message::Assistant(message) if message.content() == "ok"
+    ));
+}
+
+#[test]
 fn messages_serialize_as_role_tagged_objects() {
     assert_eq!(
         serde_json::to_value(Message::User(UserMessage::new("hello"))).unwrap(),
@@ -421,8 +454,9 @@ async fn collect_events<P: Provider + Sync>(
     agent: &Agent<P>,
     conversation: &mut Conversation,
     prompt: &str,
+    model: &Model,
 ) -> Result<Vec<AgentEvent>, AgentError> {
-    let mut stream = agent.run(conversation, prompt);
+    let mut stream = agent.run(conversation, prompt, Vec::new(), model);
     let mut events = Vec::new();
 
     while let Some(item) = stream.next().await {
@@ -436,8 +470,9 @@ async fn collect_run<P: Provider + Sync>(
     agent: &Agent<P>,
     conversation: &mut Conversation,
     prompt: &str,
+    model: &Model,
 ) -> Result<AssistantMessage, AgentError> {
-    let mut stream = agent.run(conversation, prompt);
+    let mut stream = agent.run(conversation, prompt, Vec::new(), model);
 
     while let Some(item) = stream.next().await {
         if let Ok(AgentEvent::Completed(message)) = item {
@@ -446,7 +481,9 @@ async fn collect_run<P: Provider + Sync>(
         item?;
     }
 
-    Err(AgentError::Provider(ProviderError::new("agent stream ended without completion")))
+    Err(AgentError::Provider(ProviderError::new(
+        "agent stream ended without completion",
+    )))
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
