@@ -10,7 +10,7 @@ use futures::stream::BoxStream;
 pub use error::AgentError;
 pub use event::AgentEvent;
 
-use crate::{Conversation, Image, Model, Provider, Tool, ToolExecutor};
+use crate::{Conversation, Model, Provider, Tool, ToolExecutor};
 
 pub struct Agent<P> {
     provider: P,
@@ -56,22 +56,16 @@ where
         self.tools.register(tool);
     }
 
-    /// Run one user turn, streaming progress events.
+    /// Run the agent loop on the current conversation, streaming progress events.
     ///
-    /// The `images` are attached to the user's prompt. The provider uses `model`
-    /// to determine the request target and whether image content is supported.
+    /// The conversation must already include the user message (and any images) for
+    /// this turn. The provider uses `model` for the request target and vision handling.
     pub fn run<'a>(
         &'a self,
         conversation: &'a mut Conversation,
-        prompt: impl Into<String>,
-        images: Vec<Image>,
         model: &'a Model,
     ) -> BoxStream<'a, Result<AgentEvent, AgentError>> {
-        let prompt = prompt.into();
-
         Box::pin(try_stream! {
-            conversation.push_user_message_with_images(prompt, images);
-
             let tool_specs = self.tools.specs();
             let mut tool_rounds_executed = 0;
 

@@ -10,9 +10,9 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::{
-    Agent, AgentError, AgentEvent, AssistantMessage, Conversation, Image, Message, Model,
-    Provider, ProviderError, Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError,
-    ToolFuture, ToolResult, ToolResultOutcome, ToolSpec, UserMessage,
+    Agent, AgentError, AgentEvent, AssistantMessage, Conversation, Image, Message, Model, Provider,
+    ProviderError, Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture,
+    ToolResult, ToolResultOutcome, ToolSpec, UserMessage,
 };
 
 struct EchoProvider;
@@ -456,7 +456,8 @@ async fn collect_events<P: Provider + Sync>(
     prompt: &str,
     model: &Model,
 ) -> Result<Vec<AgentEvent>, AgentError> {
-    let mut stream = agent.run(conversation, prompt, Vec::new(), model);
+    conversation.push_user_message(prompt);
+    let mut stream = agent.run(conversation, model);
     let mut events = Vec::new();
 
     while let Some(item) = stream.next().await {
@@ -472,7 +473,8 @@ async fn collect_run<P: Provider + Sync>(
     prompt: &str,
     model: &Model,
 ) -> Result<AssistantMessage, AgentError> {
-    let mut stream = agent.run(conversation, prompt, Vec::new(), model);
+    conversation.push_user_message(prompt);
+    let mut stream = agent.run(conversation, model);
 
     while let Some(item) = stream.next().await {
         if let Ok(AgentEvent::Completed(message)) = item {
@@ -503,4 +505,17 @@ struct NoopWaker;
 
 impl Wake for NoopWaker {
     fn wake(self: Arc<Self>) {}
+}
+
+#[test]
+fn image_in_conversation_json_roundtrips() {
+    use crate::{Conversation, Image};
+    let mut conversation = Conversation::new();
+    conversation.push_user_message_with_images(
+        "describe",
+        vec![Image::new("image/png", vec![0x89, 0x50])],
+    );
+    let encoded = serde_json::to_string_pretty(&conversation).unwrap();
+    let decoded: Conversation = serde_json::from_str(&encoded).expect(&encoded);
+    assert_eq!(decoded, conversation);
 }

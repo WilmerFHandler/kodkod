@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    AssistantMessage, Conversation, Message, Model, Provider, ProviderError, ToolCall,
-    ToolResult, ToolResultOutcome, ToolSpec,
+    AssistantMessage, Conversation, Message, Model, Provider, ProviderError, ToolCall, ToolResult,
+    ToolResultOutcome, ToolSpec,
 };
 
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -22,15 +22,8 @@ impl OpenAiCompatibleProvider {
         Self::with_client(reqwest::Client::new(), base_url, None)
     }
 
-    pub fn with_api_key(
-        base_url: impl Into<String>,
-        api_key: impl Into<String>,
-    ) -> Self {
-        Self::with_client(
-            reqwest::Client::new(),
-            base_url,
-            Some(api_key.into()),
-        )
+    pub fn with_api_key(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self::with_client(reqwest::Client::new(), base_url, Some(api_key.into()))
     }
 
     pub fn openai(api_key: impl Into<String>) -> Self {
@@ -659,8 +652,8 @@ mod tests {
         conversation.push_user_message_with_images("describe this", vec![image]);
         let model = Model::with_vision("gpt-vision", "GPT Vision");
 
-        let request = ChatCompletionRequest::from_agent_input(model.id(), &conversation, &[])
-            .unwrap();
+        let request =
+            ChatCompletionRequest::from_agent_input(model.id(), &conversation, &[]).unwrap();
 
         let value = serde_json::to_value(request).unwrap();
         let content = &value["messages"][0]["content"];

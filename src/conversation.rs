@@ -56,6 +56,17 @@ impl Conversation {
         self.messages.push(Message::ToolResult(result));
     }
 
+    pub fn push_message(&mut self, message: Message) {
+        match message {
+            Message::User(user) => {
+                self.push_user_message_with_images(user.content(), user.images().to_vec());
+            }
+            Message::Assistant(assistant) => self.push_assistant_message(assistant),
+            Message::System(system) => self.push_system_message(system.content()),
+            Message::ToolResult(result) => self.push_tool_result(result),
+        }
+    }
+
     /// Return a copy of this conversation with all image attachments removed.
     pub fn without_images(&self) -> Self {
         Self {
@@ -64,9 +75,9 @@ impl Conversation {
                 .messages
                 .iter()
                 .map(|message| match message {
-                    Message::User(user) => Message::User(
-                        UserMessage::new(user.content()).with_images(Vec::new()),
-                    ),
+                    Message::User(user) => {
+                        Message::User(UserMessage::new(user.content()).with_images(Vec::new()))
+                    }
                     _ => message.clone(),
                 })
                 .collect(),

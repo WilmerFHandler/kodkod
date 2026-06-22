@@ -165,26 +165,51 @@ mod base64_bytes {
     }
 
     pub fn decode(input: &str) -> Result<Vec<u8>, String> {
-        let mut data = input.bytes().filter(|&b| b != b'=').peekable();
-        let mut out = Vec::with_capacity((input.len() * 3) / 4);
-        while data.peek().is_some() {
-            let mut sextets = [0u8; 4];
-            for i in 0..4 {
-                let byte = data
-                    .next()
-                    .ok_or_else(|| "invalid base64 length".to_string())?;
-                sextets[i] = decode_char(byte)?;
-            }
-            let triple = ((sextets[0] as u32) << 18)
-                | ((sextets[1] as u32) << 12)
-                | ((sextets[2] as u32) << 6)
-                | (sextets[3] as u32);
-            out.push(((triple >> 16) & 0xFF) as u8);
-            out.push(((triple >> 8) & 0xFF) as u8);
-            out.push((triple & 0xFF) as u8);
+        let bytes: Vec<u8> = input
+            .bytes()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect();
+        if bytes.is_empty() {
+            return Ok(Vec::new());
         }
-        let padding = input.bytes().filter(|&b| b == b'=').count();
-        out.truncate(out.len().saturating_sub(padding));
+        if bytes.len() % 4 == 1 {
+            return Err("invalid base64 length".to_string());
+        }
+
+        let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+        for chunk in bytes.chunks(4) {
+            let mut buf = [0u8; 4];
+            let mut padding = 0usize;
+            for (i, &byte) in chunk.iter().enumerate() {
+                if byte == b'=' {
+                    padding += 1;
+                    buf[i] = 0;
+                } else {
+                    if padding > 0 {
+                        return Err("invalid base64 padding".to_string());
+                    }
+                    buf[i] = decode_char(byte)?;
+                }
+            }
+            if padding > 2 {
+                return Err("invalid base64 padding".to_string());
+            }
+            if chunk.len() < 4 && padding == 0 {
+                return Err("invalid base64 length".to_string());
+            }
+
+            let triple = ((buf[0] as u32) << 18)
+                | ((buf[1] as u32) << 12)
+                | ((buf[2] as u32) << 6)
+                | (buf[3] as u32);
+            out.push(((triple >> 16) & 0xFF) as u8);
+            if padding <= 1 {
+                out.push(((triple >> 8) & 0xFF) as u8);
+            }
+            if padding == 0 {
+                out.push((triple & 0xFF) as u8);
+            }
+        }
         Ok(out)
     }
 
