@@ -13,9 +13,11 @@ pub mod conversation;
 pub mod message;
 pub mod provider;
 pub mod tool;
+pub mod turns;
 
 pub use agent::{Agent, AgentError, AgentEvent};
 pub use conversation::Conversation;
+pub use turns::{final_assistant_text, segment_uses_tools, turn_ranges, user_turn_starts};
 pub use message::{AssistantMessage, Image, Message, SystemMessage, UserMessage};
 pub use provider::{Model, Provider, ProviderError};
 pub use tool::{
