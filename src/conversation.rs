@@ -26,6 +26,12 @@ impl Conversation {
         &self.messages
     }
 
+    /// User turns as views over this conversation's messages.
+    pub fn turns(&self) -> crate::turns::Turns<'_> {
+        crate::turns::turns(self.messages())
+    }
+
+
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
     }
