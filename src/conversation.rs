@@ -31,7 +31,6 @@ impl Conversation {
         crate::turns::turns(self.messages())
     }
 
-
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
     }
@@ -71,6 +70,10 @@ impl Conversation {
             Message::System(system) => self.push_system_message(system.content()),
             Message::ToolResult(result) => self.push_tool_result(result),
         }
+    }
+
+    pub fn replace_messages(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
     }
 
     /// Return a copy of this conversation with all image attachments removed.
