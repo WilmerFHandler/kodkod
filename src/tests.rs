@@ -10,7 +10,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::{
-    Agent, AgentError, AgentEvent, AssistantMessage, Conversation, Image, Message, Model, Provider,
+    Agent, AgentError, AgentEvent, AssistantMessage, Conversation, Image, Message, Model, Provider, TaskControl,
     ProviderError, Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture,
     ToolResult, ToolResultOutcome, ToolSpec, UserMessage,
 };
@@ -457,7 +457,8 @@ async fn collect_events<P: Provider + Sync>(
     model: &Model,
 ) -> Result<Vec<AgentEvent>, AgentError> {
     conversation.push_user_message(prompt);
-    let mut stream = agent.run(conversation, model);
+    let control = TaskControl::new();
+    let mut stream = agent.run(conversation, model, &control);
     let mut events = Vec::new();
 
     while let Some(item) = stream.next().await {
@@ -474,7 +475,8 @@ async fn collect_run<P: Provider + Sync>(
     model: &Model,
 ) -> Result<AssistantMessage, AgentError> {
     conversation.push_user_message(prompt);
-    let mut stream = agent.run(conversation, model);
+    let control = TaskControl::new();
+    let mut stream = agent.run(conversation, model, &control);
 
     while let Some(item) = stream.next().await {
         if let Ok(AgentEvent::Completed(message)) = item {

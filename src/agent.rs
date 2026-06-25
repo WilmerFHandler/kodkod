@@ -1,3 +1,4 @@
+pub mod control;
 pub mod error;
 pub mod event;
 
@@ -5,10 +6,13 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use async_stream::try_stream;
-use futures::stream::BoxStream;
 
+pub use control::TaskControl;
 pub use error::AgentError;
 pub use event::AgentEvent;
+
+/// Streaming events from an [`Agent::run`] call.
+pub type Task<'a> = futures::stream::BoxStream<'a, Result<AgentEvent, AgentError>>;
 
 use crate::{Conversation, Model, Provider, Tool, ToolExecutor};
 
@@ -60,16 +64,24 @@ where
     ///
     /// The conversation must already include the user message (and any images) for
     /// this turn. The provider uses `model` for the request target and vision handling.
+    ///
+    /// Pass a [`TaskControl`] so external callers can cancel the run between
+    /// provider rounds (e.g. a GUI "Cancel" button).
     pub fn run<'a>(
         &'a self,
         conversation: &'a mut Conversation,
         model: &'a Model,
-    ) -> BoxStream<'a, Result<AgentEvent, AgentError>> {
+        control: &'a TaskControl,
+    ) -> Task<'a> {
         Box::pin(try_stream! {
             let tool_specs = self.tools.specs();
             let mut tool_rounds_executed = 0;
 
             loop {
+                if control.is_cancelled() {
+                    Err(AgentError::Cancelled)?;
+                }
+
                 let provider_input: Cow<'_, Conversation> = if model.vision() {
                     Cow::Borrowed(conversation)
                 } else {

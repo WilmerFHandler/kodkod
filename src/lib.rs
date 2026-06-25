@@ -15,7 +15,7 @@ pub mod provider;
 pub mod tool;
 pub mod turns;
 
-pub use agent::{Agent, AgentError, AgentEvent};
+pub use agent::{Agent, AgentError, AgentEvent, Task, TaskControl};
 pub use conversation::Conversation;
 pub use turns::{Turn, TurnIter, Turns, turns};
 pub use message::{AssistantMessage, Image, Message, SystemMessage, UserMessage};
