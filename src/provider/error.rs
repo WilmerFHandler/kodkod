@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// What went wrong when talking to a model backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderErrorKind {
     /// Transport failure (DNS, connection reset, timeout, etc.).
@@ -14,13 +14,8 @@ pub enum ProviderErrorKind {
     Response,
     /// Other failures (configuration, serialization before the request, etc.).
     #[serde(other)]
+    #[default]
     Other,
-}
-
-impl Default for ProviderErrorKind {
-    fn default() -> Self {
-        Self::Other
-    }
 }
 
 /// Error from a [`Provider::complete`](super::Provider::complete) call.

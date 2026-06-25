@@ -141,7 +141,7 @@ mod base64_bytes {
     }
 
     pub fn encode(input: &[u8]) -> String {
-        let mut out = String::with_capacity((input.len() * 4 + 2) / 3);
+        let mut out = String::with_capacity((input.len() * 4).div_ceil(3));
         for chunk in input.chunks(3) {
             let mut buf = [0u8; 3];
             for (i, byte) in chunk.iter().enumerate() {
@@ -165,10 +165,7 @@ mod base64_bytes {
     }
 
     pub fn decode(input: &str) -> Result<Vec<u8>, String> {
-        let bytes: Vec<u8> = input
-            .bytes()
-            .filter(|b| !b.is_ascii_whitespace())
-            .collect();
+        let bytes: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
         if bytes.is_empty() {
             return Ok(Vec::new());
         }

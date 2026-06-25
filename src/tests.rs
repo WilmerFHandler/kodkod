@@ -10,9 +10,9 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::{
-    Agent, AgentError, AgentEvent, AssistantMessage, Conversation, Image, Message, Model, Provider, TaskControl,
-    ProviderError, Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture,
-    ToolResult, ToolResultOutcome, ToolSpec, UserMessage,
+    Agent, AgentError, AgentEvent, AssistantMessage, Conversation, Image, Message, Model, Provider,
+    ProviderError, TaskControl, Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError,
+    ToolFuture, ToolResult, ToolResultOutcome, ToolSpec, UserMessage,
 };
 
 struct EchoProvider;
@@ -513,11 +513,248 @@ impl Wake for NoopWaker {
 fn image_in_conversation_json_roundtrips() {
     use crate::{Conversation, Image};
     let mut conversation = Conversation::new();
-    conversation.push_user_message_with_images(
-        "describe",
-        vec![Image::new("image/png", vec![0x89, 0x50])],
-    );
+    conversation
+        .push_user_message_with_images("describe", vec![Image::new("image/png", vec![0x89, 0x50])]);
     let encoded = serde_json::to_string_pretty(&conversation).unwrap();
     let decoded: Conversation = serde_json::from_str(&encoded).expect(&encoded);
     assert_eq!(decoded, conversation);
+}
+
+#[test]
+fn steered_message_is_injected_between_rounds() {
+    // On round 1 the provider returns a tool call, then the test steers a
+    // message before round 2. Round 2 asserts the steer is present in the
+    // conversation and replies with it.
+    struct SteerAwareProvider {
+        calls: Arc<AtomicUsize>,
+        saw_steer: Arc<Mutex<bool>>,
+    }
+
+    impl Provider for SteerAwareProvider {
+        fn complete(
+            &self,
+            _model: &Model,
+            conversation: &Conversation,
+            tools: &[ToolSpec],
+        ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+            let round = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(tools.iter().any(|tool| tool.name() == "echo"));
+
+            let reply = if round == 0 {
+                AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+                    "call_1",
+                    "echo",
+                    json!({ "value": "hello" }),
+                )])
+            } else {
+                // Round 1: the steered message should now be in the conversation.
+                let found = conversation.messages().iter().any(|message| {
+                    matches!(message,
+                        Message::User(user) if user.content() == "wait, stop")
+                });
+                *self.saw_steer.lock().unwrap() = found;
+                AssistantMessage::new(if found { "ack" } else { "missed" })
+            };
+
+            ready(Ok(reply))
+        }
+    }
+
+    let saw_steer = Arc::new(Mutex::new(false));
+    let provider = SteerAwareProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+        saw_steer: saw_steer.clone(),
+    };
+    let agent = Agent::new(provider).with_tool(Arc::new(EchoTool));
+    let mut conversation = Conversation::new();
+
+    let model = Model::new("echo", "Echo");
+    conversation.push_user_message("go");
+    let control = TaskControl::new();
+    let mut stream = agent.run(&mut conversation, &model, &control);
+
+    // Round 1: assistant replies with a tool call.
+    drain_until_assistant_reply(&mut stream);
+    drain_until_tool_finished(&mut stream);
+
+    // Now queue a steer before round 2 begins.
+    control.steer(UserMessage::new("wait, stop"));
+
+    // Round 2: the loop drains the steer, appends it, then calls the provider.
+    let mut final_message = None;
+    while let Some(item) = block_on(stream.next()) {
+        if let AgentEvent::Completed(message) = item.unwrap() {
+            final_message = Some(message);
+            break;
+        }
+    }
+
+    assert_eq!(final_message.unwrap().content(), "ack");
+    assert!(*saw_steer.lock().unwrap(), "provider did not see the steer");
+}
+
+#[test]
+fn steer_events_are_emitted_in_order() {
+    // A provider that loops through a tool call each round up to a max,
+    // allowing multiple steers to be queued and drained across boundaries.
+    struct LoopingProvider {
+        calls: Arc<AtomicUsize>,
+        rounds: usize,
+    }
+
+    impl Provider for LoopingProvider {
+        fn complete(
+            &self,
+            _model: &Model,
+            _conversation: &Conversation,
+            tools: &[ToolSpec],
+        ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+            let round = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(tools.iter().any(|tool| tool.name() == "echo"));
+            ready(Ok(if round + 1 >= self.rounds {
+                AssistantMessage::new("done")
+            } else {
+                AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+                    "call_1",
+                    "echo",
+                    json!({}),
+                )])
+            }))
+        }
+    }
+
+    let agent = Agent::new(LoopingProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+        rounds: 3,
+    })
+    .with_tool(Arc::new(EchoTool));
+    let mut conversation = Conversation::new();
+
+    let model = Model::new("echo", "Echo");
+    conversation.push_user_message("start");
+    let control = TaskControl::new();
+
+    // Collect every event from the run while queuing steers between rounds.
+    // The stream borrows `conversation` mutably, so drive it to completion and
+    // drop it before inspecting the conversation.
+    let events = {
+        let mut stream = agent.run(&mut conversation, &model, &control);
+        // Round 1: tool call then tool result.
+        block_on(stream.next()).unwrap().unwrap(); // AssistantReply
+        block_on(stream.next()).unwrap().unwrap(); // ToolStarted
+        block_on(stream.next()).unwrap().unwrap(); // ToolFinished
+        // Queue two steers before round 2 begins.
+        control.steer(UserMessage::new("one"));
+        control.steer(UserMessage::new("two"));
+        // Drain to completion: round 2 (with the steers) and round 3 (final).
+        let mut collected = Vec::new();
+        while let Some(item) = block_on(stream.next()) {
+            collected.push(item.unwrap());
+        }
+        collected
+    };
+
+    // The two steers appear as Steered events, in queue order.
+    let steered: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Steered(user) => Some(user.content()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(steered, vec!["one", "two"]);
+
+    // The conversation holds the steered messages.
+    let user_contents: Vec<&str> = conversation
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => Some(user.content()),
+            _ => None,
+        })
+        .collect();
+    assert!(user_contents.contains(&"one"));
+    assert!(user_contents.contains(&"two"));
+}
+
+#[test]
+fn drain_pending_steers_empties_the_queue() {
+    let control = TaskControl::new();
+    control.steer(UserMessage::new("a"));
+    control.steer(UserMessage::new("b"));
+
+    let drained = control.drain_pending_steers();
+    assert_eq!(drained.len(), 2);
+    assert_eq!(drained[0].content(), "a");
+    assert_eq!(drained[1].content(), "b");
+    // Second drain is empty: steers are consumed once.
+    assert!(control.drain_pending_steers().is_empty());
+}
+
+#[test]
+fn cancel_takes_precedence_over_steer() {
+    // If a steer and a cancel are both pending, the cancel check runs first
+    // and the turn ends without consuming the steer.
+    struct IdleProvider;
+    impl Provider for IdleProvider {
+        fn complete(
+            &self,
+            _model: &Model,
+            _conversation: &Conversation,
+            _tools: &[ToolSpec],
+        ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+            ready(Ok(AssistantMessage::new("").with_tool_calls(vec![
+                ToolCall::new("call_1", "echo", json!({})),
+            ])))
+        }
+    }
+
+    let agent = Agent::new(IdleProvider).with_tool(Arc::new(EchoTool));
+    let mut conversation = Conversation::new();
+
+    let model = Model::new("echo", "Echo");
+    conversation.push_user_message("start");
+    let control = TaskControl::new();
+    let mut stream = agent.run(&mut conversation, &model, &control);
+
+    // Round 1 returns a tool call.
+    drain_until_tool_finished(&mut stream);
+
+    // Queue both a steer and a cancel.
+    control.steer(UserMessage::new("ignored"));
+    control.cancel();
+
+    // The loop should cancel before processing the steer.
+    let mut cancelled = false;
+    while let Some(item) = block_on(stream.next()) {
+        match item {
+            Err(AgentError::Cancelled) => {
+                cancelled = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(cancelled);
+}
+
+/// Pull events from the stream until (and including) the first assistant reply.
+fn drain_until_assistant_reply(stream: &mut crate::Task<'_>) {
+    while let Some(item) = block_on(stream.next()) {
+        if let AgentEvent::AssistantReply(_) = item.unwrap() {
+            return;
+        }
+    }
+    panic!("stream ended before an assistant reply");
+}
+
+/// Pull events until a ToolFinished has been emitted (completing a tool round).
+fn drain_until_tool_finished(stream: &mut crate::Task<'_>) {
+    while let Some(item) = block_on(stream.next()) {
+        if let AgentEvent::ToolFinished(_) = item.unwrap() {
+            return;
+        }
+    }
+    panic!("stream ended before a tool finished");
 }

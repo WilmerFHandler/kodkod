@@ -14,7 +14,7 @@ pub use event::AgentEvent;
 /// Streaming events from an [`Agent::run`] call.
 pub type Task<'a> = futures::stream::BoxStream<'a, Result<AgentEvent, AgentError>>;
 
-use crate::{Conversation, Model, Provider, Tool, ToolExecutor};
+use crate::{Conversation, Message, Model, Provider, Tool, ToolExecutor};
 
 pub struct Agent<P> {
     provider: P,
@@ -66,7 +66,8 @@ where
     /// this turn. The provider uses `model` for the request target and vision handling.
     ///
     /// Pass a [`TaskControl`] so external callers can cancel the run between
-    /// provider rounds (e.g. a GUI "Cancel" button).
+    /// provider rounds (e.g. a GUI "Cancel" button) or steer it by injecting new
+    /// user messages at round boundaries.
     pub fn run<'a>(
         &'a self,
         conversation: &'a mut Conversation,
@@ -80,6 +81,15 @@ where
             loop {
                 if control.is_cancelled() {
                     Err(AgentError::Cancelled)?;
+                }
+
+                // Inject any user messages queued via TaskControl::steer. Each is
+                // appended to the conversation before the next provider call, so the
+                // model sees it this round. The event is yielded first so callers can
+                // mirror it into shared state.
+                for user in control.drain_pending_steers() {
+                    yield AgentEvent::Steered(user.clone());
+                    conversation.push_message(Message::User(user));
                 }
 
                 let provider_input: Cow<'_, Conversation> = if model.vision() {

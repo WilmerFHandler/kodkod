@@ -5,7 +5,9 @@ use crate::ProviderError;
 #[derive(Debug)]
 pub enum AgentError {
     Provider(ProviderError),
-    MaxToolRoundsExceeded { max: usize },
+    MaxToolRoundsExceeded {
+        max: usize,
+    },
     /// The caller requested cancellation via [`TaskControl`](super::TaskControl).
     Cancelled,
 }

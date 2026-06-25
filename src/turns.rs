@@ -101,7 +101,9 @@ impl<'a> Turns<'a> {
     }
 
     pub fn last(&self) -> Option<Turn<'a>> {
-        (!self.starts.is_empty()).then(|| self.get(self.starts.len() - 1)).flatten()
+        (!self.starts.is_empty())
+            .then(|| self.get(self.starts.len() - 1))
+            .flatten()
     }
 
     pub fn iter(&self) -> TurnIter<'a> {
