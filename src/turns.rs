@@ -163,7 +163,8 @@ fn turn_start_indices(messages: &[Message]) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(index, message)| match message {
-            Message::User(_) => Some(index),
+            // Steered messages are part of the current turn, not a new one.
+            Message::User(user) if !user.steered() => Some(index),
             _ => None,
         })
         .collect()
@@ -216,5 +217,25 @@ mod tests {
         assert!(first.uses_tools());
         assert_eq!(first.final_assistant_text(), Some("done"));
         assert_eq!(first.final_assistant().map(|a| a.content()), Some("done"));
+    }
+
+    #[test]
+    fn steered_messages_do_not_start_new_turns() {
+        // A steered user message injected mid-turn stays in the same turn.
+        let messages = vec![
+            Message::User(UserMessage::new("go")),
+            Message::Assistant(AssistantMessage::new("")),
+            Message::User(UserMessage::new("wait, also check tests").with_steered(true)),
+            Message::Assistant(AssistantMessage::new("done")),
+        ];
+
+        let collected: Vec<_> = turns(&messages).into_iter().collect();
+        assert_eq!(
+            collected.len(),
+            1,
+            "steered message should not split the turn"
+        );
+        assert_eq!(collected[0].messages().len(), 4);
+        assert_eq!(collected[0].start_index(), 0);
     }
 }

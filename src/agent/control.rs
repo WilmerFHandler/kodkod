@@ -40,6 +40,9 @@ impl TaskControl {
     /// steers are delivered in order. No-op outside a run — the message just
     /// waits until the loop next checks the mailbox.
     pub fn steer(&self, message: UserMessage) {
+        // Mark the message as a steering injection so it is treated as part of
+        // the current turn rather than starting a new one.
+        let message = message.with_steered(true);
         self.steers
             .lock()
             .expect("steer queue poisoned")

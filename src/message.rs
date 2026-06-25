@@ -44,6 +44,9 @@ pub struct UserMessage {
     content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     images: Vec<Image>,
+    /// Whether this was injected mid-turn via steering rather than starting a new turn.
+    #[serde(default, skip_serializing_if = "is_false")]
+    steered: bool,
 }
 
 impl UserMessage {
@@ -51,11 +54,18 @@ impl UserMessage {
         Self {
             content: content.into(),
             images: Vec::new(),
+            steered: false,
         }
     }
 
     pub fn with_images(mut self, images: Vec<Image>) -> Self {
         self.images = images;
+        self
+    }
+
+    /// Mark this message as a steering injection (mid-turn, not a new turn).
+    pub fn with_steered(mut self, steered: bool) -> Self {
+        self.steered = steered;
         self
     }
 
@@ -65,6 +75,10 @@ impl UserMessage {
 
     pub fn images(&self) -> &[Image] {
         &self.images
+    }
+
+    pub fn steered(&self) -> bool {
+        self.steered
     }
 }
 
@@ -220,4 +234,8 @@ mod base64_bytes {
             _ => Err(format!("invalid base64 character: {}", byte as char)),
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
