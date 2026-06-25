@@ -77,21 +77,22 @@ impl Provider for OpenAiCompatibleProvider {
         let response = builder
             .send()
             .await
-            .map_err(|error| ProviderError::new(format!("OpenAI request failed: {error}")))?;
+            .map_err(|error| ProviderError::request(format!("OpenAI request failed: {error}")))?;
         let status = response.status();
 
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::new(format!(
-                "OpenAI request failed with status {status}: {body}"
-            )));
+            return Err(ProviderError::http(
+                status.as_u16(),
+                format!("OpenAI request failed with status {status}: {body}"),
+            ));
         }
 
         let response = response
             .json::<ChatCompletionResponse>()
             .await
             .map_err(|error| {
-                ProviderError::new(format!("OpenAI response was not valid JSON: {error}"))
+                ProviderError::response(format!("OpenAI response was not valid JSON: {error}"))
             })?;
 
         response.into_assistant_message()

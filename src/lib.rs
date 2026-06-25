@@ -17,13 +17,13 @@ pub mod turns;
 
 pub use agent::{Agent, AgentError, AgentEvent, Task, TaskControl};
 pub use conversation::Conversation;
-pub use turns::{Turn, TurnIter, Turns, turns};
 pub use message::{AssistantMessage, Image, Message, SystemMessage, UserMessage};
-pub use provider::{Model, Provider, ProviderError};
+pub use provider::{Model, Provider, ProviderError, ProviderErrorKind, RetryPolicy, RetryProvider};
 pub use tool::{
     Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolResult,
     ToolResultOutcome, ToolSpec,
 };
+pub use turns::{Turn, TurnIter, Turns, turns};
 
 #[cfg(test)]
 mod tests;
