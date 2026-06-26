@@ -150,8 +150,8 @@ impl Tool for FailingTool {
 fn conversation_tracks_messages() {
     let mut conversation = Conversation::new().with_system_prompt("Be concise.");
 
-    conversation.push_user_message("hello");
-    conversation.push_assistant_message(AssistantMessage::new("hi"));
+    conversation.push_user_message(UserMessage::new("hello"));
+    conversation.push_message(Message::Assistant(AssistantMessage::new("hi")));
 
     assert_eq!(conversation.system_prompt(), Some("Be concise."));
     assert_eq!(conversation.messages().len(), 2);
@@ -281,7 +281,7 @@ fn conversation_tracks_tool_results() {
     let mut conversation = Conversation::new();
     let result = ToolResult::success("call_1", json!({ "value": "hello" }));
 
-    conversation.push_tool_result(result.clone());
+    conversation.push_message(Message::ToolResult(result.clone()));
 
     assert!(matches!(
         &conversation.messages()[0],
@@ -338,12 +338,12 @@ fn tool_executor_wraps_tool_failures() {
 #[test]
 fn conversation_round_trips_through_json() {
     let mut conversation = Conversation::new().with_system_prompt("Be concise.");
-    conversation.push_user_message("hello");
-    conversation.push_assistant_message(AssistantMessage::new("").with_tool_calls(vec![
+    conversation.push_user_message(UserMessage::new("hello"));
+    conversation.push_message(Message::Assistant(AssistantMessage::new("").with_tool_calls(vec![
         ToolCall::new("call_1", "echo", json!({ "value": "hello" })),
-    ]));
-    conversation.push_tool_result(ToolResult::success("call_1", json!({ "value": "hello" })));
-    conversation.push_assistant_message(AssistantMessage::new("done"));
+    ])));
+    conversation.push_message(Message::ToolResult(ToolResult::success("call_1", json!({ "value": "hello" }))));
+    conversation.push_message(Message::Assistant(AssistantMessage::new("done")));
 
     let encoded = serde_json::to_string(&conversation).unwrap();
     let decoded: Conversation = serde_json::from_str(&encoded).unwrap();
@@ -354,11 +354,8 @@ fn conversation_round_trips_through_json() {
 #[test]
 fn conversation_without_images_strips_image_attachments() {
     let mut conversation = Conversation::new();
-    conversation.push_user_message_with_images(
-        "describe this",
-        vec![Image::new("image/png", vec![0x89, 0x50])],
-    );
-    conversation.push_assistant_message(AssistantMessage::new("ok"));
+    conversation.push_user_message(UserMessage::new("describe this").with_images(vec![Image::new("image/png", vec![0x89, 0x50])]));
+    conversation.push_message(Message::Assistant(AssistantMessage::new("ok")));
 
     let stripped = conversation.without_images();
 
@@ -456,7 +453,7 @@ async fn collect_events<P: Provider + Sync>(
     prompt: &str,
     model: &Model,
 ) -> Result<Vec<AgentEvent>, AgentError> {
-    conversation.push_user_message(prompt);
+    conversation.push_user_message(UserMessage::new(prompt));
     let control = TaskControl::new();
     let mut stream = agent.run(conversation, model, &control);
     let mut events = Vec::new();
@@ -474,7 +471,7 @@ async fn collect_run<P: Provider + Sync>(
     prompt: &str,
     model: &Model,
 ) -> Result<AssistantMessage, AgentError> {
-    conversation.push_user_message(prompt);
+    conversation.push_user_message(UserMessage::new(prompt));
     let control = TaskControl::new();
     let mut stream = agent.run(conversation, model, &control);
 
@@ -514,7 +511,7 @@ fn image_in_conversation_json_roundtrips() {
     use crate::{Conversation, Image};
     let mut conversation = Conversation::new();
     conversation
-        .push_user_message_with_images("describe", vec![Image::new("image/png", vec![0x89, 0x50])]);
+        .push_user_message(UserMessage::new("describe").with_images(vec![Image::new("image/png", vec![0x89, 0x50])]));
     let encoded = serde_json::to_string_pretty(&conversation).unwrap();
     let decoded: Conversation = serde_json::from_str(&encoded).expect(&encoded);
     assert_eq!(decoded, conversation);
@@ -569,7 +566,7 @@ fn steered_message_is_injected_between_rounds() {
     let mut conversation = Conversation::new();
 
     let model = Model::new("echo", "Echo");
-    conversation.push_user_message("go");
+    conversation.push_user_message(UserMessage::new("go"));
     let control = TaskControl::new();
     let mut stream = agent.run(&mut conversation, &model, &control);
 
@@ -631,7 +628,7 @@ fn steer_events_are_emitted_in_order() {
     let mut conversation = Conversation::new();
 
     let model = Model::new("echo", "Echo");
-    conversation.push_user_message("start");
+    conversation.push_user_message(UserMessage::new("start"));
     let control = TaskControl::new();
 
     // Collect every event from the run while queuing steers between rounds.
@@ -713,7 +710,7 @@ fn cancel_takes_precedence_over_steer() {
     let mut conversation = Conversation::new();
 
     let model = Model::new("echo", "Echo");
-    conversation.push_user_message("start");
+    conversation.push_user_message(UserMessage::new("start"));
     let control = TaskControl::new();
     let mut stream = agent.run(&mut conversation, &model, &control);
 

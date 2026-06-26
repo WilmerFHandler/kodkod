@@ -106,7 +106,7 @@ where
                 let tool_calls = message.tool_calls().to_vec();
 
                 yield AgentEvent::AssistantReply(message.clone());
-                conversation.push_assistant_message(message.clone());
+                conversation.push_message(Message::Assistant(message.clone()));
 
                 if tool_calls.is_empty() {
                     yield AgentEvent::Completed(message);
@@ -123,7 +123,7 @@ where
                     yield AgentEvent::ToolStarted(tool_call.clone());
                     let result = self.tools.execute(tool_call).await;
                     yield AgentEvent::ToolFinished(result.clone());
-                    conversation.push_tool_result(result);
+                    conversation.push_message(Message::ToolResult(result));
                 }
 
                 tool_rounds_executed += 1;

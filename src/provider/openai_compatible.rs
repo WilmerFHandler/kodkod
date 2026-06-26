@@ -415,11 +415,11 @@ mod tests {
     #[test]
     fn request_serializes_messages_and_tools_for_chat_completions() {
         let mut conversation = Conversation::new().with_system_prompt("Be concise.");
-        conversation.push_user_message("hello");
-        conversation.push_assistant_message(AssistantMessage::new("").with_tool_calls(vec![
+        conversation.push_user_message(UserMessage::new("hello"));
+        conversation.push_message(Message::Assistant(AssistantMessage::new("").with_tool_calls(vec![
             ToolCall::new("call_1", "echo", json!({ "value": "hello" })),
-        ]));
-        conversation.push_tool_result(ToolResult::success("call_1", json!({ "value": "hello" })));
+        ])));
+        conversation.push_message(Message::ToolResult(ToolResult::success("call_1", json!({ "value": "hello" }))));
 
         let request = ChatCompletionRequest::from_agent_input(
             "gpt-test",
@@ -631,7 +631,7 @@ mod tests {
     fn request_strips_images_for_non_vision_model() {
         let image = Image::new("image/png", vec![0x89, 0x50]);
         let mut conversation = Conversation::new();
-        conversation.push_user_message_with_images("describe this", vec![image]);
+        conversation.push_user_message(UserMessage::new("describe this").with_images(vec![image]));
 
         let request = ChatCompletionRequest::from_agent_input(
             "gpt-test",
@@ -650,7 +650,7 @@ mod tests {
     fn request_preserves_images_for_vision_model() {
         let image = Image::new("image/png", vec![0x89, 0x50]);
         let mut conversation = Conversation::new();
-        conversation.push_user_message_with_images("describe this", vec![image]);
+        conversation.push_user_message(UserMessage::new("describe this").with_images(vec![image]));
         let model = Model::with_vision("gpt-vision", "GPT Vision");
 
         let request =
