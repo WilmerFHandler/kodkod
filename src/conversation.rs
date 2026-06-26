@@ -63,9 +63,9 @@ impl Conversation {
 
     pub fn push_message(&mut self, message: Message) {
         match message {
-            Message::User(user) => {
-                self.push_user_message_with_images(user.content(), user.images().to_vec());
-            }
+            // Push user messages verbatim to preserve all fields (e.g. the
+            // `steered` flag that keeps injected messages in the same turn).
+            Message::User(user) => self.messages.push(Message::User(user)),
             Message::Assistant(assistant) => self.push_assistant_message(assistant),
             Message::System(system) => self.push_system_message(system.content()),
             Message::ToolResult(result) => self.push_tool_result(result),
@@ -84,12 +84,49 @@ impl Conversation {
                 .messages
                 .iter()
                 .map(|message| match message {
-                    Message::User(user) => {
-                        Message::User(UserMessage::new(user.content()).with_images(Vec::new()))
-                    }
+                    Message::User(user) => Message::User(
+                        UserMessage::new(user.content())
+                            .with_images(Vec::new())
+                            .with_steered(user.steered()),
+                    ),
                     _ => message.clone(),
                 })
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Message, UserMessage};
+
+    #[test]
+    fn push_message_preserves_steered_flag() {
+        let mut conv = Conversation::new();
+        conv.push_message(Message::User(UserMessage::new("go")));
+        conv.push_message(Message::Assistant(AssistantMessage::new("ok")));
+        conv.push_message(Message::User(
+            UserMessage::new("steer me").with_steered(true),
+        ));
+
+        assert_eq!(conv.turns().count(), 1);
+        let steer = match conv.messages().get(2).unwrap() {
+            Message::User(u) => u,
+            _ => panic!("expected user"),
+        };
+        assert!(steer.steered(), "steered flag must survive push_message");
+    }
+
+    #[test]
+    fn without_images_preserves_steered_flag() {
+        let mut conv = Conversation::new();
+        conv.push_message(Message::User(UserMessage::new("x").with_steered(true)));
+        let stripped = conv.without_images();
+        let user = match stripped.messages().first().unwrap() {
+            Message::User(u) => u,
+            _ => panic!("expected user"),
+        };
+        assert!(user.steered());
     }
 }
