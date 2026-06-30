@@ -121,7 +121,16 @@ where
 
                 for tool_call in &tool_calls {
                     yield AgentEvent::ToolStarted(tool_call.clone());
-                    let result = self.tools.execute(tool_call).await;
+                }
+
+                let results = futures::future::join_all(
+                    tool_calls
+                        .iter()
+                        .map(|tool_call| self.tools.execute(tool_call)),
+                )
+                .await;
+
+                for result in results {
                     yield AgentEvent::ToolFinished(result.clone());
                     conversation.push_message(Message::ToolResult(result));
                 }

@@ -226,6 +226,109 @@ fn agent_executes_tool_calls_until_final_response() {
     ));
 }
 
+struct SlowEchoTool {
+    max_in_flight: Arc<AtomicUsize>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl SlowEchoTool {
+    fn new() -> (Self, Arc<AtomicUsize>) {
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                max_in_flight: Arc::clone(&max_in_flight),
+                in_flight: Arc::new(AtomicUsize::new(0)),
+            },
+            max_in_flight,
+        )
+    }
+}
+
+impl Tool for SlowEchoTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "echo",
+            "Returns the provided arguments unchanged.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                },
+                "required": ["value"]
+            }),
+        )
+    }
+
+    fn execute<'a>(&'a self, arguments: &'a Value) -> ToolFuture<'a> {
+        let max_in_flight = Arc::clone(&self.max_in_flight);
+        let in_flight = Arc::clone(&self.in_flight);
+        Box::pin(async move {
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut observed = max_in_flight.load(Ordering::SeqCst);
+            while observed < now {
+                match max_in_flight.compare_exchange_weak(
+                    observed,
+                    now,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => observed = current,
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(arguments.clone())
+        })
+    }
+}
+
+struct TwoToolCallsProvider;
+
+impl Provider for TwoToolCallsProvider {
+    fn complete(
+        &self,
+        _model: &Model,
+        conversation: &Conversation,
+        _tools: &[ToolSpec],
+    ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+        let has_tool_results = conversation
+            .messages()
+            .iter()
+            .filter(|message| matches!(message, Message::ToolResult(_)))
+            .count();
+
+        ready(Ok(if has_tool_results == 0 {
+            AssistantMessage::new("").with_tool_calls(vec![
+                ToolCall::new("call_1", "echo", json!({ "value": "a" })),
+                ToolCall::new("call_2", "echo", json!({ "value": "b" })),
+            ])
+        } else {
+            assert_eq!(has_tool_results, 2);
+            AssistantMessage::new("done")
+        }))
+    }
+}
+
+#[tokio::test]
+async fn agent_executes_multiple_tool_calls_in_parallel() {
+    let (slow_tool, max_in_flight) = SlowEchoTool::new();
+    let agent = Agent::new(TwoToolCallsProvider).with_tool(Arc::new(slow_tool));
+    let mut conversation = Conversation::new();
+
+    let model = Model::new("echo", "Echo");
+    let response = collect_run(&agent, &mut conversation, "hello", &model)
+        .await
+        .unwrap();
+
+    assert_eq!(response.content(), "done");
+    assert!(
+        max_in_flight.load(Ordering::SeqCst) >= 2,
+        "expected at least two tool calls to overlap, got max_in_flight={}",
+        max_in_flight.load(Ordering::SeqCst)
+    );
+}
+
 #[test]
 fn run_reports_tool_progress_in_order() {
     let provider = ToolCallingProvider::default();
