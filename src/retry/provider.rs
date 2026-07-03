@@ -71,12 +71,41 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error;
+    use std::fmt;
     use std::future::Future;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
-    use crate::ProviderError;
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RetryTestError {
+        retryable: bool,
+        status_code: Option<u16>,
+    }
+
+    impl RetryTestError {
+        fn http(status_code: u16, retryable: bool) -> Self {
+            Self {
+                retryable,
+                status_code: Some(status_code),
+            }
+        }
+    }
+
+    impl fmt::Display for RetryTestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "retry test error")
+        }
+    }
+
+    impl Error for RetryTestError {}
+
+    impl Retryable for RetryTestError {
+        fn is_retryable(&self) -> bool {
+            self.retryable
+        }
+    }
 
     #[derive(Clone, Debug)]
     struct TestModel;
@@ -94,7 +123,7 @@ mod tests {
 
     impl Provider for FlakyProvider {
         type Model = TestModel;
-        type Error = ProviderError;
+        type Error = RetryTestError;
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
@@ -105,13 +134,13 @@ mod tests {
             _model: &TestModel,
             _conversation: &Conversation,
             _tools: &[ToolSpec],
-        ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+        ) -> impl Future<Output = Result<AssistantMessage, RetryTestError>> + Send {
             let calls = Arc::clone(&self.calls);
             let fail_until = self.fail_until;
             async move {
                 let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
                 if n <= fail_until {
-                    Err(ProviderError::http(503, format!("synthetic failure {n}")))
+                    Err(RetryTestError::http(503, true))
                 } else {
                     Ok(AssistantMessage::new("ok"))
                 }
@@ -150,7 +179,7 @@ mod tests {
         struct Once401;
         impl Provider for Once401 {
             type Model = TestModel;
-            type Error = ProviderError;
+            type Error = RetryTestError;
 
             fn supports_vision(&self, model: &TestModel) -> bool {
                 model.vision()
@@ -161,8 +190,8 @@ mod tests {
                 _model: &TestModel,
                 _conversation: &Conversation,
                 _tools: &[ToolSpec],
-            ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
-                async { Err(ProviderError::http(401, "unauthorized")) }
+            ) -> impl Future<Output = Result<AssistantMessage, RetryTestError>> + Send {
+                async { Err(RetryTestError::http(401, false)) }
             }
         }
 
@@ -173,6 +202,6 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(err.status_code(), Some(401));
+        assert_eq!(err.status_code, Some(401));
     }
 }

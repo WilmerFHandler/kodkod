@@ -1,13 +1,5 @@
-pub mod error;
-#[cfg(feature = "openai-compatible")]
-pub mod openai_compatible;
-
 use std::error::Error;
 use std::future::Future;
-
-pub use error::{ProviderError, ProviderErrorKind};
-#[cfg(feature = "openai-compatible")]
-pub use openai_compatible::complete_openai_compatible;
 
 use crate::{AssistantMessage, Conversation, ToolSpec};
 

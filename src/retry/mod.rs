@@ -2,7 +2,6 @@
 
 mod policy;
 mod provider;
-mod provider_error;
 mod retryable;
 
 pub use policy::RetryPolicy;

@@ -1,3 +1,5 @@
+use std::error::Error;
+use std::fmt;
 use std::future::{Future, ready};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,9 +13,20 @@ use serde_json::{Value, json};
 
 use crate::{
     Agent, AgentError, AgentEvent, AssistantMessage, Conversation, Image, Message, Provider,
-    ProviderError, TaskControl, Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError,
-    ToolFuture, ToolResult, ToolResultOutcome, ToolSpec, UserMessage,
+    TaskControl, Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture,
+    ToolResult, ToolResultOutcome, ToolSpec, UserMessage,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TestError(&'static str);
+
+impl fmt::Display for TestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl Error for TestError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TestModel {
@@ -48,7 +61,7 @@ struct RecordingProvider {
 
 impl Provider for RecordingProvider {
     type Model = TestModel;
-    type Error = ProviderError;
+    type Error = TestError;
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
@@ -59,7 +72,7 @@ impl Provider for RecordingProvider {
         _model: &TestModel,
         _conversation: &Conversation,
         tools: &[ToolSpec],
-    ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+    ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
         self.seen_tool_names
             .lock()
             .unwrap()
@@ -76,7 +89,7 @@ struct ToolCallingProvider {
 
 impl Provider for ToolCallingProvider {
     type Model = TestModel;
-    type Error = ProviderError;
+    type Error = TestError;
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
@@ -87,7 +100,7 @@ impl Provider for ToolCallingProvider {
         _model: &TestModel,
         conversation: &Conversation,
         tools: &[ToolSpec],
-    ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+    ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
         let call_count = self.calls.fetch_add(1, Ordering::SeqCst);
         assert!(tools.iter().any(|tool| tool.name() == "echo"));
 
@@ -113,7 +126,7 @@ struct AlwaysToolCallingProvider;
 
 impl Provider for AlwaysToolCallingProvider {
     type Model = TestModel;
-    type Error = ProviderError;
+    type Error = TestError;
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
@@ -124,7 +137,7 @@ impl Provider for AlwaysToolCallingProvider {
         _model: &TestModel,
         _conversation: &Conversation,
         _tools: &[ToolSpec],
-    ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+    ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
         ready(Ok(AssistantMessage::new("").with_tool_calls(vec![
             ToolCall::new("call_1", "missing", json!({})),
         ])))
@@ -283,7 +296,7 @@ struct TwoToolCallsProvider;
 
 impl Provider for TwoToolCallsProvider {
     type Model = TestModel;
-    type Error = ProviderError;
+    type Error = TestError;
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
@@ -294,7 +307,7 @@ impl Provider for TwoToolCallsProvider {
         _model: &TestModel,
         conversation: &Conversation,
         _tools: &[ToolSpec],
-    ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+    ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
         let has_tool_results = conversation
             .messages()
             .iter()
@@ -407,7 +420,7 @@ struct CapturingProvider {
 
 impl Provider for CapturingProvider {
     type Model = TestModel;
-    type Error = ProviderError;
+    type Error = TestError;
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
@@ -418,7 +431,7 @@ impl Provider for CapturingProvider {
         _model: &TestModel,
         conversation: &Conversation,
         _tools: &[ToolSpec],
-    ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+    ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
         self.saw_images
             .lock()
             .unwrap()
@@ -463,9 +476,9 @@ async fn collect_events<P>(
     conversation: &mut Conversation,
     prompt: &str,
     model: &P::Model,
-) -> Result<Vec<AgentEvent>, AgentError<ProviderError>>
+) -> Result<Vec<AgentEvent>, AgentError<TestError>>
 where
-    P: Provider<Error = ProviderError> + Sync,
+    P: Provider<Error = TestError> + Sync,
 {
     conversation.push_user_message(UserMessage::new(prompt));
     let control = TaskControl::new();
@@ -484,9 +497,9 @@ async fn collect_run<P>(
     conversation: &mut Conversation,
     prompt: &str,
     model: &P::Model,
-) -> Result<AssistantMessage, AgentError<ProviderError>>
+) -> Result<AssistantMessage, AgentError<TestError>>
 where
-    P: Provider<Error = ProviderError> + Sync,
+    P: Provider<Error = TestError> + Sync,
 {
     conversation.push_user_message(UserMessage::new(prompt));
     let control = TaskControl::new();
@@ -499,7 +512,7 @@ where
         item?;
     }
 
-    Err(AgentError::Provider(ProviderError::new(
+    Err(AgentError::Provider(TestError(
         "agent stream ended without completion",
     )))
 }
@@ -535,7 +548,7 @@ fn steered_message_is_injected_between_rounds() {
 
     impl Provider for SteerAwareProvider {
         type Model = TestModel;
-        type Error = ProviderError;
+        type Error = TestError;
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
@@ -546,7 +559,7 @@ fn steered_message_is_injected_between_rounds() {
             _model: &TestModel,
             conversation: &Conversation,
             tools: &[ToolSpec],
-        ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+        ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
             let round = self.calls.fetch_add(1, Ordering::SeqCst);
             assert!(tools.iter().any(|tool| tool.name() == "echo"));
 
@@ -614,7 +627,7 @@ fn steer_events_are_emitted_in_order() {
 
     impl Provider for LoopingProvider {
         type Model = TestModel;
-        type Error = ProviderError;
+        type Error = TestError;
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
@@ -625,7 +638,7 @@ fn steer_events_are_emitted_in_order() {
             _model: &TestModel,
             _conversation: &Conversation,
             tools: &[ToolSpec],
-        ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+        ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
             let round = self.calls.fetch_add(1, Ordering::SeqCst);
             assert!(tools.iter().any(|tool| tool.name() == "echo"));
             ready(Ok(if round + 1 >= self.rounds {
@@ -701,7 +714,7 @@ fn cancel_takes_precedence_over_steer() {
     struct IdleProvider;
     impl Provider for IdleProvider {
         type Model = TestModel;
-        type Error = ProviderError;
+        type Error = TestError;
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
@@ -712,7 +725,7 @@ fn cancel_takes_precedence_over_steer() {
             _model: &TestModel,
             _conversation: &Conversation,
             _tools: &[ToolSpec],
-        ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+        ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
             ready(Ok(AssistantMessage::new("").with_tool_calls(vec![
                 ToolCall::new("call_1", "echo", json!({})),
             ])))
@@ -750,7 +763,7 @@ fn cancel_takes_precedence_over_steer() {
 }
 
 /// Pull events from the stream until (and including) the first assistant reply.
-fn drain_until_assistant_reply(stream: &mut crate::Task<'_, ProviderError>) {
+fn drain_until_assistant_reply(stream: &mut crate::Task<'_, TestError>) {
     while let Some(item) = block_on(stream.next()) {
         if let AgentEvent::AssistantReply(_) = item.unwrap() {
             return;
@@ -760,7 +773,7 @@ fn drain_until_assistant_reply(stream: &mut crate::Task<'_, ProviderError>) {
 }
 
 /// Pull events until a ToolFinished has been emitted (completing a tool round).
-fn drain_until_tool_finished(stream: &mut crate::Task<'_, ProviderError>) {
+fn drain_until_tool_finished(stream: &mut crate::Task<'_, TestError>) {
     while let Some(item) = block_on(stream.next()) {
         if let AgentEvent::ToolFinished(_) = item.unwrap() {
             return;
