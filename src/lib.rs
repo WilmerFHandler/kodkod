@@ -12,6 +12,7 @@ pub mod agent;
 pub mod conversation;
 pub mod message;
 pub mod provider;
+pub mod retry;
 pub mod tool;
 pub mod turns;
 
@@ -20,9 +21,8 @@ pub use conversation::Conversation;
 pub use message::{AssistantMessage, Image, Message, SystemMessage, UserMessage};
 #[cfg(feature = "openai-compatible")]
 pub use provider::complete_openai_compatible;
-pub use provider::{
-    Provider, ProviderError, ProviderErrorKind, RetryPolicy, RetryProvider, Retryable,
-};
+pub use provider::{Provider, ProviderError, ProviderErrorKind};
+pub use retry::{RetryPolicy, RetryProvider, Retryable};
 pub use tool::{
     Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolResult,
     ToolResultOutcome, ToolSpec,

@@ -2,8 +2,6 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::Retryable;
-
 /// What went wrong when talking to a model backend.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,15 +85,3 @@ impl fmt::Display for ProviderError {
 }
 
 impl std::error::Error for ProviderError {}
-
-impl Retryable for ProviderError {
-    fn is_retryable(&self) -> bool {
-        match self.kind {
-            ProviderErrorKind::Request => true,
-            ProviderErrorKind::Http => self
-                .status_code
-                .is_some_and(|code| matches!(code, 408 | 429 | 500 | 502 | 503 | 504)),
-            ProviderErrorKind::Response | ProviderErrorKind::Other => false,
-        }
-    }
-}
