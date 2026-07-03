@@ -1,10 +1,9 @@
+use std::error::Error;
 use std::fmt;
 
-use crate::ProviderError;
-
 #[derive(Debug)]
-pub enum AgentError {
-    Provider(ProviderError),
+pub enum AgentError<E> {
+    Provider(E),
     MaxToolRoundsExceeded {
         max: usize,
     },
@@ -12,7 +11,10 @@ pub enum AgentError {
     Cancelled,
 }
 
-impl fmt::Display for AgentError {
+impl<E> fmt::Display for AgentError<E>
+where
+    E: fmt::Display,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Provider(error) => write!(f, "provider failed: {error}"),
@@ -24,17 +26,14 @@ impl fmt::Display for AgentError {
     }
 }
 
-impl std::error::Error for AgentError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl<E> Error for AgentError<E>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Provider(error) => Some(error),
             Self::MaxToolRoundsExceeded { .. } | Self::Cancelled => None,
         }
-    }
-}
-
-impl From<ProviderError> for AgentError {
-    fn from(error: ProviderError) -> Self {
-        Self::Provider(error)
     }
 }

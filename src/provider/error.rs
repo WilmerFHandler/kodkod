@@ -76,17 +76,6 @@ impl ProviderError {
     pub fn status_code(&self) -> Option<u16> {
         self.status_code
     }
-
-    /// Whether a transient failure might succeed on a later attempt.
-    pub fn is_retryable(&self) -> bool {
-        match self.kind {
-            ProviderErrorKind::Request => true,
-            ProviderErrorKind::Http => self
-                .status_code
-                .is_some_and(|code| matches!(code, 408 | 429 | 500 | 502 | 503 | 504)),
-            ProviderErrorKind::Response | ProviderErrorKind::Other => false,
-        }
-    }
 }
 
 impl fmt::Display for ProviderError {

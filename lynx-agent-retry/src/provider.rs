@@ -1,47 +1,6 @@
-use std::time::Duration;
+use lynx_agent::{AssistantMessage, Conversation, Provider, ToolSpec};
 
-use crate::{AssistantMessage, Conversation, Provider, ProviderError, ToolSpec};
-
-/// Policy for retrying transient [`ProviderError`]s with exponential backoff.
-#[derive(Debug, Clone)]
-pub struct RetryPolicy {
-    /// Maximum number of attempts for one `complete` call (including the first).
-    pub max_attempts: u32,
-    pub initial_backoff: Duration,
-    pub max_backoff: Duration,
-    /// Multiplier applied to the backoff after each failed retryable attempt.
-    pub backoff_multiplier: f64,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 4,
-            initial_backoff: Duration::from_millis(500),
-            max_backoff: Duration::from_secs(30),
-            backoff_multiplier: 2.0,
-        }
-    }
-}
-
-impl RetryPolicy {
-    pub fn disabled() -> Self {
-        Self {
-            max_attempts: 1,
-            ..Self::default()
-        }
-    }
-
-    fn backoff_after_attempt(&self, failed_attempt_index: u32) -> Duration {
-        let exp = failed_attempt_index.saturating_sub(1);
-        let mut millis = self.initial_backoff.as_millis() as f64;
-        for _ in 0..exp {
-            millis *= self.backoff_multiplier;
-        }
-        let capped = millis.min(self.max_backoff.as_millis() as f64);
-        Duration::from_millis(capped as u64)
-    }
-}
+use crate::{RetryPolicy, Retryable};
 
 /// Wraps any [`Provider`] and retries retryable failures between attempts.
 #[derive(Debug, Clone)]
@@ -78,8 +37,10 @@ impl<P> RetryProvider<P> {
 impl<P> Provider for RetryProvider<P>
 where
     P: Provider + Sync,
+    P::Error: Retryable,
 {
     type Model = P::Model;
+    type Error = P::Error;
 
     fn supports_vision(&self, model: &Self::Model) -> bool {
         self.inner.supports_vision(model)
@@ -90,7 +51,7 @@ where
         model: &Self::Model,
         conversation: &Conversation,
         tools: &[ToolSpec],
-    ) -> Result<AssistantMessage, ProviderError> {
+    ) -> Result<AssistantMessage, Self::Error> {
         let max = self.policy.max_attempts.max(1);
         let mut attempt = 0u32;
 
@@ -110,7 +71,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    use lynx_agent::ProviderError;
 
     #[derive(Clone, Debug)]
     struct TestModel;
@@ -120,7 +86,6 @@ mod tests {
             false
         }
     }
-    use std::sync::atomic::{AtomicU32, Ordering};
 
     struct FlakyProvider {
         calls: Arc<AtomicU32>,
@@ -129,6 +94,7 @@ mod tests {
 
     impl Provider for FlakyProvider {
         type Model = TestModel;
+        type Error = ProviderError;
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
@@ -184,6 +150,7 @@ mod tests {
         struct Once401;
         impl Provider for Once401 {
             type Model = TestModel;
+            type Error = ProviderError;
 
             fn supports_vision(&self, model: &TestModel) -> bool {
                 model.vision()

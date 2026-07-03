@@ -7,6 +7,8 @@
 //!
 //! Enable the `openai-compatible` feature for
 //! [`complete_openai_compatible`](provider::complete_openai_compatible).
+//!
+//! Optional retry middleware lives in the separate [`lynx-agent-retry`] crate.
 
 pub mod agent;
 pub mod conversation;
@@ -20,7 +22,7 @@ pub use conversation::Conversation;
 pub use message::{AssistantMessage, Image, Message, SystemMessage, UserMessage};
 #[cfg(feature = "openai-compatible")]
 pub use provider::complete_openai_compatible;
-pub use provider::{Provider, ProviderError, ProviderErrorKind, RetryPolicy, RetryProvider};
+pub use provider::{Provider, ProviderError, ProviderErrorKind};
 pub use tool::{
     Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolResult,
     ToolResultOutcome, ToolSpec,

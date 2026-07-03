@@ -8,6 +8,8 @@ tool execution, and structured message/result types. The optional
 `openai-compatible` feature adds [`complete_openai_compatible`] for OpenAI-shaped
 HTTP APIs.
 
+Transient retries are provided by the sibling [`lynx-agent-retry`] crate.
+
 ## Installation
 
 ```toml
@@ -22,10 +24,16 @@ Enable the OpenAI-compatible helper when you need the shared HTTP adapter:
 lynx-agent = { version = "0.1", features = ["openai-compatible"] }
 ```
 
+Add retry middleware when you want automatic backoff on transient provider failures:
+
+```toml
+lynx-agent-retry = "0.1"
+```
+
 ## Example
 
-Providers bring their own model type. The agent only asks for vision support and
-delegates the actual request to `complete`.
+Providers bring their own model and error types. The agent only asks for vision
+support and delegates the actual request to `complete`.
 
 ```rust
 use std::future::ready;
@@ -42,6 +50,7 @@ struct EchoProvider;
 
 impl Provider for EchoProvider {
     type Model = EchoModel;
+    type Error = ProviderError;
 
     fn supports_vision(&self, _model: &EchoModel) -> bool {
         false
@@ -52,7 +61,7 @@ impl Provider for EchoProvider {
         _model: &EchoModel,
         conversation: &Conversation,
         _tools: &[ToolSpec],
-    ) -> impl std::future::Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+    ) -> impl std::future::Future<Output = Result<AssistantMessage, Self::Error>> + Send {
         let content = conversation
             .messages()
             .iter()
@@ -88,6 +97,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+With retry middleware:
+
+```rust
+use lynx_agent_retry::{RetryPolicy, RetryProvider};
+
+let provider = RetryProvider::new(EchoProvider);
+let agent = Agent::new(provider);
+```
+
 With the `openai-compatible` feature:
 
 ```rust,no_run
@@ -106,6 +124,7 @@ struct OpenAiModel(&'static str);
 
 impl Provider for OpenAiProvider {
     type Model = OpenAiModel;
+    type Error = ProviderError;
 
     fn supports_vision(&self, _model: &OpenAiModel) -> bool {
         false
@@ -116,7 +135,7 @@ impl Provider for OpenAiProvider {
         model: &OpenAiModel,
         conversation: &Conversation,
         tools: &[ToolSpec],
-    ) -> Result<lynx_agent::AssistantMessage, ProviderError> {
+    ) -> Result<lynx_agent::AssistantMessage, Self::Error> {
         complete_openai_compatible(
             &self.client,
             "https://api.openai.com/v1",

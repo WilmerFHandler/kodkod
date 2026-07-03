@@ -12,7 +12,7 @@ pub use error::AgentError;
 pub use event::AgentEvent;
 
 /// Streaming events from an [`Agent::run`] call.
-pub type Task<'a> = futures::stream::BoxStream<'a, Result<AgentEvent, AgentError>>;
+pub type Task<'a, E> = futures::stream::BoxStream<'a, Result<AgentEvent, AgentError<E>>>;
 
 use crate::{Conversation, Message, Provider, Tool, ToolExecutor};
 
@@ -73,7 +73,7 @@ where
         conversation: &'a mut Conversation,
         model: &'a P::Model,
         control: &'a TaskControl,
-    ) -> Task<'a> {
+    ) -> Task<'a, P::Error> {
         Box::pin(try_stream! {
             let tool_specs = self.tools.specs();
             let mut tool_rounds_executed = 0;

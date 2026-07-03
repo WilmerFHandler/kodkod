@@ -48,6 +48,7 @@ struct RecordingProvider {
 
 impl Provider for RecordingProvider {
     type Model = TestModel;
+    type Error = ProviderError;
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
@@ -75,6 +76,7 @@ struct ToolCallingProvider {
 
 impl Provider for ToolCallingProvider {
     type Model = TestModel;
+    type Error = ProviderError;
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
@@ -111,6 +113,7 @@ struct AlwaysToolCallingProvider;
 
 impl Provider for AlwaysToolCallingProvider {
     type Model = TestModel;
+    type Error = ProviderError;
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
@@ -280,6 +283,7 @@ struct TwoToolCallsProvider;
 
 impl Provider for TwoToolCallsProvider {
     type Model = TestModel;
+    type Error = ProviderError;
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
@@ -403,6 +407,7 @@ struct CapturingProvider {
 
 impl Provider for CapturingProvider {
     type Model = TestModel;
+    type Error = ProviderError;
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
@@ -458,9 +463,9 @@ async fn collect_events<P>(
     conversation: &mut Conversation,
     prompt: &str,
     model: &P::Model,
-) -> Result<Vec<AgentEvent>, AgentError>
+) -> Result<Vec<AgentEvent>, AgentError<ProviderError>>
 where
-    P: Provider + Sync,
+    P: Provider<Error = ProviderError> + Sync,
 {
     conversation.push_user_message(UserMessage::new(prompt));
     let control = TaskControl::new();
@@ -479,9 +484,9 @@ async fn collect_run<P>(
     conversation: &mut Conversation,
     prompt: &str,
     model: &P::Model,
-) -> Result<AssistantMessage, AgentError>
+) -> Result<AssistantMessage, AgentError<ProviderError>>
 where
-    P: Provider + Sync,
+    P: Provider<Error = ProviderError> + Sync,
 {
     conversation.push_user_message(UserMessage::new(prompt));
     let control = TaskControl::new();
@@ -530,6 +535,7 @@ fn steered_message_is_injected_between_rounds() {
 
     impl Provider for SteerAwareProvider {
         type Model = TestModel;
+        type Error = ProviderError;
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
@@ -608,6 +614,7 @@ fn steer_events_are_emitted_in_order() {
 
     impl Provider for LoopingProvider {
         type Model = TestModel;
+        type Error = ProviderError;
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
@@ -694,6 +701,7 @@ fn cancel_takes_precedence_over_steer() {
     struct IdleProvider;
     impl Provider for IdleProvider {
         type Model = TestModel;
+        type Error = ProviderError;
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
@@ -742,7 +750,7 @@ fn cancel_takes_precedence_over_steer() {
 }
 
 /// Pull events from the stream until (and including) the first assistant reply.
-fn drain_until_assistant_reply(stream: &mut crate::Task<'_>) {
+fn drain_until_assistant_reply(stream: &mut crate::Task<'_, ProviderError>) {
     while let Some(item) = block_on(stream.next()) {
         if let AgentEvent::AssistantReply(_) = item.unwrap() {
             return;
@@ -752,7 +760,7 @@ fn drain_until_assistant_reply(stream: &mut crate::Task<'_>) {
 }
 
 /// Pull events until a ToolFinished has been emitted (completing a tool round).
-fn drain_until_tool_finished(stream: &mut crate::Task<'_>) {
+fn drain_until_tool_finished(stream: &mut crate::Task<'_, ProviderError>) {
     while let Some(item) = block_on(stream.next()) {
         if let AgentEvent::ToolFinished(_) = item.unwrap() {
             return;
