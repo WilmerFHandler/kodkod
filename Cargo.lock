@@ -454,14 +454,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lynx-agent-retry"
-version = "0.1.0"
-dependencies = [
- "lynx-agent",
- "tokio",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

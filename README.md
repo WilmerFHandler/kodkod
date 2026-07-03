@@ -8,8 +8,6 @@ tool execution, and structured message/result types. The optional
 `openai-compatible` feature adds [`complete_openai_compatible`] for OpenAI-shaped
 HTTP APIs.
 
-Transient retries are provided by the sibling [`lynx-agent-retry`] crate.
-
 ## Installation
 
 ```toml
@@ -22,12 +20,6 @@ Enable the OpenAI-compatible helper when you need the shared HTTP adapter:
 ```toml
 [dependencies]
 lynx-agent = { version = "0.1", features = ["openai-compatible"] }
-```
-
-Add retry middleware when you want automatic backoff on transient provider failures:
-
-```toml
-lynx-agent-retry = "0.1"
 ```
 
 ## Example
@@ -100,10 +92,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 With retry middleware:
 
 ```rust
-use lynx_agent_retry::{RetryPolicy, RetryProvider};
+use lynx_agent::{RetryProvider, /* ... */};
 
-let provider = RetryProvider::new(EchoProvider);
-let agent = Agent::new(provider);
+let agent = Agent::new(RetryProvider::new(EchoProvider));
 ```
 
 With the `openai-compatible` feature:

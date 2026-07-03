@@ -1,6 +1,8 @@
 pub mod error;
 #[cfg(feature = "openai-compatible")]
 pub mod openai_compatible;
+pub mod retry;
+mod retryable;
 
 use std::error::Error;
 use std::future::Future;
@@ -8,6 +10,8 @@ use std::future::Future;
 pub use error::{ProviderError, ProviderErrorKind};
 #[cfg(feature = "openai-compatible")]
 pub use openai_compatible::complete_openai_compatible;
+pub use retry::{RetryPolicy, RetryProvider};
+pub use retryable::Retryable;
 
 use crate::{AssistantMessage, Conversation, ToolSpec};
 
