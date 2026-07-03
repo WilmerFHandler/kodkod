@@ -1,6 +1,6 @@
-# lynx-agent
+# kodkod
 
-`lynx-agent` is a small Rust library for running provider-agnostic agent loops
+`kodkod` is a small Rust library for running provider-agnostic agent loops
 with tool calling support.
 
 The crate defines conversation state, the [`Provider`] trait, tool traits,
@@ -10,7 +10,7 @@ tool execution, retry middleware, and structured message/result types.
 
 ```toml
 [dependencies]
-lynx-agent = "0.1"
+kodkod = "0.1"
 ```
 
 ## Example
@@ -24,7 +24,7 @@ use std::fmt;
 use std::future::ready;
 
 use futures::StreamExt;
-use lynx_agent::{
+use kodkod::{
     Agent, AgentEvent, AssistantMessage, Conversation, Provider, TaskControl, ToolSpec,
 };
 
@@ -62,7 +62,7 @@ impl Provider for EchoProvider {
             .iter()
             .rev()
             .find_map(|message| match message {
-                lynx_agent::Message::User(user) => Some(user.content().to_owned()),
+                kodkod::Message::User(user) => Some(user.content().to_owned()),
                 _ => None,
             })
             .unwrap_or_else(|| "hello".to_owned());
@@ -75,7 +75,7 @@ impl Provider for EchoProvider {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent = Agent::new(EchoProvider);
     let mut conversation = Conversation::new();
-    conversation.push_user_message(lynx_agent::UserMessage::new("hello"));
+    conversation.push_user_message(kodkod::UserMessage::new("hello"));
 
     let model = EchoModel;
     let control = TaskControl::new();
@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 With retry middleware:
 
 ```rust
-use lynx_agent::RetryProvider;
+use kodkod::RetryProvider;
 
 let agent = Agent::new(RetryProvider::new(EchoProvider));
 ```

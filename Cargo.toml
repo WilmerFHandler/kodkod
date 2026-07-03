@@ -1,11 +1,11 @@
 [package]
-name = "lynx-agent"
+name = "kodkod"
 version = "0.1.0"
 edition = "2024"
 description = "A small provider-agnostic agent loop with tool calling support."
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/WilmerFHandler/lynx-agent"
+repository = "https://github.com/WilmerFHandler/kodkod"
 keywords = ["agent", "llm", "tools"]
 categories = ["asynchronous"]
 exclude = [".raven/"]

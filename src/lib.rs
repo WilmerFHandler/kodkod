@@ -1,6 +1,6 @@
 //! A small provider-agnostic agent loop with tool calling support.
 //!
-//! `lynx-agent` provides the core types needed to run an agent against any
+//! `kodkod` provides the core types needed to run an agent against any
 //! backend that implements [`Provider`]. The crate keeps provider integration,
 //! conversation state, and tool execution separate so applications can bring
 //! their own model backend and tool implementations.
