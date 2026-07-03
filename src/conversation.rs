@@ -71,47 +71,41 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AssistantMessage, Message, UserMessage};
+    use crate::{Message, UserMessage};
 
     #[test]
-    fn push_message_preserves_steered_flag() {
+    fn steered_flag_survives_push_and_image_stripping() {
         let mut conv = Conversation::new();
-        conv.push_message(Message::User(UserMessage::new("go")));
-        conv.push_message(Message::Assistant(AssistantMessage::new("ok")));
+        conv.push_user_message(UserMessage::new("go"));
         conv.push_message(Message::User(
             UserMessage::new("steer me").with_steered(true),
         ));
-
         assert_eq!(conv.turns().count(), 1);
-        let steer = match conv.messages().get(2).unwrap() {
-            Message::User(u) => u,
-            _ => panic!("expected user"),
-        };
-        assert!(steer.steered(), "steered flag must survive push_message");
-    }
+        assert!(matches!(
+            conv.messages().last(),
+            Some(Message::User(user)) if user.steered()
+        ));
 
-    #[test]
-    fn push_user_message_preserves_steered_flag() {
-        let mut conv = Conversation::new();
-        conv.push_user_message(UserMessage::new("go"));
-        conv.push_user_message(UserMessage::new("steer me").with_steered(true));
-        assert_eq!(conv.turns().count(), 1);
-        let steer = match conv.messages().get(1).unwrap() {
-            Message::User(u) => u,
-            _ => panic!("expected user"),
-        };
-        assert!(steer.steered());
-    }
-
-    #[test]
-    fn without_images_preserves_steered_flag() {
-        let mut conv = Conversation::new();
-        conv.push_user_message(UserMessage::new("x").with_steered(true));
         let stripped = conv.without_images();
-        let user = match stripped.messages().first().unwrap() {
-            Message::User(u) => u,
-            _ => panic!("expected user"),
-        };
-        assert!(user.steered());
+        assert!(matches!(
+            stripped.messages().last(),
+            Some(Message::User(user)) if user.steered()
+        ));
+    }
+
+    #[test]
+    fn without_images_strips_attachments() {
+        use crate::Image;
+
+        let mut conv = Conversation::new();
+        conv.push_user_message(
+            UserMessage::new("describe")
+                .with_images(vec![Image::new("image/png", vec![0x89, 0x50])]),
+        );
+        let stripped = conv.without_images();
+        assert!(matches!(
+            stripped.messages().first(),
+            Some(Message::User(user)) if user.content() == "describe" && user.images().is_empty()
+        ));
     }
 }

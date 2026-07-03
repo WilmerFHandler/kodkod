@@ -1,7 +1,6 @@
-use std::future::Future;
 use std::time::Duration;
 
-use crate::{AssistantMessage, Conversation, Model, Provider, ProviderError, ToolSpec};
+use crate::{AssistantMessage, Conversation, Provider, ProviderError, ToolSpec};
 
 /// Policy for retrying transient [`ProviderError`]s with exponential backoff.
 #[derive(Debug, Clone)]
@@ -80,29 +79,29 @@ impl<P> Provider for RetryProvider<P>
 where
     P: Provider + Sync,
 {
-    fn models(&self) -> Vec<Model> {
-        self.inner.models()
+    type Model = P::Model;
+
+    fn supports_vision(&self, model: &Self::Model) -> bool {
+        self.inner.supports_vision(model)
     }
 
-    fn complete(
+    async fn complete(
         &self,
-        model: &Model,
+        model: &Self::Model,
         conversation: &Conversation,
         tools: &[ToolSpec],
-    ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
-        async move {
-            let max = self.policy.max_attempts.max(1);
-            let mut attempt = 0u32;
+    ) -> Result<AssistantMessage, ProviderError> {
+        let max = self.policy.max_attempts.max(1);
+        let mut attempt = 0u32;
 
-            loop {
-                attempt += 1;
-                match self.inner.complete(model, conversation, tools).await {
-                    Ok(message) => return Ok(message),
-                    Err(error) if error.is_retryable() && attempt < max => {
-                        tokio::time::sleep(self.policy.backoff_after_attempt(attempt)).await;
-                    }
-                    Err(error) => return Err(error),
+        loop {
+            attempt += 1;
+            match self.inner.complete(model, conversation, tools).await {
+                Ok(message) => return Ok(message),
+                Err(error) if error.is_retryable() && attempt < max => {
+                    tokio::time::sleep(self.policy.backoff_after_attempt(attempt)).await;
                 }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -112,6 +111,15 @@ where
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[derive(Clone, Debug)]
+    struct TestModel;
+
+    impl TestModel {
+        fn vision(&self) -> bool {
+            false
+        }
+    }
     use std::sync::atomic::{AtomicU32, Ordering};
 
     struct FlakyProvider {
@@ -120,9 +128,15 @@ mod tests {
     }
 
     impl Provider for FlakyProvider {
+        type Model = TestModel;
+
+        fn supports_vision(&self, model: &TestModel) -> bool {
+            model.vision()
+        }
+
         fn complete(
             &self,
-            _model: &Model,
+            _model: &TestModel,
             _conversation: &Conversation,
             _tools: &[ToolSpec],
         ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
@@ -155,7 +169,7 @@ mod tests {
             },
         );
 
-        let model = Model::new("m", "M");
+        let model = TestModel;
         let conversation = Conversation::new();
         let message = provider
             .complete(&model, &conversation, &[])
@@ -169,9 +183,15 @@ mod tests {
     async fn does_not_retry_non_retryable_errors() {
         struct Once401;
         impl Provider for Once401 {
+            type Model = TestModel;
+
+            fn supports_vision(&self, model: &TestModel) -> bool {
+                model.vision()
+            }
+
             fn complete(
                 &self,
-                _model: &Model,
+                _model: &TestModel,
                 _conversation: &Conversation,
                 _tools: &[ToolSpec],
             ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
@@ -179,7 +199,7 @@ mod tests {
             }
         }
 
-        let model = Model::new("m", "M");
+        let model = TestModel;
         let provider = RetryProvider::new(Once401);
         let err = provider
             .complete(&model, &Conversation::new(), &[])

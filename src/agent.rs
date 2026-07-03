@@ -14,7 +14,7 @@ pub use event::AgentEvent;
 /// Streaming events from an [`Agent::run`] call.
 pub type Task<'a> = futures::stream::BoxStream<'a, Result<AgentEvent, AgentError>>;
 
-use crate::{Conversation, Message, Model, Provider, Tool, ToolExecutor};
+use crate::{Conversation, Message, Provider, Tool, ToolExecutor};
 
 pub struct Agent<P> {
     provider: P,
@@ -63,7 +63,7 @@ where
     /// Run the agent loop on the current conversation, streaming progress events.
     ///
     /// The conversation must already include the user message (and any images) for
-    /// this turn. The provider uses `model` for the request target and vision handling.
+    /// this turn. The provider interprets `model` for the request target and vision support.
     ///
     /// Pass a [`TaskControl`] so external callers can cancel the run between
     /// provider rounds (e.g. a GUI "Cancel" button) or steer it by injecting new
@@ -71,7 +71,7 @@ where
     pub fn run<'a>(
         &'a self,
         conversation: &'a mut Conversation,
-        model: &'a Model,
+        model: &'a P::Model,
         control: &'a TaskControl,
     ) -> Task<'a> {
         Box::pin(try_stream! {
@@ -92,7 +92,7 @@ where
                     conversation.push_message(Message::User(user));
                 }
 
-                let provider_input: Cow<'_, Conversation> = if model.vision() {
+                let provider_input: Cow<'_, Conversation> = if self.provider.supports_vision(model) {
                     Cow::Borrowed(conversation)
                 } else {
                     Cow::Owned(conversation.without_images())

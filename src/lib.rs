@@ -5,8 +5,8 @@
 //! conversation state, and tool execution separate so applications can bring
 //! their own model backend and tool implementations.
 //!
-//! Enable the `openai-compatible` feature to use the built-in
-//! [`OpenAiCompatibleProvider`](provider::OpenAiCompatibleProvider).
+//! Enable the `openai-compatible` feature for
+//! [`complete_openai_compatible`](provider::complete_openai_compatible).
 
 pub mod agent;
 pub mod conversation;
@@ -18,7 +18,9 @@ pub mod turns;
 pub use agent::{Agent, AgentError, AgentEvent, Task, TaskControl};
 pub use conversation::Conversation;
 pub use message::{AssistantMessage, Image, Message, SystemMessage, UserMessage};
-pub use provider::{Model, Provider, ProviderError, ProviderErrorKind, RetryPolicy, RetryProvider};
+#[cfg(feature = "openai-compatible")]
+pub use provider::complete_openai_compatible;
+pub use provider::{Provider, ProviderError, ProviderErrorKind, RetryPolicy, RetryProvider};
 pub use tool::{
     Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolResult,
     ToolResultOutcome, ToolSpec,

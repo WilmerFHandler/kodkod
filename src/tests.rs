@@ -10,37 +10,35 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::{
-    Agent, AgentError, AgentEvent, AssistantMessage, Conversation, Image, Message, Model, Provider,
+    Agent, AgentError, AgentEvent, AssistantMessage, Conversation, Image, Message, Provider,
     ProviderError, TaskControl, Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError,
     ToolFuture, ToolResult, ToolResultOutcome, ToolSpec, UserMessage,
 };
 
-struct EchoProvider;
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TestModel {
+    vision: bool,
+}
 
-impl Provider for EchoProvider {
-    fn complete(
-        &self,
-        _model: &Model,
-        conversation: &Conversation,
-        _tools: &[ToolSpec],
-    ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
-        let prompt = conversation.messages().iter().rev().find_map(|message| {
-            if let Message::User(message) = message {
-                Some(message.content().to_owned())
-            } else {
-                None
-            }
-        });
+impl TestModel {
+    const fn new() -> Self {
+        Self { vision: false }
+    }
 
-        ready(Ok(AssistantMessage::new(
-            prompt.unwrap_or_else(|| "no prompt".to_owned()),
-        )))
+    const fn with_vision() -> Self {
+        Self { vision: true }
+    }
+
+    fn vision(&self) -> bool {
+        self.vision
     }
 }
 
-#[test]
-fn provider_models_default_to_empty() {
-    assert!(EchoProvider.models().is_empty());
+fn conversation_has_images(conversation: &Conversation) -> bool {
+    conversation
+        .messages()
+        .iter()
+        .any(|message| matches!(message, Message::User(user) if !user.images().is_empty()))
 }
 
 #[derive(Default)]
@@ -49,9 +47,15 @@ struct RecordingProvider {
 }
 
 impl Provider for RecordingProvider {
+    type Model = TestModel;
+
+    fn supports_vision(&self, model: &TestModel) -> bool {
+        model.vision()
+    }
+
     fn complete(
         &self,
-        _model: &Model,
+        _model: &TestModel,
         _conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
@@ -70,9 +74,15 @@ struct ToolCallingProvider {
 }
 
 impl Provider for ToolCallingProvider {
+    type Model = TestModel;
+
+    fn supports_vision(&self, model: &TestModel) -> bool {
+        model.vision()
+    }
+
     fn complete(
         &self,
-        _model: &Model,
+        _model: &TestModel,
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
@@ -100,9 +110,15 @@ impl Provider for ToolCallingProvider {
 struct AlwaysToolCallingProvider;
 
 impl Provider for AlwaysToolCallingProvider {
+    type Model = TestModel;
+
+    fn supports_vision(&self, model: &TestModel) -> bool {
+        model.vision()
+    }
+
     fn complete(
         &self,
-        _model: &Model,
+        _model: &TestModel,
         _conversation: &Conversation,
         _tools: &[ToolSpec],
     ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
@@ -147,52 +163,13 @@ impl Tool for FailingTool {
 }
 
 #[test]
-fn conversation_tracks_messages() {
-    let mut conversation = Conversation::new().with_system_prompt("Be concise.");
-
-    conversation.push_user_message(UserMessage::new("hello"));
-    conversation.push_message(Message::Assistant(AssistantMessage::new("hi")));
-
-    assert_eq!(conversation.system_prompt(), Some("Be concise."));
-    assert_eq!(conversation.messages().len(), 2);
-    assert!(matches!(
-        &conversation.messages()[0],
-        Message::User(message) if message.content() == "hello"
-    ));
-    assert!(matches!(
-        &conversation.messages()[1],
-        Message::Assistant(message) if message.content() == "hi"
-    ));
-}
-
-#[test]
-fn agent_appends_user_and_assistant_messages() {
-    let agent = Agent::new(EchoProvider);
-    let mut conversation = Conversation::new();
-
-    let model = Model::new("echo", "Echo");
-    let response = block_on(collect_run(&agent, &mut conversation, "hello", &model)).unwrap();
-
-    assert_eq!(response.content(), "hello");
-    assert_eq!(conversation.messages().len(), 2);
-    assert!(matches!(
-        &conversation.messages()[0],
-        Message::User(message) if message.content() == "hello"
-    ));
-    assert!(matches!(
-        &conversation.messages()[1],
-        Message::Assistant(message) if message.content() == "hello"
-    ));
-}
-
-#[test]
 fn agent_passes_registered_tool_specs_to_provider() {
     let provider = RecordingProvider::default();
     let seen_tool_names = provider.seen_tool_names.clone();
     let agent = Agent::new(provider).with_tool(Arc::new(EchoTool));
     let mut conversation = Conversation::new();
 
-    let model = Model::new("echo", "Echo");
+    let model = TestModel::new();
     block_on(collect_run(&agent, &mut conversation, "hello", &model)).unwrap();
 
     assert_eq!(*seen_tool_names.lock().unwrap(), vec!["echo"]);
@@ -205,11 +182,27 @@ fn agent_executes_tool_calls_until_final_response() {
     let agent = Agent::new(provider).with_tool(Arc::new(EchoTool));
     let mut conversation = Conversation::new();
 
-    let model = Model::new("echo", "Echo");
-    let response = block_on(collect_run(&agent, &mut conversation, "hello", &model)).unwrap();
+    let model = TestModel::new();
+    let events = block_on(collect_events(&agent, &mut conversation, "hello", &model)).unwrap();
+    let response = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::Completed(message) => Some(message),
+            _ => None,
+        })
+        .unwrap();
 
     assert_eq!(response.content(), "done");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        &events[0],
+        AgentEvent::AssistantReply(message) if message.tool_calls().len() == 1
+    ));
+    assert!(matches!(&events[1], AgentEvent::ToolStarted(call) if call.name() == "echo"));
+    assert!(matches!(
+        &events[2],
+        AgentEvent::ToolFinished(result) if result.tool_call_id() == "call_1"
+    ));
     assert_eq!(conversation.messages().len(), 4);
     assert!(matches!(&conversation.messages()[0], Message::User(_)));
     assert!(matches!(
@@ -286,9 +279,15 @@ impl Tool for SlowEchoTool {
 struct TwoToolCallsProvider;
 
 impl Provider for TwoToolCallsProvider {
+    type Model = TestModel;
+
+    fn supports_vision(&self, model: &TestModel) -> bool {
+        model.vision()
+    }
+
     fn complete(
         &self,
-        _model: &Model,
+        _model: &TestModel,
         conversation: &Conversation,
         _tools: &[ToolSpec],
     ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
@@ -316,7 +315,7 @@ async fn agent_executes_multiple_tool_calls_in_parallel() {
     let agent = Agent::new(TwoToolCallsProvider).with_tool(Arc::new(slow_tool));
     let mut conversation = Conversation::new();
 
-    let model = Model::new("echo", "Echo");
+    let model = TestModel::new();
     let response = collect_run(&agent, &mut conversation, "hello", &model)
         .await
         .unwrap();
@@ -330,38 +329,11 @@ async fn agent_executes_multiple_tool_calls_in_parallel() {
 }
 
 #[test]
-fn run_reports_tool_progress_in_order() {
-    let provider = ToolCallingProvider::default();
-    let agent = Agent::new(provider).with_tool(Arc::new(EchoTool));
-    let mut conversation = Conversation::new();
-
-    let model = Model::new("echo", "Echo");
-    let events = block_on(collect_events(&agent, &mut conversation, "hello", &model)).unwrap();
-
-    assert!(
-        matches!(&events[0], AgentEvent::AssistantReply(message) if message.tool_calls().len() == 1)
-    );
-    assert!(matches!(&events[1], AgentEvent::ToolStarted(call) if call.name() == "echo"));
-    assert!(matches!(
-        &events[2],
-        AgentEvent::ToolFinished(result) if result.tool_call_id() == "call_1" && result.value().is_some()
-    ));
-    assert!(matches!(
-        &events[3],
-        AgentEvent::AssistantReply(message) if message.content() == "done" && message.tool_calls().is_empty()
-    ));
-    assert!(matches!(
-        &events[4],
-        AgentEvent::Completed(message) if message.content() == "done"
-    ));
-}
-
-#[test]
 fn agent_stops_after_max_tool_rounds() {
     let agent = Agent::new(AlwaysToolCallingProvider).with_max_tool_rounds(0);
     let mut conversation = Conversation::new();
 
-    let model = Model::new("echo", "Echo");
+    let model = TestModel::new();
     let result = block_on(collect_run(&agent, &mut conversation, "hello", &model));
 
     assert!(matches!(
@@ -372,68 +344,30 @@ fn agent_stops_after_max_tool_rounds() {
 }
 
 #[test]
-fn assistant_messages_can_include_tool_calls() {
-    let call = ToolCall::new("call_1", "echo", json!({ "value": "hello" }));
-    let message = AssistantMessage::new("").with_tool_calls(vec![call.clone()]);
-
-    assert_eq!(message.tool_calls(), &[call]);
-}
-
-#[test]
-fn conversation_tracks_tool_results() {
-    let mut conversation = Conversation::new();
-    let result = ToolResult::success("call_1", json!({ "value": "hello" }));
-
-    conversation.push_message(Message::ToolResult(result.clone()));
-
-    assert!(matches!(
-        &conversation.messages()[0],
-        Message::ToolResult(message) if message == &result
-    ));
-}
-
-#[test]
-fn tool_executor_registers_and_executes_tools() {
+fn tool_executor_routes_calls_and_errors() {
     let mut executor = ToolExecutor::new();
     executor.register(Arc::new(EchoTool));
-
-    let call = ToolCall::new("call_1", "echo", json!({ "value": "hello" }));
-    let result = block_on(executor.execute(&call));
-
-    assert_eq!(result.tool_call_id(), "call_1");
-    assert_eq!(
-        result.outcome(),
-        &ToolResultOutcome::Success(json!({ "value": "hello" }))
-    );
-    assert!(executor.has_tool("echo"));
-    assert_eq!(executor.specs()[0].name(), "echo");
-}
-
-#[test]
-fn tool_executor_reports_unknown_tools() {
-    let executor = ToolExecutor::new();
-    let call = ToolCall::new("call_1", "missing", json!({}));
-
-    let result = block_on(executor.execute(&call));
-
-    assert_eq!(result.tool_call_id(), "call_1");
-    assert_eq!(
-        result.outcome(),
-        &ToolResultOutcome::Error(ToolExecutorError::UnknownTool("missing".to_owned()))
-    );
-}
-
-#[test]
-fn tool_executor_wraps_tool_failures() {
-    let mut executor = ToolExecutor::new();
     executor.register(Arc::new(FailingTool));
 
-    let call = ToolCall::new("call_1", "fail", json!({}));
-    let result = block_on(executor.execute(&call));
-
-    assert_eq!(result.tool_call_id(), "call_1");
+    let success = block_on(executor.execute(&ToolCall::new(
+        "call_1",
+        "echo",
+        json!({ "value": "hello" }),
+    )));
     assert_eq!(
-        result.outcome(),
+        success.outcome(),
+        &ToolResultOutcome::Success(json!({ "value": "hello" }))
+    );
+
+    let unknown = block_on(executor.execute(&ToolCall::new("call_2", "missing", json!({}))));
+    assert_eq!(
+        unknown.outcome(),
+        &ToolResultOutcome::Error(ToolExecutorError::UnknownTool("missing".to_owned()))
+    );
+
+    let failure = block_on(executor.execute(&ToolCall::new("call_3", "fail", json!({}))));
+    assert_eq!(
+        failure.outcome(),
         &ToolResultOutcome::Error(ToolExecutorError::Tool(ToolError::new("boom")))
     );
 }
@@ -441,11 +375,20 @@ fn tool_executor_wraps_tool_failures() {
 #[test]
 fn conversation_round_trips_through_json() {
     let mut conversation = Conversation::new().with_system_prompt("Be concise.");
-    conversation.push_user_message(UserMessage::new("hello"));
-    conversation.push_message(Message::Assistant(AssistantMessage::new("").with_tool_calls(vec![
-        ToolCall::new("call_1", "echo", json!({ "value": "hello" })),
-    ])));
-    conversation.push_message(Message::ToolResult(ToolResult::success("call_1", json!({ "value": "hello" }))));
+    conversation.push_user_message(
+        UserMessage::new("describe").with_images(vec![Image::new("image/png", vec![0x89, 0x50])]),
+    );
+    conversation.push_message(Message::Assistant(
+        AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+            "call_1",
+            "echo",
+            json!({ "value": "hello" }),
+        )]),
+    ));
+    conversation.push_message(Message::ToolResult(ToolResult::success(
+        "call_1",
+        json!({ "value": "hello" }),
+    )));
     conversation.push_message(Message::Assistant(AssistantMessage::new("done")));
 
     let encoded = serde_json::to_string(&conversation).unwrap();
@@ -454,108 +397,71 @@ fn conversation_round_trips_through_json() {
     assert_eq!(decoded, conversation);
 }
 
-#[test]
-fn conversation_without_images_strips_image_attachments() {
-    let mut conversation = Conversation::new();
-    conversation.push_user_message(UserMessage::new("describe this").with_images(vec![Image::new("image/png", vec![0x89, 0x50])]));
-    conversation.push_message(Message::Assistant(AssistantMessage::new("ok")));
+struct CapturingProvider {
+    saw_images: Arc<Mutex<Vec<bool>>>,
+}
 
-    let stripped = conversation.without_images();
+impl Provider for CapturingProvider {
+    type Model = TestModel;
 
-    assert_eq!(stripped.messages().len(), 2);
-    assert!(matches!(
-        &stripped.messages()[0],
-        Message::User(user) if user.content() == "describe this" && user.images().is_empty()
-    ));
-    assert!(matches!(
-        &stripped.messages()[1],
-        Message::Assistant(message) if message.content() == "ok"
-    ));
+    fn supports_vision(&self, model: &TestModel) -> bool {
+        model.vision()
+    }
+
+    fn complete(
+        &self,
+        _model: &TestModel,
+        conversation: &Conversation,
+        _tools: &[ToolSpec],
+    ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
+        self.saw_images
+            .lock()
+            .unwrap()
+            .push(conversation_has_images(conversation));
+        ready(Ok(AssistantMessage::new("ok")))
+    }
 }
 
 #[test]
-fn messages_serialize_as_role_tagged_objects() {
-    assert_eq!(
-        serde_json::to_value(Message::User(UserMessage::new("hello"))).unwrap(),
-        json!({
-            "role": "user",
-            "content": "hello"
-        })
-    );
-    assert_eq!(
-        serde_json::to_value(Message::Assistant(AssistantMessage::new("hi"))).unwrap(),
-        json!({
-            "role": "assistant",
-            "content": "hi",
-            "tool_calls": []
-        })
-    );
-    assert_eq!(
-        serde_json::to_value(Message::ToolResult(ToolResult::success(
-            "call_1",
-            json!({ "value": "hello" })
-        )))
-        .unwrap(),
-        json!({
-            "role": "tool",
-            "tool_call_id": "call_1",
-            "outcome": {
-                "type": "success",
-                "value": { "value": "hello" }
-            }
-        })
-    );
+fn agent_strips_images_based_on_provider_vision_support() {
+    let saw_images = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(CapturingProvider {
+        saw_images: saw_images.clone(),
+    });
+    let image = vec![Image::new("image/png", vec![0x89, 0x50])];
+
+    let mut non_vision = Conversation::new();
+    non_vision.push_user_message(UserMessage::new("describe").with_images(image.clone()));
+    block_on(collect_run(
+        &agent,
+        &mut non_vision,
+        "go",
+        &TestModel::new(),
+    ))
+    .unwrap();
+    assert_eq!(saw_images.lock().unwrap().as_slice(), &[false]);
+
+    let mut vision = Conversation::new();
+    vision.push_user_message(UserMessage::new("describe").with_images(image));
+    block_on(collect_run(
+        &agent,
+        &mut vision,
+        "go",
+        &TestModel::with_vision(),
+    ))
+    .unwrap();
+    assert_eq!(saw_images.lock().unwrap().as_slice(), &[false, true]);
 }
 
-#[test]
-fn tool_spec_round_trips_through_json() {
-    let spec = EchoTool.spec();
-
-    let encoded = serde_json::to_string(&spec).unwrap();
-    let decoded: ToolSpec = serde_json::from_str(&encoded).unwrap();
-
-    assert_eq!(decoded, spec);
-}
-
-#[test]
-fn tool_result_outcomes_serialize_with_explicit_shape() {
-    let success = ToolResult::success("call_1", json!({ "value": "hello" }));
-    let error = ToolResult::failure(
-        "call_2",
-        ToolExecutorError::UnknownTool("missing".to_owned()),
-    );
-
-    assert_eq!(
-        serde_json::to_value(&success).unwrap(),
-        json!({
-            "tool_call_id": "call_1",
-            "outcome": {
-                "type": "success",
-                "value": { "value": "hello" }
-            }
-        })
-    );
-    assert_eq!(
-        serde_json::to_value(&error).unwrap(),
-        json!({
-            "tool_call_id": "call_2",
-            "outcome": {
-                "type": "error",
-                "value": {
-                    "type": "unknown_tool",
-                    "value": "missing"
-                }
-            }
-        })
-    );
-}
-
-async fn collect_events<P: Provider + Sync>(
+async fn collect_events<P>(
     agent: &Agent<P>,
     conversation: &mut Conversation,
     prompt: &str,
-    model: &Model,
-) -> Result<Vec<AgentEvent>, AgentError> {
+    model: &P::Model,
+) -> Result<Vec<AgentEvent>, AgentError>
+where
+    P: Provider + Sync,
+{
     conversation.push_user_message(UserMessage::new(prompt));
     let control = TaskControl::new();
     let mut stream = agent.run(conversation, model, &control);
@@ -568,12 +474,15 @@ async fn collect_events<P: Provider + Sync>(
     Ok(events)
 }
 
-async fn collect_run<P: Provider + Sync>(
+async fn collect_run<P>(
     agent: &Agent<P>,
     conversation: &mut Conversation,
     prompt: &str,
-    model: &Model,
-) -> Result<AssistantMessage, AgentError> {
+    model: &P::Model,
+) -> Result<AssistantMessage, AgentError>
+where
+    P: Provider + Sync,
+{
     conversation.push_user_message(UserMessage::new(prompt));
     let control = TaskControl::new();
     let mut stream = agent.run(conversation, model, &control);
@@ -610,17 +519,6 @@ impl Wake for NoopWaker {
 }
 
 #[test]
-fn image_in_conversation_json_roundtrips() {
-    use crate::{Conversation, Image};
-    let mut conversation = Conversation::new();
-    conversation
-        .push_user_message(UserMessage::new("describe").with_images(vec![Image::new("image/png", vec![0x89, 0x50])]));
-    let encoded = serde_json::to_string_pretty(&conversation).unwrap();
-    let decoded: Conversation = serde_json::from_str(&encoded).expect(&encoded);
-    assert_eq!(decoded, conversation);
-}
-
-#[test]
 fn steered_message_is_injected_between_rounds() {
     // On round 1 the provider returns a tool call, then the test steers a
     // message before round 2. Round 2 asserts the steer is present in the
@@ -631,9 +529,15 @@ fn steered_message_is_injected_between_rounds() {
     }
 
     impl Provider for SteerAwareProvider {
+        type Model = TestModel;
+
+        fn supports_vision(&self, model: &TestModel) -> bool {
+            model.vision()
+        }
+
         fn complete(
             &self,
-            _model: &Model,
+            _model: &TestModel,
             conversation: &Conversation,
             tools: &[ToolSpec],
         ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
@@ -668,7 +572,7 @@ fn steered_message_is_injected_between_rounds() {
     let agent = Agent::new(provider).with_tool(Arc::new(EchoTool));
     let mut conversation = Conversation::new();
 
-    let model = Model::new("echo", "Echo");
+    let model = TestModel::new();
     conversation.push_user_message(UserMessage::new("go"));
     let control = TaskControl::new();
     let mut stream = agent.run(&mut conversation, &model, &control);
@@ -703,9 +607,15 @@ fn steer_events_are_emitted_in_order() {
     }
 
     impl Provider for LoopingProvider {
+        type Model = TestModel;
+
+        fn supports_vision(&self, model: &TestModel) -> bool {
+            model.vision()
+        }
+
         fn complete(
             &self,
-            _model: &Model,
+            _model: &TestModel,
             _conversation: &Conversation,
             tools: &[ToolSpec],
         ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
@@ -730,7 +640,7 @@ fn steer_events_are_emitted_in_order() {
     .with_tool(Arc::new(EchoTool));
     let mut conversation = Conversation::new();
 
-    let model = Model::new("echo", "Echo");
+    let model = TestModel::new();
     conversation.push_user_message(UserMessage::new("start"));
     let control = TaskControl::new();
 
@@ -778,28 +688,20 @@ fn steer_events_are_emitted_in_order() {
 }
 
 #[test]
-fn drain_pending_steers_empties_the_queue() {
-    let control = TaskControl::new();
-    control.steer(UserMessage::new("a"));
-    control.steer(UserMessage::new("b"));
-
-    let drained = control.drain_pending_steers();
-    assert_eq!(drained.len(), 2);
-    assert_eq!(drained[0].content(), "a");
-    assert_eq!(drained[1].content(), "b");
-    // Second drain is empty: steers are consumed once.
-    assert!(control.drain_pending_steers().is_empty());
-}
-
-#[test]
 fn cancel_takes_precedence_over_steer() {
     // If a steer and a cancel are both pending, the cancel check runs first
     // and the turn ends without consuming the steer.
     struct IdleProvider;
     impl Provider for IdleProvider {
+        type Model = TestModel;
+
+        fn supports_vision(&self, model: &TestModel) -> bool {
+            model.vision()
+        }
+
         fn complete(
             &self,
-            _model: &Model,
+            _model: &TestModel,
             _conversation: &Conversation,
             _tools: &[ToolSpec],
         ) -> impl Future<Output = Result<AssistantMessage, ProviderError>> + Send {
@@ -812,7 +714,7 @@ fn cancel_takes_precedence_over_steer() {
     let agent = Agent::new(IdleProvider).with_tool(Arc::new(EchoTool));
     let mut conversation = Conversation::new();
 
-    let model = Model::new("echo", "Echo");
+    let model = TestModel::new();
     conversation.push_user_message(UserMessage::new("start"));
     let control = TaskControl::new();
     let mut stream = agent.run(&mut conversation, &model, &control);

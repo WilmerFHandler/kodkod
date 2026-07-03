@@ -3,10 +3,10 @@
 `lynx-agent` is a small Rust library for running provider-agnostic agent loops
 with tool calling support.
 
-The core crate defines conversation state, provider traits, tool traits, tool
-execution, and structured message/result types. The optional
-`openai-compatible` feature adds a `reqwest`-based adapter for OpenAI-compatible
-chat completion APIs.
+The core crate defines conversation state, the [`Provider`] trait, tool traits,
+tool execution, and structured message/result types. The optional
+`openai-compatible` feature adds [`complete_openai_compatible`] for OpenAI-shaped
+HTTP APIs.
 
 ## Installation
 
@@ -15,7 +15,7 @@ chat completion APIs.
 lynx-agent = "0.1"
 ```
 
-Enable the OpenAI-compatible provider when you want the built-in HTTP adapter:
+Enable the OpenAI-compatible helper when you need the shared HTTP adapter:
 
 ```toml
 [dependencies]
@@ -24,35 +24,66 @@ lynx-agent = { version = "0.1", features = ["openai-compatible"] }
 
 ## Example
 
+Providers bring their own model type. The agent only asks for vision support and
+delegates the actual request to `complete`.
+
 ```rust
 use std::future::ready;
 
-use lynx_agent::{Agent, AssistantMessage, Conversation, Provider, ProviderError, ToolSpec};
+use futures::StreamExt;
+use lynx_agent::{
+    Agent, AgentEvent, AssistantMessage, Conversation, Provider, ProviderError,
+    TaskControl, ToolSpec,
+};
+
+struct EchoModel;
 
 struct EchoProvider;
 
 impl Provider for EchoProvider {
+    type Model = EchoModel;
+
+    fn supports_vision(&self, _model: &EchoModel) -> bool {
+        false
+    }
+
     fn complete(
         &self,
+        _model: &EchoModel,
         conversation: &Conversation,
         _tools: &[ToolSpec],
     ) -> impl std::future::Future<Output = Result<AssistantMessage, ProviderError>> + Send {
         let content = conversation
             .messages()
-            .last()
-            .map(|_| "hello from lynx")
-            .unwrap_or("hello");
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                lynx_agent::Message::User(user) => Some(user.content().to_owned()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "hello".to_owned());
 
         ready(Ok(AssistantMessage::new(content)))
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent = Agent::new(EchoProvider);
     let mut conversation = Conversation::new();
+    conversation.push_user_message(lynx_agent::UserMessage::new("hello"));
 
-    let response = agent.run(&mut conversation, "hello").await?;
-    assert_eq!(response.content(), "hello from lynx");
+    let model = EchoModel;
+    let control = TaskControl::new();
+    let mut stream = agent.run(&mut conversation, &model, &control);
+
+    while let Some(event) = stream.next().await {
+        if let AgentEvent::Completed(message) = event? {
+            assert_eq!(message.content(), "hello");
+            break;
+        }
+    }
+
     Ok(())
 }
 ```
@@ -60,18 +91,64 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 With the `openai-compatible` feature:
 
 ```rust,no_run
-use lynx_agent::{Agent, Conversation, OpenAiCompatibleProvider};
+use futures::StreamExt;
+use lynx_agent::{
+    Agent, AgentEvent, Conversation, Provider, ProviderError, TaskControl, ToolSpec,
+    complete_openai_compatible,
+};
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let provider = OpenAiCompatibleProvider::openai(
-        std::env::var("OPENAI_API_KEY")?,
-        "gpt-4.1-mini",
-    );
+struct OpenAiProvider {
+    client: reqwest::Client,
+    api_key: String,
+}
+
+struct OpenAiModel(&'static str);
+
+impl Provider for OpenAiProvider {
+    type Model = OpenAiModel;
+
+    fn supports_vision(&self, _model: &OpenAiModel) -> bool {
+        false
+    }
+
+    async fn complete(
+        &self,
+        model: &OpenAiModel,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> Result<lynx_agent::AssistantMessage, ProviderError> {
+        complete_openai_compatible(
+            &self.client,
+            "https://api.openai.com/v1",
+            Some(&self.api_key),
+            model.0,
+            conversation,
+            tools,
+        )
+        .await
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let provider = OpenAiProvider {
+        client: reqwest::Client::new(),
+        api_key: std::env::var("OPENAI_API_KEY")?,
+    };
     let agent = Agent::new(provider);
     let mut conversation = Conversation::new();
+    conversation.push_user_message(lynx_agent::UserMessage::new("Write one short sentence."));
 
-    let response = agent.run(&mut conversation, "Write one short sentence.").await?;
-    println!("{}", response.content());
+    let model = OpenAiModel("gpt-4.1-mini");
+    let mut stream = agent.run(&mut conversation, &model, &TaskControl::new());
+
+    while let Some(event) = stream.next().await {
+        if let AgentEvent::Completed(message) = event? {
+            println!("{}", message.content());
+            break;
+        }
+    }
+
     Ok(())
 }
 ```

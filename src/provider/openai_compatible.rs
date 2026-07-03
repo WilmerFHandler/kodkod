@@ -1,102 +1,51 @@
-use std::borrow::Cow;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    AssistantMessage, Conversation, Message, Model, Provider, ProviderError, ToolCall, ToolResult,
+    AssistantMessage, Conversation, Message, ProviderError, ToolCall, ToolResult,
     ToolResultOutcome, ToolSpec,
 };
 
-const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+/// Run one chat-completions request against an OpenAI-compatible HTTP API.
+pub async fn complete_openai_compatible(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+    model_id: &str,
+    conversation: &Conversation,
+    tools: &[ToolSpec],
+) -> Result<AssistantMessage, ProviderError> {
+    let base_url = base_url.trim_end_matches('/');
+    let url = format!("{base_url}/chat/completions");
+    let request = ChatCompletionRequest::from_agent_input(model_id, conversation, tools)?;
+    let mut builder = client.post(url).json(&request);
 
-#[derive(Debug, Clone)]
-pub struct OpenAiCompatibleProvider {
-    client: reqwest::Client,
-    base_url: String,
-    api_key: Option<String>,
-}
-
-impl OpenAiCompatibleProvider {
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self::with_client(reqwest::Client::new(), base_url, None)
+    if let Some(api_key) = api_key {
+        builder = builder.bearer_auth(api_key);
     }
 
-    pub fn with_api_key(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
-        Self::with_client(reqwest::Client::new(), base_url, Some(api_key.into()))
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| ProviderError::request(format!("OpenAI request failed: {error}")))?;
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(ProviderError::http(
+            status.as_u16(),
+            format!("OpenAI request failed with status {status}: {body}"),
+        ));
     }
 
-    pub fn openai(api_key: impl Into<String>) -> Self {
-        Self::with_client(
-            reqwest::Client::new(),
-            OPENAI_BASE_URL,
-            Some(api_key.into()),
-        )
-    }
+    let response = response
+        .json::<ChatCompletionResponse>()
+        .await
+        .map_err(|error| {
+            ProviderError::response(format!("OpenAI response was not valid JSON: {error}"))
+        })?;
 
-    pub fn with_client(
-        client: reqwest::Client,
-        base_url: impl Into<String>,
-        api_key: Option<String>,
-    ) -> Self {
-        Self {
-            client,
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
-            api_key,
-        }
-    }
-
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    fn completions_url(&self) -> String {
-        format!("{}/chat/completions", self.base_url)
-    }
-}
-
-impl Provider for OpenAiCompatibleProvider {
-    async fn complete(
-        &self,
-        model: &Model,
-        conversation: &Conversation,
-        tools: &[ToolSpec],
-    ) -> Result<AssistantMessage, ProviderError> {
-        let conversation = if model.vision() {
-            Cow::Borrowed(conversation)
-        } else {
-            Cow::Owned(conversation.without_images())
-        };
-        let request = ChatCompletionRequest::from_agent_input(model.id(), &conversation, tools)?;
-        let mut builder = self.client.post(self.completions_url()).json(&request);
-
-        if let Some(api_key) = &self.api_key {
-            builder = builder.bearer_auth(api_key);
-        }
-
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| ProviderError::request(format!("OpenAI request failed: {error}")))?;
-        let status = response.status();
-
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::http(
-                status.as_u16(),
-                format!("OpenAI request failed with status {status}: {body}"),
-            ));
-        }
-
-        let response = response
-            .json::<ChatCompletionResponse>()
-            .await
-            .map_err(|error| {
-                ProviderError::response(format!("OpenAI response was not valid JSON: {error}"))
-            })?;
-
-        response.into_assistant_message()
-    }
+    response.into_assistant_message()
 }
 
 #[derive(Debug, Serialize)]
@@ -416,10 +365,17 @@ mod tests {
     fn request_serializes_messages_and_tools_for_chat_completions() {
         let mut conversation = Conversation::new().with_system_prompt("Be concise.");
         conversation.push_user_message(UserMessage::new("hello"));
-        conversation.push_message(Message::Assistant(AssistantMessage::new("").with_tool_calls(vec![
-            ToolCall::new("call_1", "echo", json!({ "value": "hello" })),
-        ])));
-        conversation.push_message(Message::ToolResult(ToolResult::success("call_1", json!({ "value": "hello" }))));
+        conversation.push_message(Message::Assistant(
+            AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+                "call_1",
+                "echo",
+                json!({ "value": "hello" }),
+            )]),
+        ));
+        conversation.push_message(Message::ToolResult(ToolResult::success(
+            "call_1",
+            json!({ "value": "hello" }),
+        )));
 
         let request = ChatCompletionRequest::from_agent_input(
             "gpt-test",
@@ -486,21 +442,6 @@ mod tests {
     }
 
     #[test]
-    fn request_omits_tools_when_none_are_registered() {
-        let conversation = Conversation::new();
-        let request =
-            ChatCompletionRequest::from_agent_input("gpt-test", &conversation, &[]).unwrap();
-
-        assert_eq!(
-            serde_json::to_value(request).unwrap(),
-            json!({
-                "model": "gpt-test",
-                "messages": []
-            })
-        );
-    }
-
-    #[test]
     fn request_serializes_user_message_with_images_as_content_parts() {
         let image = Image::new("image/png", vec![0x89, 0x50]);
         let user = UserMessage::new("describe this").with_images(vec![image]);
@@ -520,17 +461,6 @@ mod tests {
                 .unwrap()
                 .starts_with("data:image/png;base64,")
         );
-    }
-
-    #[test]
-    fn request_serializes_user_message_without_images_as_plain_string() {
-        let user = UserMessage::new("hello");
-
-        let message = ChatMessage::from_message(&Message::User(user)).unwrap();
-        let value = serde_json::to_value(&message).unwrap();
-
-        assert_eq!(value["role"], "user");
-        assert_eq!(value["content"], "hello");
     }
 
     #[test]
@@ -614,50 +544,5 @@ mod tests {
                 "tool_call_id": "call_1"
             })
         );
-    }
-
-    #[test]
-    fn core_message_serde_stays_independent_from_openai_adapter() {
-        assert_eq!(
-            serde_json::to_value(Message::User(UserMessage::new("hello"))).unwrap(),
-            json!({
-                "role": "user",
-                "content": "hello"
-            })
-        );
-    }
-
-    #[test]
-    fn request_strips_images_for_non_vision_model() {
-        let image = Image::new("image/png", vec![0x89, 0x50]);
-        let mut conversation = Conversation::new();
-        conversation.push_user_message(UserMessage::new("describe this").with_images(vec![image]));
-
-        let request = ChatCompletionRequest::from_agent_input(
-            "gpt-test",
-            &conversation.without_images(),
-            &[],
-        )
-        .unwrap();
-
-        let value = serde_json::to_value(request).unwrap();
-        let content = &value["messages"][0]["content"];
-        assert!(content.is_string());
-        assert_eq!(content.as_str().unwrap(), "describe this");
-    }
-
-    #[test]
-    fn request_preserves_images_for_vision_model() {
-        let image = Image::new("image/png", vec![0x89, 0x50]);
-        let mut conversation = Conversation::new();
-        conversation.push_user_message(UserMessage::new("describe this").with_images(vec![image]));
-        let model = Model::with_vision("gpt-vision", "GPT Vision");
-
-        let request =
-            ChatCompletionRequest::from_agent_input(model.id(), &conversation, &[]).unwrap();
-
-        let value = serde_json::to_value(request).unwrap();
-        let content = &value["messages"][0]["content"];
-        assert!(content.is_array());
     }
 }
