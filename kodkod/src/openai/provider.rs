@@ -1,10 +1,10 @@
 use std::marker::PhantomData;
 
-use kodkod::{AssistantMessage, Conversation, Provider, ToolSpec};
+use crate::{AssistantMessage, Conversation, Provider, ToolSpec};
 
-use crate::completion;
-use crate::error::OpenAiError;
-use crate::model::OpenAiModel;
+use super::completion;
+use super::error::OpenAiError;
+use super::model::OpenAiModel;
 
 /// Provider for OpenAI-compatible `/chat/completions` endpoints with a static bearer token.
 ///
@@ -81,7 +81,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kodkod::UserMessage;
+    use crate::UserMessage;
     use serde_json::json;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

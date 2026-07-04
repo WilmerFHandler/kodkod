@@ -545,9 +545,11 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "futures",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
@@ -555,11 +557,6 @@ name = "kodkod-openai"
 version = "0.1.0"
 dependencies = [
  "kodkod",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "wiremock",
 ]
 
 [[package]]

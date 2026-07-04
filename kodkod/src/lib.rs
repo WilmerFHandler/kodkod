@@ -24,5 +24,8 @@ pub use tool::{
 };
 pub use turns::{Turn, TurnIter, Turns, turns};
 
+#[cfg(feature = "openai")]
+pub mod openai;
+
 #[cfg(test)]
 mod tests;

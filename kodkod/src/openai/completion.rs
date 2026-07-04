@@ -1,8 +1,8 @@
-use kodkod::{AssistantMessage, Conversation, ToolSpec};
+use crate::{AssistantMessage, Conversation, ToolSpec};
 
-use crate::api::{ApiErrorResponse, ChatCompletionResponse};
-use crate::convert::{build_request, parse_assistant_message};
-use crate::error::OpenAiError;
+use super::api::{ApiErrorResponse, ChatCompletionResponse};
+use super::convert::{build_request, parse_assistant_message};
+use super::error::OpenAiError;
 
 pub fn chat_completions_url(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');

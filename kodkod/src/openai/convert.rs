@@ -1,15 +1,15 @@
-use kodkod::{
-    AssistantMessage, Conversation, Message, ToolCall, ToolExecutorError, ToolResultOutcome,
-    ToolSpec,
+use crate::{
+    AssistantMessage, Conversation, Message, ToolCall, ToolExecutorError, ToolResult,
+    ToolResultOutcome, ToolSpec,
 };
 use serde_json::Value;
 
-use crate::api::{
+use super::api::{
     ChatCompletionRequest, ChatCompletionResponse, ContentPart, FunctionDefinition,
     ImageUrl, RequestMessage, ToolCallKind, ToolDefinition, ToolDefinitionKind, UserContent,
     WireToolCall,
 };
-use crate::error::OpenAiError;
+use super::error::OpenAiError;
 
 pub(crate) fn build_request(
     model_id: &str,
@@ -111,7 +111,7 @@ fn convert_tool_call(call: &ToolCall) -> WireToolCall {
     WireToolCall {
         id: call.id().to_owned(),
         kind: ToolCallKind::Function,
-        function: crate::api::FunctionCall {
+        function: super::api::FunctionCall {
             name: call.name().to_owned(),
             arguments: serde_json::to_string(call.arguments()).unwrap_or_else(|_| "{}".to_owned()),
         },
@@ -119,7 +119,7 @@ fn convert_tool_call(call: &ToolCall) -> WireToolCall {
 }
 
 fn parse_legacy_function_call(
-    function_call: crate::api::FunctionCall,
+    function_call: super::api::FunctionCall,
 ) -> Result<ToolCall, OpenAiError> {
     let arguments = parse_function_arguments(&function_call.arguments)?;
     Ok(ToolCall::new(
@@ -154,9 +154,9 @@ fn convert_tool_spec(spec: &ToolSpec) -> ToolDefinition {
     }
 }
 
-fn tool_result_content(result: &kodkod::ToolResult) -> String {
+fn tool_result_content(result: &ToolResult) -> String {
     match result.outcome() {
-        ToolResultOutcome::Success(value) => serde_json::to_string(value).unwrap_or_default(),
+        ToolResultOutcome::Success(value) => serde_json::to_string(&value).unwrap_or_default(),
         ToolResultOutcome::Error(ToolExecutorError::UnknownTool(name)) => {
             format!("unknown tool: {name}")
         }
@@ -167,7 +167,7 @@ fn tool_result_content(result: &kodkod::ToolResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kodkod::{Image, ToolResult, UserMessage};
+    use crate::{Image, UserMessage};
     use serde_json::json;
 
     #[test]
