@@ -2,28 +2,28 @@ use std::marker::PhantomData;
 
 use kodkod::{AssistantMessage, Conversation, Provider, ToolSpec};
 
-use crate::api::{ApiErrorResponse, ChatCompletionResponse};
-use crate::convert::{build_request, parse_assistant_message};
+use crate::completion;
 use crate::error::OpenAiError;
 use crate::model::OpenAiModel;
 
-/// Provider for OpenAI-compatible `/chat/completions` endpoints.
+/// Provider for OpenAI-compatible `/chat/completions` endpoints with a static bearer token.
 ///
 /// `M` is a zero-sized type marker tying this provider to your [`OpenAiModel`]
-/// implementation (e.g. `OpenAiProvider::<MyModel>::new(url)`).
+/// implementation (e.g. `OpenAiCompatibleProvider::<MyModel>::new(url)`).
+///
+/// For per-request bearer tokens (e.g. OAuth), use [`completion::complete`] directly.
 #[derive(Clone)]
-pub struct OpenAiProvider<M = ()> {
+pub struct OpenAiCompatibleProvider<M = ()> {
     chat_completions_url: String,
     api_key: Option<String>,
     client: reqwest::Client,
     _model: PhantomData<M>,
 }
 
-impl<M> OpenAiProvider<M> {
+impl<M> OpenAiCompatibleProvider<M> {
     pub fn new(base_url: impl Into<String>) -> Self {
-        let base = base_url.into().trim_end_matches('/').to_owned();
         Self {
-            chat_completions_url: format!("{base}/chat/completions"),
+            chat_completions_url: completion::chat_completions_url(&base_url.into()),
             api_key: None,
             client: reqwest::Client::new(),
             _model: PhantomData,
@@ -43,9 +43,13 @@ impl<M> OpenAiProvider<M> {
     pub fn chat_completions_url(&self) -> &str {
         &self.chat_completions_url
     }
+
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
 }
 
-impl<M> Provider for OpenAiProvider<M>
+impl<M> Provider for OpenAiCompatibleProvider<M>
 where
     M: OpenAiModel,
 {
@@ -62,32 +66,15 @@ where
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> Result<AssistantMessage, Self::Error> {
-        let request = build_request(model.id(), conversation, tools);
-        let mut http_request = self
-            .client
-            .post(&self.chat_completions_url)
-            .json(&request);
-
-        if let Some(api_key) = &self.api_key {
-            http_request = http_request.bearer_auth(api_key);
-        }
-
-        let response = http_request.send().await?;
-        let status = response.status();
-
-        if !status.is_success() {
-            let message = match response.json::<ApiErrorResponse>().await {
-                Ok(body) => body.error.message,
-                Err(_) => status.to_string(),
-            };
-            return Err(OpenAiError::Api {
-                status: status.as_u16(),
-                message,
-            });
-        }
-
-        let body = response.json::<ChatCompletionResponse>().await?;
-        parse_assistant_message(body)
+        completion::complete(
+            &self.client,
+            &self.chat_completions_url,
+            self.api_key.as_deref(),
+            model.id(),
+            conversation,
+            tools,
+        )
+        .await
     }
 }
 
@@ -134,7 +121,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenAiProvider::<TestModel>::new(format!("{}/v1", server.uri()));
+        let provider = OpenAiCompatibleProvider::<TestModel>::new(format!("{}/v1", server.uri()));
         let mut conversation = Conversation::new();
         conversation.push_user_message(UserMessage::new("hello"));
 
