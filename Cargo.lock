@@ -543,20 +543,31 @@ dependencies = [
 name = "kodkod"
 version = "0.1.0"
 dependencies = [
+ "kodkod-core",
+ "kodkod-openai",
+]
+
+[[package]]
+name = "kodkod-core"
+version = "0.1.0"
+dependencies = [
  "async-stream",
  "futures",
- "reqwest",
  "serde",
  "serde_json",
  "tokio",
- "wiremock",
 ]
 
 [[package]]
 name = "kodkod-openai"
 version = "0.1.0"
 dependencies = [
- "kodkod",
+ "kodkod-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
 ]
 
 [[package]]

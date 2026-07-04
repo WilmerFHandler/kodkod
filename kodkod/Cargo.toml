@@ -4,28 +4,15 @@ version = "0.1.0"
 edition = "2024"
 description = "A small provider-agnostic agent loop with tool calling support."
 license = "MIT"
-readme = "README.md"
+readme = "../kodkod-core/README.md"
 repository = "https://github.com/WilmerFHandler/kodkod"
 keywords = ["agent", "llm", "tools"]
 categories = ["asynchronous"]
-exclude = [".raven/"]
 
 [features]
 default = []
-openai = ["dep:reqwest"]
+openai = ["dep:kodkod-openai"]
 
 [dependencies]
-async-stream = "0.3"
-futures = { version = "0.3", default-features = false, features = ["alloc", "std"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
-
-[dependencies.tokio]
-version = "1"
-default-features = false
-features = ["time"]
-
-[dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-wiremock = "0.6"
+kodkod-core = { path = "../kodkod-core", version = "0.1.0" }
+kodkod-openai = { path = "../kodkod-openai", optional = true, version = "0.1.0" }

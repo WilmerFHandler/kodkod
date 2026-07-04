@@ -1,31 +1,6 @@
-//! A small provider-agnostic agent loop with tool calling support.
-//!
-//! `kodkod` provides the core types needed to run an agent against any
-//! backend that implements [`Provider`]. The crate keeps provider integration,
-//! conversation state, and tool execution separate so applications can bring
-//! their own model backend and tool implementations.
+//! Facade crate for [`kodkod-core`] and optional OpenAI-compatible providers.
 
-pub mod agent;
-pub mod conversation;
-pub mod message;
-pub mod provider;
-pub mod retry;
-pub mod tool;
-pub mod turns;
-
-pub use agent::{Agent, AgentError, AgentEvent, Task, TaskControl};
-pub use conversation::Conversation;
-pub use message::{AssistantMessage, Image, Message, SystemMessage, UserMessage};
-pub use provider::Provider;
-pub use retry::{RetryPolicy, RetryProvider, Retryable};
-pub use tool::{
-    Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolResult,
-    ToolResultOutcome, ToolSpec,
-};
-pub use turns::{Turn, TurnIter, Turns, turns};
+pub use kodkod_core::*;
 
 #[cfg(feature = "openai")]
-pub mod openai;
-
-#[cfg(test)]
-mod tests;
+pub use kodkod_openai as openai;

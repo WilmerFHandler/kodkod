@@ -1,4 +1,4 @@
-use crate::{
+use kodkod_core::{
     AssistantMessage, Conversation, Message, ToolCall, ToolExecutorError, ToolResult,
     ToolResultOutcome, ToolSpec,
 };
@@ -167,7 +167,7 @@ fn tool_result_content(result: &ToolResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Image, UserMessage};
+    use kodkod_core::{Image, UserMessage};
     use serde_json::json;
 
     #[test]

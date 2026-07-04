@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::Retryable;
+use kodkod_core::Retryable;
 
 #[derive(Debug)]
 pub enum OpenAiError {

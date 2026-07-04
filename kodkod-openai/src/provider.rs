@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use crate::{AssistantMessage, Conversation, Provider, ToolSpec};
+use kodkod_core::{AssistantMessage, Conversation, Provider, ToolSpec};
 
 use super::completion;
 use super::error::OpenAiError;
@@ -81,7 +81,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::UserMessage;
+    use kodkod_core::UserMessage;
     use serde_json::json;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

@@ -1,4 +1,4 @@
-use crate::{AssistantMessage, Conversation, ToolSpec};
+use kodkod_core::{AssistantMessage, Conversation, ToolSpec};
 
 use super::api::{ApiErrorResponse, ChatCompletionResponse};
 use super::convert::{build_request, parse_assistant_message};
