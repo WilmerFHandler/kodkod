@@ -37,21 +37,21 @@ pub(crate) fn build_request(
                     tool_call_id: result.tool_call_id().to_owned(),
                     content: tool_result_content(result),
                 });
-                if let ToolResultOutcome::Success(output) = result.outcome() {
-                    if !output.images().is_empty() {
-                        let mut parts = vec![ContentPart::Text {
-                            text: format!(
-                                "Images returned by tool call '{}'.",
-                                result.tool_call_id()
-                            ),
-                        }];
-                        parts.extend(output.images().iter().map(|image| ContentPart::ImageUrl {
-                            image_url: ImageUrl {
-                                url: image.to_data_url(),
-                            },
-                        }));
-                        image_batches.push(parts);
-                    }
+                if let ToolResultOutcome::Success(output) = result.outcome()
+                    && !output.images().is_empty()
+                {
+                    let mut parts = vec![ContentPart::Text {
+                        text: format!(
+                            "Images returned by tool call '{}'.",
+                            result.tool_call_id()
+                        ),
+                    }];
+                    parts.extend(output.images().iter().map(|image| ContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: image.to_data_url(),
+                        },
+                    }));
+                    image_batches.push(parts);
                 }
                 message_index += 1;
             }
