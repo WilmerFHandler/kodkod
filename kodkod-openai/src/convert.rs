@@ -24,8 +24,47 @@ pub(crate) fn build_request(
         });
     }
 
-    for message in conversation.messages() {
-        messages.push(convert_message(message));
+    let mut message_index = 0;
+    while message_index < conversation.messages().len() {
+        if matches!(
+            conversation.messages()[message_index],
+            Message::ToolResult(_)
+        ) {
+            let mut image_batches = Vec::new();
+            while let Some(Message::ToolResult(result)) = conversation.messages().get(message_index)
+            {
+                messages.push(RequestMessage::Tool {
+                    tool_call_id: result.tool_call_id().to_owned(),
+                    content: tool_result_content(result),
+                });
+                if let ToolResultOutcome::Success(output) = result.outcome() {
+                    if !output.images().is_empty() {
+                        let mut parts = vec![ContentPart::Text {
+                            text: format!(
+                                "Images returned by tool call '{}'.",
+                                result.tool_call_id()
+                            ),
+                        }];
+                        parts.extend(output.images().iter().map(|image| ContentPart::ImageUrl {
+                            image_url: ImageUrl {
+                                url: image.to_data_url(),
+                            },
+                        }));
+                        image_batches.push(parts);
+                    }
+                }
+                message_index += 1;
+            }
+            for parts in image_batches {
+                messages.push(RequestMessage::User {
+                    content: UserContent::Parts(parts),
+                });
+            }
+            continue;
+        }
+
+        messages.push(convert_message(&conversation.messages()[message_index]));
+        message_index += 1;
     }
 
     ChatCompletionRequest {
@@ -100,10 +139,7 @@ fn convert_message(message: &Message) -> RequestMessage {
                 .map(convert_tool_call)
                 .collect(),
         },
-        Message::ToolResult(result) => RequestMessage::Tool {
-            tool_call_id: result.tool_call_id().to_owned(),
-            content: tool_result_content(result),
-        },
+        Message::ToolResult(_) => unreachable!("tool result groups are converted by build_request"),
     }
 }
 
@@ -156,7 +192,9 @@ fn convert_tool_spec(spec: &ToolSpec) -> ToolDefinition {
 
 fn tool_result_content(result: &ToolResult) -> String {
     match result.outcome() {
-        ToolResultOutcome::Success(value) => serde_json::to_string(&value).unwrap_or_default(),
+        ToolResultOutcome::Success(output) => {
+            serde_json::to_string(output.value()).unwrap_or_default()
+        }
         ToolResultOutcome::Error(ToolExecutorError::UnknownTool(name)) => {
             format!("unknown tool: {name}")
         }
@@ -220,6 +258,56 @@ mod tests {
             .as_str()
             .expect("url")
             .starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn places_tool_images_in_a_following_vision_message() {
+        use kodkod_core::ToolOutput;
+
+        let mut conversation = Conversation::new();
+        conversation.push_message(Message::Assistant(
+            AssistantMessage::new("").with_tool_calls(vec![
+                ToolCall::new("call_1", "view_image", json!({"path": "sample.png"})),
+                ToolCall::new("call_2", "lookup", json!({"query": "sample"})),
+            ]),
+        ));
+        conversation.push_message(Message::ToolResult(ToolResult::success(
+            "call_1",
+            ToolOutput::new(json!({"path": "sample.png"}))
+                .with_images(vec![Image::new("image/png", b"abc")]),
+        )));
+        conversation.push_message(Message::ToolResult(ToolResult::success(
+            "call_2",
+            ToolOutput::new(json!({"path": "other.png"}))
+                .with_images(vec![Image::new("image/png", b"def")]),
+        )));
+
+        let request = build_request("gpt-4o", &conversation, &[]);
+        let serialized = serde_json::to_value(request).unwrap();
+        assert_eq!(serialized["messages"][0]["role"], "assistant");
+        assert_eq!(serialized["messages"][1]["role"], "tool");
+        assert_eq!(
+            serialized["messages"][1]["content"],
+            r#"{"path":"sample.png"}"#
+        );
+        assert_eq!(serialized["messages"][2]["role"], "tool");
+        assert_eq!(serialized["messages"][3]["role"], "user");
+        assert_eq!(serialized["messages"][4]["role"], "user");
+        assert_eq!(
+            serialized["messages"][3]["content"][0]["text"],
+            "Images returned by tool call 'call_1'."
+        );
+        assert_eq!(serialized["messages"][3]["content"][1]["type"], "image_url");
+        assert!(
+            serialized["messages"][3]["content"][1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+        assert_eq!(
+            serialized["messages"][4]["content"][0]["text"],
+            "Images returned by tool call 'call_2'."
+        );
     }
 
     #[test]

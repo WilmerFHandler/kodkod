@@ -162,7 +162,7 @@ impl Tool for EchoTool {
     }
 
     fn execute<'a>(&'a self, arguments: &'a Value) -> ToolFuture<'a> {
-        Box::pin(async move { Ok(arguments.clone()) })
+        Box::pin(async move { Ok(arguments.clone().into()) })
     }
 }
 
@@ -178,6 +178,22 @@ impl Tool for FailingTool {
     }
 }
 
+struct VisionTool;
+
+impl Tool for VisionTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new("vision", "Requires vision.", json!({ "type": "object" }))
+    }
+
+    fn requires_vision(&self) -> bool {
+        true
+    }
+
+    fn execute<'a>(&'a self, arguments: &'a Value) -> ToolFuture<'a> {
+        Box::pin(async move { Ok(arguments.clone().into()) })
+    }
+}
+
 #[test]
 fn agent_passes_registered_tool_specs_to_provider() {
     let provider = RecordingProvider::default();
@@ -189,6 +205,37 @@ fn agent_passes_registered_tool_specs_to_provider() {
     block_on(collect_run(&agent, &mut conversation, "hello", &model)).unwrap();
 
     assert_eq!(*seen_tool_names.lock().unwrap(), vec!["echo"]);
+}
+
+#[test]
+fn agent_only_advertises_vision_tools_to_vision_models() {
+    let non_vision_provider = RecordingProvider::default();
+    let non_vision_names = non_vision_provider.seen_tool_names.clone();
+    let non_vision_agent = Agent::new(non_vision_provider)
+        .with_tool(Arc::new(EchoTool))
+        .with_tool(Arc::new(VisionTool));
+    block_on(collect_run(
+        &non_vision_agent,
+        &mut Conversation::new(),
+        "hello",
+        &TestModel::new(),
+    ))
+    .unwrap();
+    assert_eq!(*non_vision_names.lock().unwrap(), vec!["echo"]);
+
+    let vision_provider = RecordingProvider::default();
+    let vision_names = vision_provider.seen_tool_names.clone();
+    let vision_agent = Agent::new(vision_provider)
+        .with_tool(Arc::new(EchoTool))
+        .with_tool(Arc::new(VisionTool));
+    block_on(collect_run(
+        &vision_agent,
+        &mut Conversation::new(),
+        "hello",
+        &TestModel::with_vision(),
+    ))
+    .unwrap();
+    assert_eq!(*vision_names.lock().unwrap(), vec!["echo", "vision"]);
 }
 
 #[test]
@@ -287,7 +334,7 @@ impl Tool for SlowEchoTool {
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             in_flight.fetch_sub(1, Ordering::SeqCst);
-            Ok(arguments.clone())
+            Ok(arguments.clone().into())
         })
     }
 }
@@ -373,7 +420,7 @@ fn tool_executor_routes_calls_and_errors() {
     )));
     assert_eq!(
         success.outcome(),
-        &ToolResultOutcome::Success(json!({ "value": "hello" }))
+        &ToolResultOutcome::Success(json!({ "value": "hello" }).into())
     );
 
     let unknown = block_on(executor.execute(&ToolCall::new("call_2", "missing", json!({}))));

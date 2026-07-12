@@ -61,6 +61,7 @@ impl Conversation {
                             .with_images(Vec::new())
                             .with_steered(user.steered()),
                     ),
+                    Message::ToolResult(result) => Message::ToolResult(result.without_images()),
                     _ => message.clone(),
                 })
                 .collect(),
@@ -95,17 +96,27 @@ mod tests {
 
     #[test]
     fn without_images_strips_attachments() {
-        use crate::Image;
+        use crate::{Image, ToolOutput, ToolResult};
 
         let mut conv = Conversation::new();
         conv.push_user_message(
             UserMessage::new("describe")
                 .with_images(vec![Image::new("image/png", vec![0x89, 0x50])]),
         );
+        conv.push_message(Message::ToolResult(ToolResult::success(
+            "call_1",
+            ToolOutput::new(serde_json::json!({"path": "image.png"}))
+                .with_images(vec![Image::new("image/png", vec![0x89, 0x50])]),
+        )));
         let stripped = conv.without_images();
         assert!(matches!(
             stripped.messages().first(),
             Some(Message::User(user)) if user.content() == "describe" && user.images().is_empty()
+        ));
+        assert!(matches!(
+            stripped.messages().get(1),
+            Some(Message::ToolResult(result))
+                if matches!(result.outcome(), crate::ToolResultOutcome::Success(output) if output.images().is_empty())
         ));
     }
 }

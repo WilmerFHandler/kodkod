@@ -19,7 +19,7 @@ pub use message::{AssistantMessage, Image, Message, SystemMessage, UserMessage};
 pub use provider::Provider;
 pub use retry::{RetryPolicy, RetryProvider, Retryable};
 pub use tool::{
-    Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolResult,
+    Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolOutput, ToolResult,
     ToolResultOutcome, ToolSpec,
 };
 pub use turns::{Turn, TurnIter, Turns, turns};

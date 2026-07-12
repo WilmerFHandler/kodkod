@@ -188,7 +188,7 @@ mod tests {
             ),
             Message::ToolResult(crate::ToolResult::new(
                 "c1",
-                crate::ToolResultOutcome::Success(json!("ok")),
+                crate::ToolResultOutcome::Success(json!("ok").into()),
             )),
             Message::Assistant(AssistantMessage::new("done")),
             Message::User(UserMessage::new("b")),

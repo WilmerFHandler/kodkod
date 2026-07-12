@@ -75,7 +75,8 @@ where
         control: &'a TaskControl,
     ) -> Task<'a, P::Error> {
         Box::pin(try_stream! {
-            let tool_specs = self.tools.specs();
+            let vision_enabled = self.provider.supports_vision(model);
+            let tool_specs = self.tools.specs_for_vision(vision_enabled);
             let mut tool_rounds_executed = 0;
 
             loop {
@@ -92,7 +93,7 @@ where
                     conversation.push_message(Message::User(user));
                 }
 
-                let provider_input: Cow<'_, Conversation> = if self.provider.supports_vision(model) {
+                let provider_input: Cow<'_, Conversation> = if vision_enabled {
                     Cow::Borrowed(conversation)
                 } else {
                     Cow::Owned(conversation.without_images())
@@ -126,7 +127,7 @@ where
                 let results = futures::future::join_all(
                     tool_calls
                         .iter()
-                        .map(|tool_call| self.tools.execute(tool_call)),
+                        .map(|tool_call| self.tools.execute_for_vision(tool_call, vision_enabled)),
                 )
                 .await;
 
