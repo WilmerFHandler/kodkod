@@ -1,4 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::sync::{Arc, OnceLock};
 
 use crate::{ToolCall, ToolResult};
 
@@ -6,37 +7,95 @@ use crate::{ToolCall, ToolResult};
 ///
 /// Images are stored as raw bytes plus a MIME type; providers that support
 /// vision are expected to encode them as base64 data URLs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Image {
+    inner: Arc<ImageData>,
+}
+
+#[derive(Debug)]
+struct ImageData {
     mime: String,
-    #[serde(with = "base64_bytes")]
     data: Vec<u8>,
+    data_url: OnceLock<Arc<str>>,
 }
 
 impl Image {
     pub fn new(mime: impl Into<String>, data: impl Into<Vec<u8>>) -> Self {
         Self {
-            mime: mime.into(),
-            data: data.into(),
+            inner: Arc::new(ImageData {
+                mime: mime.into(),
+                data: data.into(),
+                data_url: OnceLock::new(),
+            }),
         }
     }
 
     pub fn mime(&self) -> &str {
-        &self.mime
+        &self.inner.mime
     }
 
     pub fn data(&self) -> &[u8] {
-        &self.data
+        &self.inner.data
     }
 
     /// Encode the image as a base64 data URL.
     pub fn to_data_url(&self) -> String {
-        format!(
-            "data:{};base64,{}",
-            self.mime,
-            base64_bytes::encode(&self.data)
-        )
+        self.inner
+            .data_url
+            .get_or_init(|| {
+                Arc::from(format!(
+                    "data:{};base64,{}",
+                    self.mime(),
+                    base64_bytes::encode(self.data())
+                ))
+            })
+            .to_string()
     }
+}
+
+impl PartialEq for Image {
+    fn eq(&self, other: &Self) -> bool {
+        self.mime() == other.mime() && self.data() == other.data()
+    }
+}
+
+impl Eq for Image {}
+
+impl Serialize for Image {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ImageRef {
+            mime: self.mime(),
+            data: self.data(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Image {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let image = ImageWire::deserialize(deserializer)?;
+        Ok(Self::new(image.mime, image.data))
+    }
+}
+
+#[derive(Serialize)]
+struct ImageRef<'a> {
+    mime: &'a str,
+    #[serde(with = "base64_bytes")]
+    data: &'a [u8],
+}
+
+#[derive(Deserialize)]
+struct ImageWire {
+    mime: String,
+    #[serde(with = "base64_bytes")]
+    data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,4 +297,34 @@ mod base64_bytes {
 
 fn is_false(value: &bool) -> bool {
     !value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_clones_share_payload_and_cached_data_url() {
+        let image = Image::new("image/png", vec![0x89, 0x50, 0x4e, 0x47]);
+        let clone = image.clone();
+
+        assert!(Arc::ptr_eq(&image.inner, &clone.inner));
+        assert_eq!(image.to_data_url(), "data:image/png;base64,iVBORw==");
+        assert!(Arc::ptr_eq(
+            image.inner.data_url.get().unwrap(),
+            clone.inner.data_url.get().unwrap()
+        ));
+    }
+
+    #[test]
+    fn image_serialization_preserves_the_existing_wire_shape() {
+        let image = Image::new("image/png", [0x89, 0x50]);
+
+        let encoded = serde_json::to_value(&image).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"mime": "image/png", "data": "iVA="})
+        );
+        assert_eq!(serde_json::from_value::<Image>(encoded).unwrap(), image);
+    }
 }
