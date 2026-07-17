@@ -1,5 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::{ToolCall, ToolResult};
 
@@ -16,7 +16,6 @@ pub struct Image {
 struct ImageData {
     mime: String,
     data: Vec<u8>,
-    data_url: OnceLock<Arc<str>>,
 }
 
 impl Image {
@@ -25,7 +24,6 @@ impl Image {
             inner: Arc::new(ImageData {
                 mime: mime.into(),
                 data: data.into(),
-                data_url: OnceLock::new(),
             }),
         }
     }
@@ -40,16 +38,11 @@ impl Image {
 
     /// Encode the image as a base64 data URL.
     pub fn to_data_url(&self) -> String {
-        self.inner
-            .data_url
-            .get_or_init(|| {
-                Arc::from(format!(
-                    "data:{};base64,{}",
-                    self.mime(),
-                    base64_bytes::encode(self.data())
-                ))
-            })
-            .to_string()
+        format!(
+            "data:{};base64,{}",
+            self.mime(),
+            base64_bytes::encode(self.data())
+        )
     }
 }
 
@@ -304,16 +297,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn image_clones_share_payload_and_cached_data_url() {
+    fn image_clones_share_the_immutable_payload() {
         let image = Image::new("image/png", vec![0x89, 0x50, 0x4e, 0x47]);
         let clone = image.clone();
 
         assert!(Arc::ptr_eq(&image.inner, &clone.inner));
         assert_eq!(image.to_data_url(), "data:image/png;base64,iVBORw==");
-        assert!(Arc::ptr_eq(
-            image.inner.data_url.get().unwrap(),
-            clone.inner.data_url.get().unwrap()
-        ));
     }
 
     #[test]
