@@ -31,19 +31,37 @@ impl Error for TestError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TestModel {
     vision: bool,
+    computer_use: bool,
 }
 
 impl TestModel {
     const fn new() -> Self {
-        Self { vision: false }
+        Self {
+            vision: false,
+            computer_use: false,
+        }
     }
 
     const fn with_vision() -> Self {
-        Self { vision: true }
+        Self {
+            vision: true,
+            computer_use: false,
+        }
+    }
+
+    const fn with_computer_use() -> Self {
+        Self {
+            vision: true,
+            computer_use: true,
+        }
     }
 
     fn vision(&self) -> bool {
         self.vision
+    }
+
+    fn computer_use(&self) -> bool {
+        self.computer_use
     }
 }
 
@@ -65,6 +83,10 @@ impl Provider for RecordingProvider {
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
+    }
+
+    fn supports_computer_use(&self, model: &TestModel) -> bool {
+        model.computer_use()
     }
 
     fn complete(
@@ -194,6 +216,30 @@ impl Tool for VisionTool {
     }
 }
 
+struct ComputerUseTool;
+
+impl Tool for ComputerUseTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "computer_use",
+            "Requires computer use.",
+            json!({ "type": "object" }),
+        )
+    }
+
+    fn requires_vision(&self) -> bool {
+        true
+    }
+
+    fn requires_computer_use(&self) -> bool {
+        true
+    }
+
+    fn execute<'a>(&'a self, arguments: &'a Value) -> ToolFuture<'a> {
+        Box::pin(async move { Ok(arguments.clone().into()) })
+    }
+}
+
 #[test]
 fn agent_passes_registered_tool_specs_to_provider() {
     let provider = RecordingProvider::default();
@@ -236,6 +282,40 @@ fn agent_only_advertises_vision_tools_to_vision_models() {
     ))
     .unwrap();
     assert_eq!(*vision_names.lock().unwrap(), vec!["echo", "vision"]);
+}
+
+#[test]
+fn agent_only_advertises_computer_use_tools_to_supported_models() {
+    let unsupported_provider = RecordingProvider::default();
+    let unsupported_names = unsupported_provider.seen_tool_names.clone();
+    let unsupported_agent = Agent::new(unsupported_provider)
+        .with_tool(Arc::new(EchoTool))
+        .with_tool(Arc::new(ComputerUseTool));
+    block_on(collect_run(
+        &unsupported_agent,
+        &mut Conversation::new(),
+        "hello",
+        &TestModel::with_vision(),
+    ))
+    .unwrap();
+    assert_eq!(*unsupported_names.lock().unwrap(), vec!["echo"]);
+
+    let supported_provider = RecordingProvider::default();
+    let supported_names = supported_provider.seen_tool_names.clone();
+    let supported_agent = Agent::new(supported_provider)
+        .with_tool(Arc::new(EchoTool))
+        .with_tool(Arc::new(ComputerUseTool));
+    block_on(collect_run(
+        &supported_agent,
+        &mut Conversation::new(),
+        "hello",
+        &TestModel::with_computer_use(),
+    ))
+    .unwrap();
+    assert_eq!(
+        *supported_names.lock().unwrap(),
+        vec!["computer_use", "echo"]
+    );
 }
 
 #[test]
@@ -433,6 +513,22 @@ fn tool_executor_routes_calls_and_errors() {
     assert_eq!(
         failure.outcome(),
         &ToolResultOutcome::Error(ToolExecutorError::Tool(ToolError::new("boom")))
+    );
+}
+
+#[test]
+fn tool_executor_rejects_computer_use_for_unsupported_models() {
+    let mut executor = ToolExecutor::new();
+    executor.register(Arc::new(ComputerUseTool));
+    let call = ToolCall::new("call_1", "computer_use", json!({}));
+
+    let result = block_on(executor.execute_for_capabilities(&call, true, false));
+
+    assert_eq!(
+        result.outcome(),
+        &ToolResultOutcome::Error(ToolExecutorError::Tool(ToolError::new(
+            "tool 'computer_use' requires a computer-use-capable model"
+        )))
     );
 }
 

@@ -76,7 +76,10 @@ where
     ) -> Task<'a, P::Error> {
         Box::pin(try_stream! {
             let vision_enabled = self.provider.supports_vision(model);
-            let tool_specs = self.tools.specs_for_vision(vision_enabled);
+            let computer_use_enabled = self.provider.supports_computer_use(model);
+            let tool_specs = self
+                .tools
+                .specs_for_capabilities(vision_enabled, computer_use_enabled);
             let mut tool_rounds_executed = 0;
 
             loop {
@@ -127,7 +130,13 @@ where
                 let results = futures::future::join_all(
                     tool_calls
                         .iter()
-                        .map(|tool_call| self.tools.execute_for_vision(tool_call, vision_enabled)),
+                        .map(|tool_call| {
+                            self.tools.execute_for_capabilities(
+                                tool_call,
+                                vision_enabled,
+                                computer_use_enabled,
+                            )
+                        }),
                 )
                 .await;
 

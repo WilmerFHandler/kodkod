@@ -9,6 +9,11 @@ pub trait Provider {
 
     fn supports_vision(&self, model: &Self::Model) -> bool;
 
+    /// Whether the model is explicitly supported for computer-use tools.
+    fn supports_computer_use(&self, _model: &Self::Model) -> bool {
+        false
+    }
+
     fn complete(
         &self,
         model: &Self::Model,

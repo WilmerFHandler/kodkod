@@ -46,6 +46,10 @@ where
         self.inner.supports_vision(model)
     }
 
+    fn supports_computer_use(&self, model: &Self::Model) -> bool {
+        self.inner.supports_computer_use(model)
+    }
+
     async fn complete(
         &self,
         model: &Self::Model,

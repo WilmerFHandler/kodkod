@@ -25,5 +25,10 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether this tool may only be used by models with explicit computer-use support.
+    fn requires_computer_use(&self) -> bool {
+        false
+    }
+
     fn execute<'a>(&'a self, arguments: &'a Value) -> ToolFuture<'a>;
 }

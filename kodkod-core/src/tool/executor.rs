@@ -26,10 +26,21 @@ impl ToolExecutor {
     }
 
     pub fn specs_for_vision(&self, vision_enabled: bool) -> Vec<ToolSpec> {
+        self.specs_for_capabilities(vision_enabled, true)
+    }
+
+    pub fn specs_for_capabilities(
+        &self,
+        vision_enabled: bool,
+        computer_use_enabled: bool,
+    ) -> Vec<ToolSpec> {
         let mut specs = self
             .tools
             .values()
-            .filter(|tool| vision_enabled || !tool.requires_vision())
+            .filter(|tool| {
+                (vision_enabled || !tool.requires_vision())
+                    && (computer_use_enabled || !tool.requires_computer_use())
+            })
             .map(|tool| tool.spec())
             .collect::<Vec<_>>();
         specs.sort_by(|left, right| left.name().cmp(right.name()));
@@ -41,6 +52,16 @@ impl ToolExecutor {
     }
 
     pub async fn execute_for_vision(&self, call: &ToolCall, vision_enabled: bool) -> ToolResult {
+        self.execute_for_capabilities(call, vision_enabled, true)
+            .await
+    }
+
+    pub async fn execute_for_capabilities(
+        &self,
+        call: &ToolCall,
+        vision_enabled: bool,
+        computer_use_enabled: bool,
+    ) -> ToolResult {
         let Some(tool) = self.tools.get(call.name()) else {
             return ToolResult::failure(
                 call.id(),
@@ -53,6 +74,16 @@ impl ToolExecutor {
                 call.id(),
                 ToolExecutorError::Tool(crate::ToolError::new(format!(
                     "tool '{}' requires a vision-capable model",
+                    call.name()
+                ))),
+            );
+        }
+
+        if tool.requires_computer_use() && !computer_use_enabled {
+            return ToolResult::failure(
+                call.id(),
+                ToolExecutorError::Tool(crate::ToolError::new(format!(
+                    "tool '{}' requires a computer-use-capable model",
                     call.name()
                 ))),
             );
