@@ -14,6 +14,15 @@ pub trait Provider {
         false
     }
 
+    /// Produce the assistant response for one provider round.
+    ///
+    /// The returned future may be dropped before completion when the agent run
+    /// is cancelled or its event stream is dropped. Implementations must be
+    /// cancellation-safe and should propagate a drop to any in-flight transport
+    /// request where possible. Work spawned independently by an implementation
+    /// is not stopped automatically. Dropping stops local polling and transport
+    /// ownership; whether remote generation and billing stop is controlled by
+    /// the provider and transport.
     fn complete(
         &self,
         model: &Self::Model,

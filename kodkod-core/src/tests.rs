@@ -4,7 +4,7 @@ use std::future::{Future, ready};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use futures::StreamExt;
@@ -903,6 +903,199 @@ fn cancel_takes_precedence_over_steer() {
         }
     }
     assert!(cancelled);
+}
+
+#[test]
+fn cancel_interrupts_and_drops_in_flight_provider_future() {
+    struct PendingProvider {
+        started: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    struct PendingCompletion {
+        started: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Future for PendingCompletion {
+        type Output = Result<AssistantMessage, TestError>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.started.store(true, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingCompletion {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Provider for PendingProvider {
+        type Model = TestModel;
+        type Error = TestError;
+
+        fn supports_vision(&self, model: &TestModel) -> bool {
+            model.vision()
+        }
+
+        fn complete(
+            &self,
+            _model: &TestModel,
+            _conversation: &Conversation,
+            _tools: &[ToolSpec],
+        ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
+            PendingCompletion {
+                started: Arc::clone(&self.started),
+                dropped: Arc::clone(&self.dropped),
+            }
+        }
+    }
+
+    let started = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let agent = Agent::new(PendingProvider {
+        started: Arc::clone(&started),
+        dropped: Arc::clone(&dropped),
+    });
+    let model = TestModel::new();
+    let control = TaskControl::new();
+    let cancellation = control.clone();
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("stop this"));
+
+    let cancel_thread = std::thread::spawn(move || {
+        while !started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        cancellation.cancel();
+    });
+
+    {
+        let mut stream = agent.run(&mut conversation, &model, &control);
+        assert!(matches!(
+            block_on(stream.next()),
+            Some(Err(AgentError::Cancelled))
+        ));
+        assert!(block_on(stream.next()).is_none());
+    }
+
+    cancel_thread.join().unwrap();
+    assert!(dropped.load(Ordering::SeqCst));
+    assert_eq!(conversation.messages().len(), 1);
+    assert!(matches!(conversation.messages()[0], Message::User(_)));
+}
+
+#[test]
+fn cancellation_wins_when_provider_completes_in_the_same_poll() {
+    struct CancellingProvider {
+        control: TaskControl,
+    }
+
+    impl Provider for CancellingProvider {
+        type Model = TestModel;
+        type Error = TestError;
+
+        fn supports_vision(&self, model: &TestModel) -> bool {
+            model.vision()
+        }
+
+        fn complete(
+            &self,
+            _model: &TestModel,
+            _conversation: &Conversation,
+            _tools: &[ToolSpec],
+        ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
+            let control = self.control.clone();
+            async move {
+                control.cancel();
+                Ok(AssistantMessage::new("too late"))
+            }
+        }
+    }
+
+    let control = TaskControl::new();
+    let agent = Agent::new(CancellingProvider {
+        control: control.clone(),
+    });
+    let model = TestModel::new();
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("race"));
+
+    {
+        let mut stream = agent.run(&mut conversation, &model, &control);
+        assert!(matches!(
+            block_on(stream.next()),
+            Some(Err(AgentError::Cancelled))
+        ));
+    }
+
+    assert_eq!(conversation.messages().len(), 1);
+    assert!(matches!(conversation.messages()[0], Message::User(_)));
+}
+
+#[test]
+fn cancellation_during_completion_construction_prevents_provider_poll() {
+    struct CancellingProvider {
+        control: TaskControl,
+        polled: Arc<AtomicBool>,
+    }
+
+    struct PollTrackingCompletion {
+        polled: Arc<AtomicBool>,
+    }
+
+    impl Future for PollTrackingCompletion {
+        type Output = Result<AssistantMessage, TestError>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polled.store(true, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    impl Provider for CancellingProvider {
+        type Model = TestModel;
+        type Error = TestError;
+
+        fn supports_vision(&self, model: &TestModel) -> bool {
+            model.vision()
+        }
+
+        fn complete(
+            &self,
+            _model: &TestModel,
+            _conversation: &Conversation,
+            _tools: &[ToolSpec],
+        ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
+            self.control.cancel();
+            PollTrackingCompletion {
+                polled: Arc::clone(&self.polled),
+            }
+        }
+    }
+
+    let control = TaskControl::new();
+    let polled = Arc::new(AtomicBool::new(false));
+    let agent = Agent::new(CancellingProvider {
+        control: control.clone(),
+        polled: Arc::clone(&polled),
+    });
+    let model = TestModel::new();
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("cancel before polling"));
+
+    {
+        let mut stream = agent.run(&mut conversation, &model, &control);
+        assert!(matches!(
+            block_on(stream.next()),
+            Some(Err(AgentError::Cancelled))
+        ));
+    }
+
+    assert!(!polled.load(Ordering::SeqCst));
+    assert_eq!(conversation.messages().len(), 1);
 }
 
 /// Pull events from the stream until (and including) the first assistant reply.

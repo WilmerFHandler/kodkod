@@ -64,7 +64,7 @@ where
             match self.inner.complete(model, conversation, tools).await {
                 Ok(message) => return Ok(message),
                 Err(error) if error.is_retryable() && attempt < max => {
-                    tokio::time::sleep(self.policy.backoff_after_attempt(attempt)).await;
+                    futures_timer::Delay::new(self.policy.backoff_after_attempt(attempt)).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -189,13 +189,13 @@ mod tests {
                 model.vision()
             }
 
-            fn complete(
+            async fn complete(
                 &self,
                 _model: &TestModel,
                 _conversation: &Conversation,
                 _tools: &[ToolSpec],
-            ) -> impl Future<Output = Result<AssistantMessage, RetryTestError>> + Send {
-                async { Err(RetryTestError::http(401, false)) }
+            ) -> Result<AssistantMessage, RetryTestError> {
+                Err(RetryTestError::http(401, false))
             }
         }
 
@@ -207,5 +207,34 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.status_code, Some(401));
+    }
+
+    #[tokio::test]
+    async fn dropping_completion_during_backoff_stops_retries() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let provider = RetryProvider::with_policy(
+            FlakyProvider {
+                calls: Arc::clone(&calls),
+                fail_until: u32::MAX,
+            },
+            RetryPolicy {
+                max_attempts: 4,
+                initial_backoff: Duration::from_millis(20),
+                max_backoff: Duration::from_millis(20),
+                backoff_multiplier: 1.0,
+            },
+        );
+        let model = TestModel;
+        let conversation = Conversation::new();
+        let mut completion = Box::pin(provider.complete(&model, &conversation, &[]));
+
+        tokio::time::timeout(Duration::from_millis(5), completion.as_mut())
+            .await
+            .expect_err("retry should still be in backoff");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(completion);
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

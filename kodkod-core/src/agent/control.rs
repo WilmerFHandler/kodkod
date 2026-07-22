@@ -3,36 +3,77 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use event_listener::Event;
+
 use crate::UserMessage;
+
+#[derive(Debug)]
+struct TaskControlInner {
+    cancelled: AtomicBool,
+    cancellation: Event,
+    steers: Mutex<VecDeque<UserMessage>>,
+}
 
 /// Handle to control an in-flight [`Agent`](super::Agent) run.
 ///
-/// Cheap to clone — all clones share the same cancellation flag and steering
+/// Cheap to clone — all clones share the same cancellation signal and steering
 /// mailbox. Pass a `TaskControl` into [`Agent::run`](super::Agent::run) so
-/// external callers (e.g. a GUI session) can stop the loop or inject new user
-/// messages between rounds.
+/// external callers (e.g. a GUI session) can request cancellation or inject new
+/// user messages between rounds.
 #[derive(Debug, Clone)]
 pub struct TaskControl {
-    cancelled: Arc<AtomicBool>,
-    steers: Arc<Mutex<VecDeque<UserMessage>>>,
+    inner: Arc<TaskControlInner>,
 }
 
 impl TaskControl {
     pub fn new() -> Self {
         Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            steers: Arc::new(Mutex::new(VecDeque::new())),
+            inner: Arc::new(TaskControlInner {
+                cancelled: AtomicBool::new(false),
+                cancellation: Event::new(),
+                steers: Mutex::new(VecDeque::new()),
+            }),
         }
     }
 
-    /// Request cancellation. The agent loop checks this between rounds.
+    /// Request cancellation.
+    ///
+    /// This is idempotent. An agent currently awaiting its provider is woken so
+    /// it can drop the provider future and finish with
+    /// [`AgentError::Cancelled`](super::AgentError::Cancelled). Active tool
+    /// futures are allowed to finish, and cancellation is observed before the
+    /// next provider round.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        if !self.inner.cancelled.swap(true, Ordering::SeqCst) {
+            self.inner.cancellation.notify(usize::MAX);
+        }
     }
 
     /// Whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Wait until cancellation is requested.
+    ///
+    /// This future is executor-independent, supports any number of concurrent
+    /// waiters, and resolves immediately if cancellation was already requested.
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+
+            let listener = self.inner.cancellation.listen();
+
+            // Cancellation notifications are not retained when no listener is
+            // registered, so check again after registering to close that race.
+            if self.is_cancelled() {
+                return;
+            }
+
+            listener.await;
+        }
     }
 
     /// Queue a user message to inject into the running turn at the next
@@ -43,7 +84,8 @@ impl TaskControl {
         // Mark the message as a steering injection so it is treated as part of
         // the current turn rather than starting a new one.
         let message = message.with_steered(true);
-        self.steers
+        self.inner
+            .steers
             .lock()
             .expect("steer queue poisoned")
             .push_back(message);
@@ -53,7 +95,8 @@ impl TaskControl {
     ///
     /// Called by the agent loop at the top of each round.
     pub fn drain_pending_steers(&self) -> Vec<UserMessage> {
-        self.steers
+        self.inner
+            .steers
             .lock()
             .expect("steer queue poisoned")
             .drain(..)
@@ -64,5 +107,32 @@ impl TaskControl {
 impl Default for TaskControl {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_wakes_all_waiters_and_remains_observable() {
+        let control = TaskControl::new();
+        let first = control.clone();
+        let second = control.clone();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(first.cancelled(), second.cancelled(), async {
+                tokio::task::yield_now().await;
+                control.cancel();
+            });
+        })
+        .await
+        .expect("all cancellation waiters should wake");
+
+        tokio::time::timeout(Duration::from_millis(10), control.cancelled())
+            .await
+            .expect("cancellation should remain observable");
     }
 }

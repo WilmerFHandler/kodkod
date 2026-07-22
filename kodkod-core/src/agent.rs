@@ -3,7 +3,9 @@ pub mod error;
 pub mod event;
 
 use std::borrow::Cow;
+use std::future::Future;
 use std::sync::Arc;
+use std::task::Poll;
 
 use async_stream::try_stream;
 
@@ -65,9 +67,10 @@ where
     /// The conversation must already include the user message (and any images) for
     /// this turn. The provider interprets `model` for the request target and vision support.
     ///
-    /// Pass a [`TaskControl`] so external callers can cancel the run between
-    /// provider rounds (e.g. a GUI "Cancel" button) or steer it by injecting new
-    /// user messages at round boundaries.
+    /// Pass a [`TaskControl`] so external callers can request cancellation (e.g.
+    /// from a GUI "Cancel" button) or steer the run by injecting new user
+    /// messages at round boundaries. When cancellation is observed during a
+    /// provider round, the agent drops the in-flight provider future.
     pub fn run<'a>(
         &'a self,
         conversation: &'a mut Conversation,
@@ -102,11 +105,34 @@ where
                     Cow::Owned(conversation.without_images())
                 };
 
-                let message = self
-                    .provider
-                    .complete(model, &provider_input, &tool_specs)
-                    .await
-                    .map_err(AgentError::Provider)?;
+                let message = {
+                    let completion = self
+                        .provider
+                        .complete(model, &provider_input, &tool_specs);
+                    let cancellation = control.cancelled();
+                    futures::pin_mut!(completion, cancellation);
+
+                    let result = futures::future::poll_fn(|cx| {
+                        if cancellation.as_mut().poll(cx).is_ready() {
+                            Poll::Ready(None)
+                        } else {
+                            completion.as_mut().poll(cx).map(Some)
+                        }
+                    })
+                    .await;
+
+                    match result {
+                        Some(result) => {
+                            // Cancellation wins until the reply is committed below,
+                            // including a completion/cancellation race in one poll.
+                            if control.is_cancelled() {
+                                Err(AgentError::Cancelled)?;
+                            }
+                            result.map_err(AgentError::Provider)?
+                        }
+                        None => Err(AgentError::Cancelled)?,
+                    }
+                };
                 let tool_calls = message.tool_calls().to_vec();
 
                 yield AgentEvent::AssistantReply(message.clone());
