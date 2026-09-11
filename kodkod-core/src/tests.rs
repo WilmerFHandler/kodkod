@@ -14,10 +14,11 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::{
-    Agent, AgentError, AgentEvent, AssistantMessage, CompactOptions, Conversation, Document, Image,
-    Message, Provider, ProviderEvent, ProviderStream, TaskControl, Tool, ToolCall, ToolError,
-    ToolExecutor, ToolExecutorError, ToolFuture, ToolResult, ToolResultOutcome, ToolSpec,
-    TurnCompaction, UserMessage,
+    Agent, AgentError, AgentEvent, AssistantMessage, CompactOptions, ContextEstimateProvenance,
+    Conversation, Document, Image, Message, Provider, ProviderCompletion, ProviderEvent,
+    ProviderStream, TaskControl, TokenUsage, Tool, ToolCall, ToolError, ToolExecutor,
+    ToolExecutorError, ToolFuture, ToolResult, ToolResultOutcome, ToolSpec, TurnCompaction,
+    UserMessage,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +150,51 @@ struct ToolCallingProvider {
     calls: Arc<AtomicUsize>,
 }
 
+impl ToolCallingProvider {
+    fn response(
+        &self,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> (AssistantMessage, TokenUsage) {
+        let call_count = self.calls.fetch_add(1, Ordering::SeqCst);
+        assert!(tools.iter().any(|tool| tool.name() == "echo"));
+
+        let has_tool_result = conversation
+            .messages()
+            .iter()
+            .any(|message| matches!(message, Message::ToolResult(_)));
+
+        if call_count == 0 {
+            (
+                AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+                    "call_1",
+                    "echo",
+                    json!({ "value": "hello" }),
+                )]),
+                TokenUsage {
+                    input_tokens: Some(10),
+                    cached_input_tokens: Some(3),
+                    output_tokens: Some(2),
+                    reasoning_output_tokens: Some(1),
+                    total_tokens: Some(12),
+                },
+            )
+        } else {
+            assert!(has_tool_result);
+            (
+                AssistantMessage::new("done"),
+                TokenUsage {
+                    input_tokens: Some(20),
+                    cached_input_tokens: Some(4),
+                    output_tokens: Some(4),
+                    reasoning_output_tokens: Some(2),
+                    total_tokens: Some(24),
+                },
+            )
+        }
+    }
+}
+
 impl Provider for ToolCallingProvider {
     type Model = TestModel;
     type Error = TestError;
@@ -168,27 +214,20 @@ impl Provider for ToolCallingProvider {
         tools: &[ToolSpec],
     ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), TestError>> + Send
     {
-        let call_count = self.calls.fetch_add(1, Ordering::SeqCst);
-        assert!(tools.iter().any(|tool| tool.name() == "echo"));
+        let (message, _) = self.response(conversation, tools);
+        ready(Ok((message, ())))
+    }
 
-        let has_tool_result = conversation
-            .messages()
-            .iter()
-            .any(|message| matches!(message, Message::ToolResult(_)));
-
-        ready(Ok((
-            if call_count == 0 {
-                AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
-                    "call_1",
-                    "echo",
-                    json!({ "value": "hello" }),
-                )])
-            } else {
-                assert!(has_tool_result);
-                AssistantMessage::new("done")
-            },
-            (),
-        )))
+    fn complete_with_usage(
+        &self,
+        _state: &Self::Continuation,
+        _model: &TestModel,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> impl Future<Output = Result<ProviderCompletion<Self::Continuation>, TestError>> + Send
+    {
+        let (message, usage) = self.response(conversation, tools);
+        ready(Ok(ProviderCompletion::new(message, (), usage)))
     }
 }
 
@@ -312,6 +351,20 @@ fn agent_passes_registered_tool_specs_to_provider() {
 }
 
 #[test]
+fn context_estimate_reports_heuristic_provenance() {
+    let agent = Agent::new(RecordingProvider::default());
+    let model = TestModel::new();
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("hello"));
+    let context = agent.new_context(&model);
+
+    let estimate = context.estimated_current_context(&conversation, &[]);
+
+    assert_eq!(estimate.provenance, ContextEstimateProvenance::Heuristic);
+    assert_eq!(estimate.tokens, conversation.estimate_tokens(&[]));
+}
+
+#[test]
 fn agent_only_advertises_vision_tools_to_vision_models() {
     let non_vision_provider = RecordingProvider::default();
     let non_vision_names = non_vision_provider.seen_tool_names.clone();
@@ -388,7 +441,7 @@ fn agent_executes_tool_calls_until_final_response() {
     let response = events
         .iter()
         .find_map(|event| match event {
-            AgentEvent::Completed(message) => Some(message),
+            AgentEvent::Completed(message, _) => Some(message),
             _ => None,
         })
         .unwrap();
@@ -397,7 +450,10 @@ fn agent_executes_tool_calls_until_final_response() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(matches!(
         &events[0],
-        AgentEvent::AssistantReply(message) if message.tool_calls().len() == 1
+        AgentEvent::AssistantReply(message, usage)
+            if message.tool_calls().len() == 1
+                && usage.input_tokens == Some(10)
+                && usage.total_tokens == Some(12)
     ));
     assert!(matches!(&events[1], AgentEvent::ToolStarted(call) if call.name() == "echo"));
     assert!(matches!(
@@ -417,6 +473,18 @@ fn agent_executes_tool_calls_until_final_response() {
     assert!(matches!(
         &conversation.messages()[3],
         Message::Assistant(message) if message.content() == "done"
+    ));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Completed(message, usage))
+            if message.content() == "done"
+                && *usage == (TokenUsage {
+                    input_tokens: Some(30),
+                    cached_input_tokens: Some(7),
+                    output_tokens: Some(6),
+                    reasoning_output_tokens: Some(3),
+                    total_tokens: Some(36),
+                })
     ));
 }
 
@@ -726,7 +794,7 @@ fn agent_allows_documents_supported_by_the_selected_model() {
     ))
     .unwrap();
 
-    assert!(matches!(events.last(), Some(AgentEvent::Completed(_))));
+    assert!(matches!(events.last(), Some(AgentEvent::Completed(..))));
     assert_eq!(seen_documents.lock().unwrap().as_slice(), &[vec![document]]);
 }
 
@@ -791,7 +859,7 @@ where
     let mut stream = agent.run(conversation, model, &control);
 
     while let Some(item) = stream.next().await {
-        if let Ok(AgentEvent::Completed(message)) = item {
+        if let Ok(AgentEvent::Completed(message, _)) = item {
             return Ok(message);
         }
         item?;
@@ -896,7 +964,7 @@ fn steered_message_is_injected_between_rounds() {
     // Round 2: the loop drains the steer, appends it, then calls the provider.
     let mut final_message = None;
     while let Some(item) = block_on(stream.next()) {
-        if let AgentEvent::Completed(message) = item.unwrap() {
+        if let AgentEvent::Completed(message, _) = item.unwrap() {
             final_message = Some(message);
             break;
         }
@@ -1281,7 +1349,7 @@ fn cancellation_during_completion_construction_prevents_provider_poll() {
 /// Pull events from the stream until (and including) the first assistant reply.
 fn drain_until_assistant_reply(stream: &mut crate::Task<'_, TestError>) {
     while let Some(item) = block_on(stream.next()) {
-        if let AgentEvent::AssistantReply(_) = item.unwrap() {
+        if let AgentEvent::AssistantReply(..) = item.unwrap() {
             return;
         }
     }
@@ -1364,7 +1432,7 @@ async fn run_turn_creates_fresh_continuation_and_checkpoints_the_accepted_reply(
 
     assert!(matches!(
         task.next().await.unwrap().unwrap(),
-        AgentEvent::AssistantReply(_)
+        AgentEvent::AssistantReply(..)
     ));
     assert_eq!(creates.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -1374,7 +1442,7 @@ async fn run_turn_creates_fresh_continuation_and_checkpoints_the_accepted_reply(
     );
     assert!(matches!(
         task.next().await.unwrap().unwrap(),
-        AgentEvent::Completed(_)
+        AgentEvent::Completed(..)
     ));
     assert_eq!(
         drops.load(Ordering::SeqCst),
@@ -1664,6 +1732,40 @@ impl Provider for CompactingProvider {
             .push((*continuation, conversation.clone()));
         Ok((AssistantMessage::new("done"), continuation + 1))
     }
+
+    async fn complete_with_usage(
+        &self,
+        continuation: &usize,
+        model: &Self::Model,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> Result<ProviderCompletion<Self::Continuation>, TestError> {
+        let is_compaction = tools.iter().any(|tool| tool.name() == "summarize");
+        let (message, next) = self
+            .complete(continuation, model, conversation, tools)
+            .await?;
+        Ok(ProviderCompletion::new(
+            message,
+            next,
+            if is_compaction {
+                TokenUsage {
+                    input_tokens: Some(50),
+                    cached_input_tokens: Some(5),
+                    output_tokens: Some(5),
+                    reasoning_output_tokens: Some(2),
+                    total_tokens: Some(55),
+                }
+            } else {
+                TokenUsage {
+                    input_tokens: Some(10),
+                    cached_input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    reasoning_output_tokens: Some(0),
+                    total_tokens: Some(11),
+                }
+            },
+        ))
+    }
 }
 
 #[tokio::test]
@@ -1701,12 +1803,21 @@ async fn compact_request_rewrites_conversation_and_resets_continuation() {
     ));
     assert!(matches!(
         task.next().await.unwrap().unwrap(),
-        AgentEvent::AssistantReply(_)
+        AgentEvent::AssistantReply(..)
     ));
-    assert!(matches!(
-        task.next().await.unwrap().unwrap(),
-        AgentEvent::Completed(_)
-    ));
+    let AgentEvent::Completed(_, usage) = task.next().await.unwrap().unwrap() else {
+        panic!("expected Completed");
+    };
+    assert_eq!(
+        usage,
+        TokenUsage {
+            input_tokens: Some(60),
+            cached_input_tokens: Some(6),
+            output_tokens: Some(6),
+            reasoning_output_tokens: Some(2),
+            total_tokens: Some(66),
+        }
+    );
     drop(task);
 
     let seen = seen.lock().unwrap();
@@ -1791,11 +1902,11 @@ async fn compact_failure_is_fail_open() {
     ));
     assert!(matches!(
         task.next().await.unwrap().unwrap(),
-        AgentEvent::AssistantReply(_)
+        AgentEvent::AssistantReply(..)
     ));
     assert!(matches!(
         task.next().await.unwrap().unwrap(),
-        AgentEvent::Completed(_)
+        AgentEvent::Completed(..)
     ));
     drop(task);
     assert_eq!(conversation.messages()[0], before.messages()[0]);
@@ -1929,7 +2040,11 @@ impl Provider for EventStreamProvider {
             yield ProviderEvent::TextDelta("provisional ".into());
             yield ProviderEvent::TextDelta("text".into());
             if !truncate {
-                yield ProviderEvent::Completed(AssistantMessage::new("authoritative"), next);
+                yield ProviderEvent::Completed(ProviderCompletion::new(
+                    AssistantMessage::new("authoritative"),
+                    next,
+                    TokenUsage::unknown(),
+                ));
             }
         })
     }
@@ -1946,10 +2061,10 @@ async fn agent_forwards_provisional_text_then_commits_authoritative_reply() {
     assert!(matches!(&events[0], AgentEvent::AssistantTextDelta(text) if text == "provisional "));
     assert!(matches!(&events[1], AgentEvent::AssistantTextDelta(text) if text == "text"));
     assert!(
-        matches!(&events[2], AgentEvent::AssistantReply(message) if message.content() == "authoritative")
+        matches!(&events[2], AgentEvent::AssistantReply(message, _) if message.content() == "authoritative")
     );
     assert!(
-        matches!(&events[3], AgentEvent::Completed(message) if message.content() == "authoritative")
+        matches!(&events[3], AgentEvent::Completed(message, _) if message.content() == "authoritative")
     );
     assert!(
         matches!(&conversation.messages()[1], Message::Assistant(message) if message.content() == "authoritative")

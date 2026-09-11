@@ -99,6 +99,8 @@ pub(crate) struct FunctionDefinition {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ChatCompletionResponse {
     pub choices: Vec<Choice>,
+    #[serde(default)]
+    pub usage: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -2,13 +2,15 @@ use std::collections::BTreeMap;
 
 use futures_util::StreamExt;
 use kodkod_core::{
-    AssistantMessage, Conversation, ProviderEvent, ProviderStream, ToolCall, ToolSpec,
+    AssistantMessage, Conversation, ProviderCompletion, ProviderEvent, ProviderStream, TokenUsage,
+    ToolCall, ToolSpec,
 };
 use serde_json::{Value, json};
 
 use super::api::{ApiErrorResponse, ChatCompletionResponse};
 use super::convert::{build_request, parse_assistant_message};
 use super::error::OpenAiError;
+use super::usage::parse_usage;
 use crate::RequestCredentials;
 use kodkod_http::SseDecoder;
 
@@ -60,6 +62,7 @@ pub async fn complete_with_credentials(
         false,
     )
     .await
+    .map(|(message, _)| message)
 }
 
 pub(crate) async fn complete_with_document_support(
@@ -70,7 +73,7 @@ pub(crate) async fn complete_with_document_support(
     conversation: &Conversation,
     tools: &[ToolSpec],
     pdf_allowed: bool,
-) -> Result<AssistantMessage, OpenAiError> {
+) -> Result<(AssistantMessage, TokenUsage), OpenAiError> {
     let request = build_request(model_id, conversation, tools, pdf_allowed)?;
     let mut http_request = client.post(chat_completions_url).json(&request);
 
@@ -93,7 +96,12 @@ pub(crate) async fn complete_with_document_support(
     }
 
     let body = response.json::<ChatCompletionResponse>().await?;
-    parse_assistant_message(body)
+    let usage = body
+        .usage
+        .as_ref()
+        .map(parse_usage)
+        .unwrap_or_else(TokenUsage::unknown);
+    Ok((parse_assistant_message(body)?, usage))
 }
 
 pub(crate) fn stream_with_document_support<'a>(
@@ -135,7 +143,16 @@ pub(crate) fn stream_with_document_support<'a>(
             .is_some_and(|value| value.split(';').next() == Some("application/json"))
         {
             let body = response.json::<ChatCompletionResponse>().await?;
-            yield ProviderEvent::Completed(parse_assistant_message(body)?, ());
+            let usage = body
+                .usage
+                .as_ref()
+                .map(parse_usage)
+                .unwrap_or_else(TokenUsage::unknown);
+            yield ProviderEvent::Completed(ProviderCompletion::new(
+                parse_assistant_message(body)?,
+                (),
+                usage,
+            ));
             return;
         }
 
@@ -145,8 +162,8 @@ pub(crate) fn stream_with_document_support<'a>(
         while let Some(chunk) = bytes.next().await {
             for event in decoder.push(&chunk?).map_err(OpenAiError::Protocol)? {
                 if event.data == "[DONE]" {
-                    let message = accumulator.finish()?;
-                    yield ProviderEvent::Completed(message, ());
+                    let (message, usage) = accumulator.finish()?;
+                    yield ProviderEvent::Completed(ProviderCompletion::new(message, (), usage));
                     return;
                 }
                 if let Some(delta) = accumulator.push(&event.data)? {
@@ -165,6 +182,7 @@ struct ChatStreamAccumulator {
     calls: BTreeMap<usize, PartialToolCall>,
     legacy_call: Option<PartialToolCall>,
     finish_reason: Option<String>,
+    usage: TokenUsage,
 }
 
 #[derive(Default)]
@@ -177,6 +195,9 @@ struct PartialToolCall {
 impl ChatStreamAccumulator {
     fn push(&mut self, data: &str) -> Result<Option<String>, OpenAiError> {
         let payload: Value = serde_json::from_str(data)?;
+        if let Some(usage) = payload.get("usage") {
+            self.usage = parse_usage(usage);
+        }
         if payload.get("error").is_some() {
             let message = payload
                 .pointer("/error/message")
@@ -273,7 +294,7 @@ impl ChatStreamAccumulator {
         Ok(text)
     }
 
-    fn finish(self) -> Result<AssistantMessage, OpenAiError> {
+    fn finish(self) -> Result<(AssistantMessage, TokenUsage), OpenAiError> {
         let reason = self.finish_reason.ok_or_else(|| {
             OpenAiError::Protocol("chat completion stream missing finish reason".into())
         })?;
@@ -314,7 +335,10 @@ impl ChatStreamAccumulator {
         if self.text.is_empty() && calls.is_empty() {
             return Err(OpenAiError::EmptyResponse);
         }
-        Ok(AssistantMessage::new(self.text).with_tool_calls(calls))
+        Ok((
+            AssistantMessage::new(self.text).with_tool_calls(calls),
+            self.usage,
+        ))
     }
 }
 

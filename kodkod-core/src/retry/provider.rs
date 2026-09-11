@@ -1,6 +1,6 @@
 use futures::StreamExt;
 
-use crate::{AssistantMessage, Conversation, Provider, ProviderEvent, ProviderStream, ToolSpec};
+use crate::{Conversation, Provider, ProviderCompletion, ProviderEvent, ProviderStream, ToolSpec};
 
 use super::{RetryPolicy, Retryable};
 
@@ -67,7 +67,19 @@ where
         model: &Self::Model,
         conversation: &Conversation,
         tools: &[ToolSpec],
-    ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
+    ) -> Result<(crate::AssistantMessage, Self::Continuation), Self::Error> {
+        self.complete_with_usage(continuation, model, conversation, tools)
+            .await
+            .map(|completion| (completion.message, completion.continuation))
+    }
+
+    async fn complete_with_usage(
+        &self,
+        continuation: &Self::Continuation,
+        model: &Self::Model,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> Result<ProviderCompletion<Self::Continuation>, Self::Error> {
         let max = self.policy.max_attempts.max(1);
         let mut attempt = 0u32;
 
@@ -75,7 +87,7 @@ where
             attempt += 1;
             match self
                 .inner
-                .complete(continuation, model, conversation, tools)
+                .complete_with_usage(continuation, model, conversation, tools)
                 .await
             {
                 Ok(completion) => return Ok(completion),
@@ -113,8 +125,8 @@ where
                             emitted_text = true;
                             yield ProviderEvent::TextDelta(delta);
                         }
-                        Ok(ProviderEvent::Completed(message, continuation)) => {
-                            yield ProviderEvent::Completed(message, continuation);
+                        Ok(ProviderEvent::Completed(completion)) => {
+                            yield ProviderEvent::Completed(completion);
                             return;
                         }
                         Err(error)
@@ -139,6 +151,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AssistantMessage;
     use std::error::Error;
     use std::fmt;
     use std::future::Future;
@@ -352,7 +365,11 @@ mod tests {
                 } else if attempt == 0 {
                     Err(RetryTestError::http(503, true))?;
                 } else {
-                    yield ProviderEvent::Completed(AssistantMessage::new("ok"), ());
+                    yield ProviderEvent::Completed(ProviderCompletion::new(
+                        AssistantMessage::new("ok"),
+                        (),
+                        crate::TokenUsage::unknown(),
+                    ));
                 }
             })
         }
@@ -377,7 +394,7 @@ mod tests {
         let conversation = Conversation::new();
         let mut stream = provider.complete_stream(&(), &TestModel, &conversation, &[]);
         assert!(
-            matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::Completed(message, ()) if message.content() == "ok")
+            matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::Completed(completion) if completion.message.content() == "ok")
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
 
@@ -401,6 +418,7 @@ mod tests {
 #[cfg(test)]
 mod transactional_tests {
     use super::*;
+    use crate::AssistantMessage;
     use std::error::Error;
     use std::fmt;
     use std::sync::Arc;

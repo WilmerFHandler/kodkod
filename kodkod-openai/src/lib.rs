@@ -7,6 +7,7 @@ mod error;
 mod model;
 mod provider;
 mod responses;
+mod usage;
 
 pub use completion::{chat_completions_url, complete, complete_with_credentials};
 pub use error::OpenAiError;

@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     while let Some(event) = stream.next().await {
-        if let AgentEvent::Completed(message) = event? {
+        if let AgentEvent::Completed(message, _usage) = event? {
             assert_eq!(message.content(), "hello");
             break;
         }
@@ -110,6 +110,16 @@ let agent = Agent::new(RetryProvider::new(EchoProvider));
 ```
 
 `Conversation::estimate_tokens` is a tokenizer-free request-size heuristic.
+`AgentContext::estimated_current_context` wraps that heuristic, including
+provider-private continuation replay, in a `ContextEstimate` tagged with
+`ContextEstimateProvenance::Heuristic`. It is separate from authoritative
+`TokenUsage`: providers report input, cached input, output, reasoning output,
+and total counts when available, while missing fields remain `None`. A terminal
+`ProviderCompletion` carries the usage atomically with its assistant message
+and continuation; `AgentEvent::Completed` aggregates those values across tool
+and compaction rounds. Implement `complete_with_usage` when a custom provider
+has reliable response counts, while existing `complete` implementations
+continue to work with unknown usage.
 Inline documents use `Document::try_new(mime, filename, bytes)` and
 `UserMessage::with_documents`. They stay in the application-owned conversation
 as validated bytes; a provider must opt in to each MIME type with

@@ -18,27 +18,37 @@ fn json_tokens(value: &impl serde::Serialize) -> u64 {
 pub(crate) fn estimate_message(message: &Message) -> u64 {
     let mut tokens = MESSAGE_OVERHEAD_TOKENS;
     match message {
-        Message::System(message) => tokens += text_tokens(message.content().len()),
+        Message::System(message) => {
+            tokens = tokens.saturating_add(text_tokens(message.content().len()))
+        }
         Message::User(message) => {
-            tokens += text_tokens(message.content().len());
-            tokens += message.images().len() as u64 * IMAGE_TOKENS;
-            tokens += message.documents().len() as u64 * DOCUMENT_TOKENS;
+            tokens = tokens.saturating_add(text_tokens(message.content().len()));
+            tokens =
+                tokens.saturating_add((message.images().len() as u64).saturating_mul(IMAGE_TOKENS));
+            tokens = tokens
+                .saturating_add((message.documents().len() as u64).saturating_mul(DOCUMENT_TOKENS));
         }
         Message::Assistant(message) => {
-            tokens += text_tokens(message.content().len());
+            tokens = tokens.saturating_add(text_tokens(message.content().len()));
             for call in message.tool_calls() {
-                tokens += text_tokens(call.id().len() + call.name().len());
-                tokens += json_tokens(call.arguments());
+                tokens = tokens.saturating_add(text_tokens(
+                    call.id().len().saturating_add(call.name().len()),
+                ));
+                tokens = tokens.saturating_add(json_tokens(call.arguments()));
             }
         }
         Message::ToolResult(result) => {
-            tokens += text_tokens(result.tool_call_id().len());
+            tokens = tokens.saturating_add(text_tokens(result.tool_call_id().len()));
             match result.outcome() {
                 ToolResultOutcome::Success(output) => {
-                    tokens += json_tokens(output.value());
-                    tokens += output.images().len() as u64 * IMAGE_TOKENS;
+                    tokens = tokens.saturating_add(json_tokens(output.value()));
+                    tokens = tokens.saturating_add(
+                        (output.images().len() as u64).saturating_mul(IMAGE_TOKENS),
+                    );
                 }
-                ToolResultOutcome::Error(error) => tokens += text_tokens(error.to_string().len()),
+                ToolResultOutcome::Error(error) => {
+                    tokens = tokens.saturating_add(text_tokens(error.to_string().len()))
+                }
             }
         }
     }
@@ -48,15 +58,19 @@ pub(crate) fn estimate_message(message: &Message) -> u64 {
 pub(crate) fn estimate_conversation(conversation: &Conversation, tools: &[ToolSpec]) -> u64 {
     let mut tokens = BASE_OVERHEAD_TOKENS;
     if let Some(system_prompt) = conversation.system_prompt() {
-        tokens += MESSAGE_OVERHEAD_TOKENS + text_tokens(system_prompt.len());
+        tokens = tokens.saturating_add(
+            MESSAGE_OVERHEAD_TOKENS.saturating_add(text_tokens(system_prompt.len())),
+        );
     }
     for message in conversation.messages() {
-        tokens += estimate_message(message);
+        tokens = tokens.saturating_add(estimate_message(message));
     }
     for spec in tools {
-        tokens += MESSAGE_OVERHEAD_TOKENS;
-        tokens += text_tokens(spec.name().len() + spec.description().len());
-        tokens += json_tokens(spec.input_schema());
+        tokens = tokens.saturating_add(MESSAGE_OVERHEAD_TOKENS);
+        tokens = tokens.saturating_add(text_tokens(
+            spec.name().len().saturating_add(spec.description().len()),
+        ));
+        tokens = tokens.saturating_add(json_tokens(spec.input_schema()));
     }
     tokens
 }

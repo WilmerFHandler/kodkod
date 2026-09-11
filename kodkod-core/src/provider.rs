@@ -5,7 +5,28 @@ use std::pin::Pin;
 use futures::Stream;
 
 use crate::compact::{CompactError, CompactOptions};
-use crate::{AssistantMessage, Conversation, ToolSpec};
+use crate::{AssistantMessage, Conversation, TokenUsage, ToolSpec};
+
+/// The authoritative result of one completed provider round.
+///
+/// The message, continuation checkpoint, and usage are returned together so a
+/// caller cannot commit one while accidentally dropping the other.
+#[derive(Debug)]
+pub struct ProviderCompletion<C> {
+    pub message: AssistantMessage,
+    pub continuation: C,
+    pub usage: TokenUsage,
+}
+
+impl<C> ProviderCompletion<C> {
+    pub fn new(message: AssistantMessage, continuation: C, usage: TokenUsage) -> Self {
+        Self {
+            message,
+            continuation,
+            usage,
+        }
+    }
+}
 
 /// Provisional progress and the authoritative result of one provider round.
 pub enum ProviderEvent<C> {
@@ -14,7 +35,7 @@ pub enum ProviderEvent<C> {
     TextDelta(String),
     /// The only event whose message and continuation may be committed. This is
     /// terminal: a provider must emit no events after it.
-    Completed(AssistantMessage, C),
+    Completed(ProviderCompletion<C>),
 }
 
 /// A provider response stream. Successful streams end with exactly one
@@ -71,11 +92,35 @@ pub trait Provider: Sync {
         tools: &[ToolSpec],
     ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), Self::Error>> + Send;
 
+    /// Produce one assistant response with its authoritative provider usage.
+    ///
+    /// Complete-only providers inherit an unknown usage value; adapters should
+    /// override this when their response exposes clear token accounting.
+    fn complete_with_usage(
+        &self,
+        continuation: &Self::Continuation,
+        model: &Self::Model,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> impl Future<Output = Result<ProviderCompletion<Self::Continuation>, Self::Error>> + Send
+    {
+        let completion = self.complete(continuation, model, conversation, tools);
+        async move {
+            let (message, continuation) = completion.await?;
+            Ok(ProviderCompletion::new(
+                message,
+                continuation,
+                TokenUsage::unknown(),
+            ))
+        }
+    }
+
     /// Stream one assistant response and its next continuation checkpoint.
     ///
     /// The default keeps complete-only providers source-compatible. Streaming
     /// providers may emit text deltas, but must emit owned authoritative state
-    /// only in the final `Completed` event and must end immediately afterward.
+    /// and usage only in the final `Completed` event and must end immediately
+    /// afterward.
     fn complete_stream<'a>(
         &'a self,
         continuation: &'a Self::Continuation,
@@ -83,11 +128,9 @@ pub trait Provider: Sync {
         conversation: &'a Conversation,
         tools: &'a [ToolSpec],
     ) -> ProviderStream<'a, Self::Continuation, Self::Error> {
-        let completion = self.complete(continuation, model, conversation, tools);
+        let completion = self.complete_with_usage(continuation, model, conversation, tools);
         Box::pin(futures::stream::once(async move {
-            completion
-                .await
-                .map(|(message, continuation)| ProviderEvent::Completed(message, continuation))
+            completion.await.map(ProviderEvent::Completed)
         }))
     }
 
@@ -106,6 +149,22 @@ pub trait Provider: Sync {
         }
     }
 
+    /// Perform an independent one-round operation while retaining the
+    /// provider-reported usage and continuation.
+    fn complete_once_with_usage(
+        &self,
+        model: &Self::Model,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> impl Future<Output = Result<ProviderCompletion<Self::Continuation>, Self::Error>> + Send
+    {
+        async move {
+            let continuation = self.create_continuation(model);
+            self.complete_with_usage(&continuation, model, conversation, tools)
+                .await
+        }
+    }
+
     /// Summarize dropped prefix messages and return a smaller conversation.
     ///
     /// The default implementation is provider-agnostic: it plans a protocol-safe
@@ -117,6 +176,23 @@ pub trait Provider: Sync {
         conversation: &Conversation,
         options: CompactOptions,
     ) -> impl Future<Output = Result<Conversation, CompactError<Self::Error>>> + Send {
-        async move { crate::compact::run(self, model, conversation, options).await }
+        async move {
+            crate::compact::run_with_usage(self, model, conversation, options)
+                .await
+                .map(|result| result.conversation)
+        }
+    }
+
+    /// Compact a conversation while retaining the provider usage consumed by
+    /// the summary round. The ordinary [`Provider::compact`] method remains a
+    /// convenient conversation-only wrapper.
+    fn compact_with_usage(
+        &self,
+        model: &Self::Model,
+        conversation: &Conversation,
+        options: CompactOptions,
+    ) -> impl Future<Output = Result<crate::CompactionResult, CompactError<Self::Error>>> + Send
+    {
+        async move { crate::compact::run_with_usage(self, model, conversation, options).await }
     }
 }

@@ -21,8 +21,8 @@ pub use event::AgentEvent;
 pub type Task<'a, E> = futures::stream::BoxStream<'a, Result<AgentEvent, AgentError<E>>>;
 
 use crate::{
-    CompactError, Conversation, Message, Provider, ProviderEvent, Tool, ToolExecutor,
-    TurnCompaction, UserMessage,
+    CompactError, ContextEstimate, Conversation, Message, Provider, ProviderCompletion,
+    ProviderEvent, TokenUsage, Tool, ToolExecutor, ToolSpec, TurnCompaction, UserMessage,
 };
 
 async fn cancel_or<T>(control: &TaskControl, operation: impl Future<Output = T>) -> Option<T> {
@@ -57,6 +57,21 @@ impl<P: Provider> AgentContext<P> {
     /// Conservatively estimate provider-private tokens replayed on the next request.
     pub fn estimated_continuation_tokens(&self) -> u64 {
         P::estimate_continuation_tokens(&self.continuation)
+    }
+
+    /// Estimate the next request context, including provider-private replay.
+    /// The result is a bounded heuristic and must not be treated as provider
+    /// reported usage.
+    pub fn estimated_current_context(
+        &self,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> ContextEstimate {
+        ContextEstimate::heuristic(
+            conversation
+                .estimate_tokens(tools)
+                .saturating_add(self.estimated_continuation_tokens()),
+        )
     }
 }
 
@@ -222,6 +237,7 @@ where
             let computer_use_enabled = self.provider.supports_computer_use(model);
             let tool_specs = self.tools.specs_for_capabilities(vision_enabled, computer_use_enabled);
             let mut tool_rounds_executed = 0;
+            let mut turn_usage = TokenUsage::zero();
 
             loop {
                 let steers = control.drain_pending_steers_unless_cancelled()
@@ -248,7 +264,7 @@ where
                     yield AgentEvent::CompactionStarted;
                     let result = match cancel_or(
                         control,
-                        self.provider.compact(
+                        self.provider.compact_with_usage(
                             compaction.model,
                             conversation,
                             compaction.options,
@@ -261,6 +277,11 @@ where
                     };
                     match result {
                         Ok(compacted) => {
+                            let crate::CompactionResult {
+                                conversation: compacted,
+                                usage,
+                            } = compacted;
+                            turn_usage.add_round(usage);
                             // Conversation and continuation are one checkpoint.
                             *conversation = compacted.clone();
                             context
@@ -288,7 +309,7 @@ where
                     &provider_input,
                     &tool_specs,
                 );
-                let (message, next_continuation) = loop {
+                let (message, next_continuation, round_usage) = loop {
                     // Cancellation wins when both become ready in one poll.
                     let event = cancel_or(control, provider_stream.next()).await;
                     match event {
@@ -297,16 +318,21 @@ where
                         {
                             yield AgentEvent::AssistantTextDelta(delta);
                         }
-                        Some(Some(Ok(ProviderEvent::Completed(message, continuation))))
+                        Some(Some(Ok(ProviderEvent::Completed(ProviderCompletion {
+                            message,
+                            continuation,
+                            usage,
+                        }))))
                             if !control.is_cancelled() =>
                         {
-                            break (message, continuation);
+                            break (message, continuation, usage);
                         }
                         Some(Some(Ok(_))) | None => Err(AgentError::Cancelled)?,
                         Some(Some(Err(error))) => Err(AgentError::Provider(error))?,
                         Some(None) => Err(AgentError::ProviderStreamEnded)?,
                     }
                 };
+                turn_usage.add_round(round_usage);
                 drop(provider_stream);
                 drop(provider_input);
 
@@ -316,7 +342,7 @@ where
                 let tool_calls = message.tool_calls().to_vec();
                 conversation.push_message(Message::Assistant(message.clone()));
                 context.as_mut().expect("agent context exists").checkpoint(next_continuation);
-                yield AgentEvent::AssistantReply(message.clone());
+                yield AgentEvent::AssistantReply(message.clone(), round_usage);
 
                 if tool_calls.is_empty() {
                     if !control.close_if_empty() {
@@ -324,7 +350,7 @@ where
                     }
                     drop(context.take());
                     drop(guard.take());
-                    yield AgentEvent::Completed(message);
+                    yield AgentEvent::Completed(message, turn_usage);
                     return;
                 }
 

@@ -4,13 +4,14 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use kodkod_core::{
-    AssistantMessage, Conversation, Message, Provider, ProviderEvent, ProviderStream, ToolCall,
-    ToolExecutorError, ToolResult, ToolResultOutcome, ToolSpec,
+    AssistantMessage, Conversation, Message, Provider, ProviderCompletion, ProviderEvent,
+    ProviderStream, ToolCall, ToolExecutorError, ToolResult, ToolResultOutcome, ToolSpec,
 };
 use kodkod_http::{SseDecoder, SseEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::usage::parse_usage;
 use crate::{CredentialSource, OpenAiError, OpenAiModel};
 
 pub fn responses_url(base_url: &str) -> String {
@@ -135,10 +136,22 @@ where
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
+        self.complete_with_usage(continuation, model, conversation, tools)
+            .await
+            .map(|completion| (completion.message, completion.continuation))
+    }
+
+    async fn complete_with_usage(
+        &self,
+        continuation: &Self::Continuation,
+        model: &M,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> Result<ProviderCompletion<Self::Continuation>, Self::Error> {
         let mut stream = self.complete_stream(continuation, model, conversation, tools);
         while let Some(event) = stream.next().await {
-            if let ProviderEvent::Completed(message, continuation) = event? {
-                return Ok((message, continuation));
+            if let ProviderEvent::Completed(completion) = event? {
+                return Ok(completion);
             }
         }
         Err(OpenAiError::Protocol(
@@ -214,7 +227,11 @@ where
                             assistant: assistant.clone(),
                             output: final_output,
                         });
-                        yield ProviderEvent::Completed(assistant, next);
+                        yield ProviderEvent::Completed(ProviderCompletion::new(
+                            assistant,
+                            next,
+                            parse_usage(&terminal),
+                        ));
                         return;
                     }
                 }
@@ -742,7 +759,7 @@ fn required_string(item: &Value, field: &str) -> Result<String, OpenAiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kodkod_core::{Document, Image, UserMessage};
+    use kodkod_core::{Document, Image, ProviderEvent, TokenUsage, UserMessage};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -778,6 +795,16 @@ mod tests {
             json!({
                 "type": "response.completed",
                 "response": {"status": "completed", "output": output}
+            })
+        )
+    }
+
+    fn completed_with_usage(output: Value, usage: Value) -> String {
+        format!(
+            "event: response.completed\ndata: {}\n\n",
+            json!({
+                "type": "response.completed",
+                "response": {"status": "completed", "output": output, "usage": usage}
             })
         )
     }
@@ -860,6 +887,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.content(), "done");
+    }
+
+    #[tokio::test]
+    async fn preserves_responses_usage_for_complete_and_stream() {
+        let server = MockServer::start().await;
+        let body = completed_with_usage(
+            json!([{
+                "type":"message", "role":"assistant",
+                "content":[{"type":"output_text", "text":"done"}]
+            }]),
+            json!({
+                "input_tokens": 100,
+                "input_tokens_details": {"cached_tokens": 25},
+                "output_tokens": 40,
+                "output_tokens_details": {"reasoning_tokens": 12},
+                "total_tokens": 140
+            }),
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let provider = OpenAiResponsesProvider::<TestModel>::new(format!("{}/v1", server.uri()));
+        let conversation = Conversation::new();
+
+        let completion = provider
+            .complete_once_with_usage(&TestModel, &conversation, &[])
+            .await
+            .unwrap();
+        let expected = TokenUsage {
+            input_tokens: Some(100),
+            cached_input_tokens: Some(25),
+            output_tokens: Some(40),
+            reasoning_output_tokens: Some(12),
+            total_tokens: Some(140),
+        };
+        assert_eq!(completion.message.content(), "done");
+        assert_eq!(completion.usage, expected);
+
+        let continuation = provider.create_continuation(&TestModel);
+        let mut stream = provider.complete_stream(&continuation, &TestModel, &conversation, &[]);
+        let ProviderEvent::Completed(completion) = stream.next().await.unwrap().unwrap() else {
+            panic!("expected terminal completion");
+        };
+        assert_eq!(completion.usage, expected);
+        server.verify().await;
     }
 
     #[test]

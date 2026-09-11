@@ -1,6 +1,6 @@
 use super::*;
 use futures_util::StreamExt;
-use kodkod_core::{Conversation, Document, Provider, ProviderEvent, UserMessage};
+use kodkod_core::{Conversation, Document, Provider, ProviderEvent, TokenUsage, UserMessage};
 use kodkod_http::{RequestCredentials, StaticCredentials};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::json;
@@ -65,6 +65,30 @@ fn completed(text: &str) -> String {
     )
 }
 
+fn completed_with_usage(text: &str) -> String {
+    format!(
+        "event: response.completed\ndata: {}\n\n",
+        json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 100,
+                    "input_tokens_details": {"cached_tokens": 25},
+                    "output_tokens": 40,
+                    "output_tokens_details": {"reasoning_tokens": 12},
+                    "total_tokens": 140
+                },
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}]
+                }]
+            }
+        })
+    )
+}
+
 #[tokio::test]
 async fn codex_adds_fresh_account_credentials_and_originator() {
     let server = MockServer::start().await;
@@ -119,7 +143,7 @@ async fn codex_forwards_responses_text_deltas() {
         matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::TextDelta(text) if text == "live")
     );
     assert!(
-        matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::Completed(message, _) if message.content() == "final")
+        matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::Completed(completion) if completion.message.content() == "final")
     );
 }
 
@@ -128,7 +152,7 @@ async fn codex_routes_pdf_to_responses_for_completion_and_stream() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/responses"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(completed("done")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(completed_with_usage("done")))
         .expect(2)
         .mount(&server)
         .await;
@@ -141,15 +165,27 @@ async fn codex_routes_pdf_to_responses_for_completion_and_stream() {
         Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
     ]));
 
-    provider
-        .complete_once(&TestCodexModel, &conversation, &[])
+    let completion = provider
+        .complete_once_with_usage(&TestCodexModel, &conversation, &[])
         .await
         .unwrap();
+    assert_eq!(
+        completion.usage,
+        TokenUsage {
+            input_tokens: Some(100),
+            cached_input_tokens: Some(25),
+            output_tokens: Some(40),
+            reasoning_output_tokens: Some(12),
+            total_tokens: Some(140),
+        }
+    );
     let continuation = provider.create_continuation(&TestCodexModel);
     let mut stream = provider.complete_stream(&continuation, &TestCodexModel, &conversation, &[]);
     assert!(matches!(
         stream.next().await.unwrap().unwrap(),
-        ProviderEvent::Completed(message, _) if message.content() == "done"
+        ProviderEvent::Completed(completion)
+            if completion.message.content() == "done"
+                && completion.usage.total_tokens == Some(140)
     ));
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 2);

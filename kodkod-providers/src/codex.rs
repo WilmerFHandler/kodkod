@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use kodkod_core::{
-    AssistantMessage, Conversation, Message, Provider, ProviderEvent, ProviderStream, ToolSpec,
+    AssistantMessage, Conversation, Message, Provider, ProviderCompletion, ProviderEvent,
+    ProviderStream, ToolSpec,
 };
 use kodkod_http::{CredentialError, CredentialSource, RequestCredentials};
 use kodkod_openai::{OpenAiError, OpenAiModel, OpenAiResponsesProvider, ResponsesContinuation};
@@ -128,9 +129,21 @@ where
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
+        self.complete_with_usage(continuation, model, conversation, tools)
+            .await
+            .map(|completion| (completion.message, completion.continuation))
+    }
+
+    async fn complete_with_usage(
+        &self,
+        continuation: &Self::Continuation,
+        model: &M,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> Result<ProviderCompletion<Self::Continuation>, Self::Error> {
         validate_documents(model, conversation)?;
         self.inner()
-            .complete(continuation, model, conversation, tools)
+            .complete_with_usage(continuation, model, conversation, tools)
             .await
     }
 
@@ -148,8 +161,8 @@ where
             while let Some(event) = stream.next().await {
                 match event? {
                     ProviderEvent::TextDelta(delta) => yield ProviderEvent::TextDelta(delta),
-                    ProviderEvent::Completed(message, continuation) => {
-                        yield ProviderEvent::Completed(message, continuation);
+                    ProviderEvent::Completed(completion) => {
+                        yield ProviderEvent::Completed(completion);
                         return;
                     }
                 }

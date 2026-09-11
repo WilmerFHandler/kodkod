@@ -69,9 +69,17 @@ No provider opens a browser, stores credentials, or performs an OAuth flow.
 Applications can render provider text before a round completes by consuming the
 agent task as a stream. Deltas are provisional: replace the preview with the
 `AssistantReply` message, which is the authoritative transcript checkpoint and
-may differ from the concatenated deltas. Complete-only providers emit no deltas,
-so rendering the final reply once also avoids duplicate text. Existing exhaustive
-matches over AgentEvent must add the AssistantTextDelta case.
+may differ from the concatenated deltas. Each reply also carries that round's
+authoritative [`TokenUsage`]; the final `Completed` event carries the aggregate
+for the turn, including any tool and compaction rounds. Missing provider fields
+remain unknown instead of being treated as zero. Complete-only providers keep
+their existing `complete` implementation and can override `complete_with_usage`
+when their response exposes clear counts.
+
+`AgentContext::estimated_current_context` exposes a bounded request-size
+heuristic with `ContextEstimateProvenance::Heuristic`. It is useful for UI
+budgeting and compaction decisions, but it is not provider-reported usage and
+must not be combined with `TokenUsage`.
 
 ```rust,ignore
 let mut preview = String::new();
@@ -82,7 +90,7 @@ while let Some(event) = task.next().await {
             preview.push_str(&delta);
             render_preview(&preview);
         }
-        AgentEvent::AssistantReply(message) => {
+        AgentEvent::AssistantReply(message, _round_usage) => {
             preview.clear();
             render_committed(message.content());
         }

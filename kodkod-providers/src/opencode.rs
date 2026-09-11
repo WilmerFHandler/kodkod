@@ -7,8 +7,8 @@ use kodkod_anthropic::{
     AnthropicContinuation, AnthropicError, AnthropicMessagesProvider, AnthropicModel,
 };
 use kodkod_core::{
-    AssistantMessage, Conversation, Message, Provider, ProviderEvent, ProviderStream, Retryable,
-    ToolSpec,
+    AssistantMessage, Conversation, Message, Provider, ProviderCompletion, ProviderEvent,
+    ProviderStream, Retryable, ToolSpec,
 };
 use kodkod_http::{CredentialSource, RequestCredentials, StaticCredentials};
 use kodkod_openai::{
@@ -399,6 +399,18 @@ impl Provider for OpenCodeProvider {
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
+        self.complete_with_usage(continuation, model, conversation, tools)
+            .await
+            .map(|completion| (completion.message, completion.continuation))
+    }
+
+    async fn complete_with_usage(
+        &self,
+        continuation: &Self::Continuation,
+        model: &OpenCodeModel,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> Result<ProviderCompletion<Self::Continuation>, Self::Error> {
         self.validate_model(model)?;
         self.validate_documents(model, conversation)?;
         match (model.protocol, continuation) {
@@ -406,27 +418,41 @@ impl Provider for OpenCodeProvider {
                 let provider = OpenAiResponsesProvider::new(&self.endpoint)
                     .with_credentials(self.credentials(Protocol::Responses))
                     .with_client(self.client.clone());
-                let (message, next) = provider
-                    .complete(continuation, model, conversation, tools)
+                let completion = provider
+                    .complete_with_usage(continuation, model, conversation, tools)
                     .await?;
-                Ok((message, OpenCodeContinuation::Responses(next)))
+                Ok(ProviderCompletion::new(
+                    completion.message,
+                    OpenCodeContinuation::Responses(completion.continuation),
+                    completion.usage,
+                ))
             }
             (Protocol::ChatCompletions, OpenCodeContinuation::ChatCompletions) => {
                 let provider = OpenAiCompatibleProvider::new(&self.endpoint)
                     .with_pdf_inputs(model.supports_pdf())
                     .with_credentials(self.credentials(Protocol::ChatCompletions))
                     .with_client(self.client.clone());
-                let (message, ()) = provider.complete(&(), model, conversation, tools).await?;
-                Ok((message, OpenCodeContinuation::ChatCompletions))
+                let completion = provider
+                    .complete_with_usage(&(), model, conversation, tools)
+                    .await?;
+                Ok(ProviderCompletion::new(
+                    completion.message,
+                    OpenCodeContinuation::ChatCompletions,
+                    completion.usage,
+                ))
             }
             (Protocol::Messages, OpenCodeContinuation::Messages(continuation)) => {
                 let provider = AnthropicMessagesProvider::new(&self.endpoint)
                     .with_credentials(self.credentials(Protocol::Messages))
                     .with_client(self.client.clone());
-                let (message, next) = provider
-                    .complete(continuation, model, conversation, tools)
+                let completion = provider
+                    .complete_with_usage(continuation, model, conversation, tools)
                     .await?;
-                Ok((message, OpenCodeContinuation::Messages(next)))
+                Ok(ProviderCompletion::new(
+                    completion.message,
+                    OpenCodeContinuation::Messages(completion.continuation),
+                    completion.usage,
+                ))
             }
             _ => Err(ProviderConfigError::new(
                 "OpenCode continuation protocol does not match the selected model",
@@ -454,8 +480,12 @@ impl Provider for OpenCodeProvider {
                     while let Some(event) = stream.next().await {
                         match event? {
                             ProviderEvent::TextDelta(delta) => yield ProviderEvent::TextDelta(delta),
-                            ProviderEvent::Completed(message, next) => {
-                                yield ProviderEvent::Completed(message, OpenCodeContinuation::Responses(next));
+                            ProviderEvent::Completed(completion) => {
+                                yield ProviderEvent::Completed(ProviderCompletion::new(
+                                    completion.message,
+                                    OpenCodeContinuation::Responses(completion.continuation),
+                                    completion.usage,
+                                ));
                                 return;
                             }
                         }
@@ -470,8 +500,12 @@ impl Provider for OpenCodeProvider {
                     while let Some(event) = stream.next().await {
                         match event? {
                             ProviderEvent::TextDelta(delta) => yield ProviderEvent::TextDelta(delta),
-                            ProviderEvent::Completed(message, ()) => {
-                                yield ProviderEvent::Completed(message, OpenCodeContinuation::ChatCompletions);
+                            ProviderEvent::Completed(completion) => {
+                                yield ProviderEvent::Completed(ProviderCompletion::new(
+                                    completion.message,
+                                    OpenCodeContinuation::ChatCompletions,
+                                    completion.usage,
+                                ));
                                 return;
                             }
                         }
@@ -485,8 +519,12 @@ impl Provider for OpenCodeProvider {
                     while let Some(event) = stream.next().await {
                         match event? {
                             ProviderEvent::TextDelta(delta) => yield ProviderEvent::TextDelta(delta),
-                            ProviderEvent::Completed(message, next) => {
-                                yield ProviderEvent::Completed(message, OpenCodeContinuation::Messages(next));
+                            ProviderEvent::Completed(completion) => {
+                                yield ProviderEvent::Completed(ProviderCompletion::new(
+                                    completion.message,
+                                    OpenCodeContinuation::Messages(completion.continuation),
+                                    completion.usage,
+                                ));
                                 return;
                             }
                         }

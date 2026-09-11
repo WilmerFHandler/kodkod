@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde_json::{Value, json};
 
-use crate::{AssistantMessage, Conversation, Message, Provider, ToolSpec, UserMessage};
+use crate::{AssistantMessage, Conversation, Message, Provider, TokenUsage, ToolSpec, UserMessage};
 
 pub const DEFAULT_KEEP_TAIL_TOKENS: u64 = 20_000;
 
@@ -41,6 +41,13 @@ pub enum CompactError<E> {
     Provider(E),
 }
 
+/// A compacted conversation and the usage consumed to produce its summary.
+#[derive(Debug)]
+pub struct CompactionResult {
+    pub conversation: Conversation,
+    pub usage: TokenUsage,
+}
+
 impl<E: fmt::Display> fmt::Display for CompactError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -61,24 +68,27 @@ impl<E: StdError + 'static> StdError for CompactError<E> {
     }
 }
 
-pub(crate) async fn run<P: Provider + ?Sized>(
+pub(crate) async fn run_with_usage<P: Provider + ?Sized>(
     provider: &P,
     model: &P::Model,
     conversation: &Conversation,
     options: CompactOptions,
-) -> Result<Conversation, CompactError<P::Error>> {
+) -> Result<CompactionResult, CompactError<P::Error>> {
     let kept = plan(conversation.messages(), options.keep_tail_tokens)
         .ok_or(CompactError::NothingToCompact)?;
     let request = summarizer_conversation(
         conversation,
         tail_starts_at(&kept, conversation.messages().len()),
     );
-    let message = provider
-        .complete_once(model, &request, &[summarize_tool()])
+    let completion = provider
+        .complete_once_with_usage(model, &request, &[summarize_tool()])
         .await
         .map_err(CompactError::Provider)?;
-    let summary = summary_from_reply(&message)?;
-    Ok(splice(conversation, &kept, AssistantMessage::new(summary)))
+    let summary = summary_from_reply(&completion.message)?;
+    Ok(CompactionResult {
+        conversation: splice(conversation, &kept, AssistantMessage::new(summary)),
+        usage: completion.usage,
+    })
 }
 
 fn plan(messages: &[Message], keep_tail_tokens: u64) -> Option<Vec<usize>> {

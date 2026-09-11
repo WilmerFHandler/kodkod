@@ -15,20 +15,24 @@ pub mod turns;
 
 mod compact;
 mod estimate;
+mod usage;
 
 pub use agent::{Agent, AgentContext, AgentError, AgentEvent, SteerError, Task, TaskControl};
-pub use compact::{CompactError, CompactOptions, DEFAULT_KEEP_TAIL_TOKENS, TurnCompaction};
+pub use compact::{
+    CompactError, CompactOptions, CompactionResult, DEFAULT_KEEP_TAIL_TOKENS, TurnCompaction,
+};
 pub use conversation::Conversation;
 pub use message::{
     AssistantMessage, Document, DocumentError, Image, Message, SystemMessage, UserMessage,
 };
-pub use provider::{Provider, ProviderEvent, ProviderStream};
+pub use provider::{Provider, ProviderCompletion, ProviderEvent, ProviderStream};
 pub use retry::{RetryPolicy, RetryProvider, Retryable};
 pub use tool::{
     Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolOutput, ToolResult,
     ToolResultOutcome, ToolSpec,
 };
 pub use turns::{Turn, TurnIter, Turns, turns};
+pub use usage::{ContextEstimate, ContextEstimateProvenance, TokenUsage};
 
 #[cfg(test)]
 mod tests;

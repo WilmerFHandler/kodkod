@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use kodkod_core::{
-    AssistantMessage, Conversation, Provider, ProviderEvent, ProviderStream, ToolSpec,
+    AssistantMessage, Conversation, Provider, ProviderCompletion, ProviderEvent, ProviderStream,
+    ToolSpec,
 };
 
 use super::completion;
@@ -90,18 +91,30 @@ where
 
     async fn complete(
         &self,
-        _continuation: &Self::Continuation,
+        continuation: &Self::Continuation,
         model: &M,
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
+        self.complete_with_usage(continuation, model, conversation, tools)
+            .await
+            .map(|completion| (completion.message, completion.continuation))
+    }
+
+    async fn complete_with_usage(
+        &self,
+        _continuation: &Self::Continuation,
+        model: &M,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> Result<ProviderCompletion<Self::Continuation>, Self::Error> {
         let pdf_allowed = self.supports_document(model, "application/pdf");
         validate_documents(conversation, pdf_allowed)?;
         let credentials = match &self.credentials {
             Some(source) => Some(source.credentials().await?),
             None => None,
         };
-        completion::complete_with_document_support(
+        let (message, usage) = completion::complete_with_document_support(
             &self.client,
             &self.chat_completions_url,
             credentials.as_ref(),
@@ -110,8 +123,8 @@ where
             tools,
             pdf_allowed,
         )
-        .await
-        .map(|message| (message, ()))
+        .await?;
+        Ok(ProviderCompletion::new(message, (), usage))
     }
 
     fn complete_stream<'a>(
@@ -140,8 +153,8 @@ where
             while let Some(event) = stream.next().await {
                 match event? {
                     ProviderEvent::TextDelta(delta) => yield ProviderEvent::TextDelta(delta),
-                    ProviderEvent::Completed(message, ()) => {
-                        yield ProviderEvent::Completed(message, ());
+                    ProviderEvent::Completed(completion) => {
+                        yield ProviderEvent::Completed(completion);
                         return;
                     }
                 }
@@ -170,7 +183,7 @@ fn is_official_openai_api(base_url: &str) -> bool {
 mod tests {
     use super::*;
     use futures_util::StreamExt;
-    use kodkod_core::{Document, ProviderEvent, UserMessage};
+    use kodkod_core::{Document, ProviderEvent, TokenUsage, UserMessage};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{body_json, method, path};
@@ -215,7 +228,14 @@ mod tests {
                         "content": "world",
                         "tool_calls": []
                     }
-                }]
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "prompt_tokens_details": {"cached_tokens": 3},
+                    "completion_tokens": 4,
+                    "completion_tokens_details": {"reasoning_tokens": 1},
+                    "total_tokens": 14
+                }
             })))
             .mount(&server)
             .await;
@@ -228,13 +248,23 @@ mod tests {
             id: "llama3",
             vision: false,
         };
-        let message = provider
-            .complete_once(&model, &conversation, &[])
+        let completion = provider
+            .complete_once_with_usage(&model, &conversation, &[])
             .await
             .expect("completion should succeed");
 
-        assert_eq!(message.content(), "world");
-        assert!(message.tool_calls().is_empty());
+        assert_eq!(completion.message.content(), "world");
+        assert!(completion.message.tool_calls().is_empty());
+        assert_eq!(
+            completion.usage,
+            TokenUsage {
+                input_tokens: Some(10),
+                cached_input_tokens: Some(3),
+                output_tokens: Some(4),
+                reasoning_output_tokens: Some(1),
+                total_tokens: Some(14),
+            }
+        );
     }
 
     #[tokio::test]
@@ -244,6 +274,7 @@ mod tests {
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}}\n\n",
             "data: [DONE]\n\n"
         );
         Mock::given(method("POST"))
@@ -269,7 +300,7 @@ mod tests {
             matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::TextDelta(text) if text == "lo")
         );
         assert!(
-            matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::Completed(message, ()) if message.content() == "hello")
+            matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::Completed(completion) if completion.message.content() == "hello" && completion.usage.total_tokens == Some(14))
         );
     }
 
@@ -415,7 +446,7 @@ mod tests {
         ));
         assert!(matches!(
             stream.next().await.unwrap().unwrap(),
-            ProviderEvent::Completed(_, ())
+            ProviderEvent::Completed(_)
         ));
         let requests = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();

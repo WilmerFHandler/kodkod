@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use kodkod_core::{
-    AssistantMessage, Conversation, Message, Provider, ProviderEvent, ProviderStream, Retryable,
-    ToolCall, ToolExecutorError, ToolResult, ToolResultOutcome, ToolSpec,
+    AssistantMessage, Conversation, Message, Provider, ProviderCompletion, ProviderEvent,
+    ProviderStream, Retryable, TokenUsage, ToolCall, ToolExecutorError, ToolResult,
+    ToolResultOutcome, ToolSpec,
 };
 use kodkod_http::SseDecoder;
 pub use kodkod_http::{
@@ -169,6 +170,18 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> Result<(AssistantMessage, AnthropicContinuation), AnthropicError> {
+        self.complete_with_usage(continuation, model, conversation, tools)
+            .await
+            .map(|completion| (completion.message, completion.continuation))
+    }
+
+    async fn complete_with_usage(
+        &self,
+        continuation: &AnthropicContinuation,
+        model: &M,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> Result<ProviderCompletion<AnthropicContinuation>, AnthropicError> {
         validate_documents(conversation, model.supports_vision())?;
         let request = build_request(
             model.id(),
@@ -211,6 +224,7 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
             });
         }
         let body: Value = response.json().await?;
+        let usage = parse_usage(&body);
         let stop_reason = body
             .get("stop_reason")
             .and_then(Value::as_str)
@@ -232,7 +246,7 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
             assistant: message.clone(),
             content,
         });
-        Ok((message, next))
+        Ok(ProviderCompletion::new(message, next, usage))
     }
 
     fn complete_stream<'a>(
@@ -276,7 +290,11 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
                 let message = parse_content(&content)?;
                 validate_stop_reason(stop_reason, &message)?;
                 let next = checkpoint_anthropic(continuation, model.id(), conversation, message.clone(), content);
-                yield ProviderEvent::Completed(message, next);
+                yield ProviderEvent::Completed(ProviderCompletion::new(
+                    message,
+                    next,
+                    parse_usage(&body),
+                ));
                 return;
             }
             let mut decoder = SseDecoder::default();
@@ -288,9 +306,9 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
                         yield ProviderEvent::TextDelta(delta);
                     }
                     if accumulator.finished {
-                        let (message, content) = accumulator.finish()?;
+                        let (message, content, usage) = accumulator.finish()?;
                         let next = checkpoint_anthropic(continuation, model.id(), conversation, message.clone(), content);
-                        yield ProviderEvent::Completed(message, next);
+                        yield ProviderEvent::Completed(ProviderCompletion::new(message, next, usage));
                         return;
                     }
                 }
@@ -323,6 +341,7 @@ struct AnthropicStreamAccumulator {
     blocks: Vec<StreamBlock>,
     stop_reason: Option<String>,
     finished: bool,
+    usage: TokenUsage,
 }
 
 struct StreamBlock {
@@ -475,6 +494,9 @@ impl AnthropicStreamAccumulator {
                 Ok(None)
             }
             "message_delta" => {
+                if let Some(usage) = payload.get("usage") {
+                    merge_usage(&mut self.usage, usage);
+                }
                 if let Some(reason) = payload
                     .pointer("/delta/stop_reason")
                     .and_then(Value::as_str)
@@ -508,14 +530,20 @@ impl AnthropicStreamAccumulator {
                     .unwrap_or("unknown streaming error")
                     .to_owned(),
             )),
-            "message_start" | "message_ping" | "ping" => Ok(None),
+            "message_start" => {
+                if let Some(usage) = payload.pointer("/message/usage") {
+                    merge_usage(&mut self.usage, usage);
+                }
+                Ok(None)
+            }
+            "message_ping" | "ping" => Ok(None),
             other => Err(AnthropicError::Protocol(format!(
                 "unknown message stream event: {other}"
             ))),
         }
     }
 
-    fn finish(self) -> Result<(AssistantMessage, Vec<Value>), AnthropicError> {
+    fn finish(self) -> Result<(AssistantMessage, Vec<Value>, TokenUsage), AnthropicError> {
         let reason = self
             .stop_reason
             .ok_or_else(|| AnthropicError::Protocol("message stream missing stop reason".into()))?;
@@ -527,7 +555,45 @@ impl AnthropicStreamAccumulator {
             .collect::<Vec<_>>();
         let message = parse_content(&content)?;
         validate_stop_reason(&reason, &message)?;
-        Ok((message, content))
+        Ok((message, content, self.usage))
+    }
+}
+
+fn parse_usage(value: &Value) -> TokenUsage {
+    let usage = value.get("usage").unwrap_or(value);
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
+    let cache_read = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
+    TokenUsage {
+        input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
+        cached_input_tokens: match (cache_creation, cache_read) {
+            (Some(creation), Some(read)) => Some(creation.saturating_add(read)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        },
+        output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
+        reasoning_output_tokens: None,
+        total_tokens: None,
+    }
+}
+
+fn merge_usage(target: &mut TokenUsage, value: &Value) {
+    let next = parse_usage(value);
+    if next.input_tokens.is_some() {
+        target.input_tokens = next.input_tokens;
+    }
+    if next.cached_input_tokens.is_some() {
+        target.cached_input_tokens = next.cached_input_tokens;
+    }
+    if next.output_tokens.is_some() {
+        target.output_tokens = next.output_tokens;
+    }
+    if next.reasoning_output_tokens.is_some() {
+        target.reasoning_output_tokens = next.reasoning_output_tokens;
+    }
+    if next.total_tokens.is_some() {
+        target.total_tokens = next.total_tokens;
     }
 }
 
@@ -968,7 +1034,7 @@ impl Retryable for AnthropicError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kodkod_core::{Document, Image, UserMessage};
+    use kodkod_core::{Document, Image, TokenUsage, UserMessage};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -989,6 +1055,12 @@ mod tests {
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "stop_reason":"tool_use",
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_creation_input_tokens": 10,
+                    "cache_read_input_tokens": 20,
+                    "output_tokens": 40
+                },
                 "content":[
                     {"type":"text","text":"checking"},
                     {"type":"tool_use","id":"toolu_1","name":"lookup","input":{"q":"x"}}
@@ -1003,16 +1075,26 @@ mod tests {
         conversation.push_user_message(
             UserMessage::new("look").with_images(vec![Image::new("image/png", b"png")]),
         );
-        let response = provider
-            .complete_once(
+        let completion = provider
+            .complete_once_with_usage(
                 &TestModel,
                 &conversation,
                 &[ToolSpec::new("lookup", "Lookup", json!({"type":"object"}))],
             )
             .await
             .unwrap();
-        assert_eq!(response.content(), "checking");
-        assert_eq!(response.tool_calls()[0].id(), "toolu_1");
+        assert_eq!(completion.message.content(), "checking");
+        assert_eq!(completion.message.tool_calls()[0].id(), "toolu_1");
+        assert_eq!(
+            completion.usage,
+            TokenUsage {
+                input_tokens: Some(100),
+                cached_input_tokens: Some(30),
+                output_tokens: Some(40),
+                reasoning_output_tokens: None,
+                total_tokens: None,
+            }
+        );
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests[0].headers["x-api-key"], "secret");
         assert_eq!(requests[0].headers["anthropic-version"], "2023-06-01");
@@ -1028,7 +1110,7 @@ mod tests {
     async fn streams_only_text_and_checkpoints_signed_thinking_on_message_stop() {
         let server = MockServer::start().await;
         let body = concat!(
-            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":20}}}\n\n",
             "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"private\"}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"signed\"}}\n\n",
@@ -1036,7 +1118,7 @@ mod tests {
             "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"draft\"}}\n\n",
             "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
-            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":40}}\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
         );
         Mock::given(method("POST"))
@@ -1055,10 +1137,14 @@ mod tests {
         assert!(
             matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::TextDelta(text) if text == "draft")
         );
-        let ProviderEvent::Completed(message, continuation) = stream.next().await.unwrap().unwrap()
-        else {
+        let ProviderEvent::Completed(completion) = stream.next().await.unwrap().unwrap() else {
             panic!("expected terminal completion");
         };
+        let message = completion.message;
+        let continuation = completion.continuation;
+        assert_eq!(completion.usage.input_tokens, Some(100));
+        assert_eq!(completion.usage.cached_input_tokens, Some(30));
+        assert_eq!(completion.usage.output_tokens, Some(40));
         assert_eq!(message.content(), "draft");
         drop(stream);
 
@@ -1208,7 +1294,7 @@ mod tests {
             .unwrap();
         accumulator.push(r#"{"type":"message_stop"}"#).unwrap();
         assert!(accumulator.push(r#"{"type":"message_stop"}"#).is_err());
-        let (message, _) = accumulator.finish().unwrap();
+        let (message, _, _) = accumulator.finish().unwrap();
         assert_eq!(message.tool_calls()[0].arguments(), &json!({"q":"x"}));
     }
 
