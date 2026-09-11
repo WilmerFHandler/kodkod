@@ -60,9 +60,9 @@ before credentials are acquired.
 OpenCode accepts PDFs only for vision-capable catalog models marked with a PDF
 capability, then routes them through that model's documented Responses, Chat
 Completions, or Messages protocol. Other OpenCode file types remain unsupported.
-Codex subscription routing continues to reject documents because native file
-inputs have not been verified for this subscription endpoint; this does not make
-a claim about every ChatGPT backend surface.
+Codex subscription routing accepts PDFs on vision-capable models through the
+native Responses file input. A synthetic PDF smoke check confirmed this with
+`gpt-6-astra`; other document types remain unverified and are rejected.
 
 No provider opens a browser, stores credentials, or performs an OAuth flow.
 
@@ -101,6 +101,6 @@ or tool side effect that already happened.
 Refresh the reviewed OpenCode snapshot with
 `python3 scripts/update-open-code-models.py`, inspect the resulting diff, and
 run the provider tests before publishing it. Protocol routing comes from the
-official OpenCode endpoint tables, while vision and PDF metadata are frozen from
-the 2026-09-08 `https://models.dev/api.json` snapshot; unknown models are not
-guessed.
+official OpenCode endpoint tables. Vision metadata comes from models.dev; PDF
+capabilities were reviewed against its 2026-09-08 `https://models.dev/api.json`
+snapshot. Unknown models are not guessed.

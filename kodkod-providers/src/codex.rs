@@ -109,6 +109,10 @@ where
         model.supports_vision()
     }
 
+    fn supports_document(&self, model: &M, mime: &str) -> bool {
+        model.supports_vision() && mime == "application/pdf"
+    }
+
     fn create_continuation(&self, _model: &M) -> Self::Continuation {
         ResponsesContinuation::default()
     }
@@ -124,7 +128,7 @@ where
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
-        reject_documents(conversation)?;
+        validate_documents(model, conversation)?;
         self.inner()
             .complete(continuation, model, conversation, tools)
             .await
@@ -138,7 +142,7 @@ where
         tools: &'a [ToolSpec],
     ) -> ProviderStream<'a, Self::Continuation, Self::Error> {
         Box::pin(async_stream::try_stream! {
-            reject_documents(conversation)?;
+            validate_documents(model, conversation)?;
             let inner = self.inner();
             let mut stream = inner.complete_stream(continuation, model, conversation, tools);
             while let Some(event) = stream.next().await {
@@ -154,15 +158,20 @@ where
     }
 }
 
-fn reject_documents(conversation: &Conversation) -> Result<(), OpenAiError> {
+fn validate_documents<M: OpenAiModel>(
+    model: &M,
+    conversation: &Conversation,
+) -> Result<(), OpenAiError> {
     for message in conversation.messages() {
-        if let Message::User(user) = message
-            && let Some(document) = user.documents().first()
-        {
-            return Err(OpenAiError::UnsupportedDocument {
-                provider: "Codex subscription Responses",
-                mime: document.mime().to_owned(),
-            });
+        if let Message::User(user) = message {
+            for document in user.documents() {
+                if !(model.supports_vision() && document.mime() == "application/pdf") {
+                    return Err(OpenAiError::UnsupportedDocument {
+                        provider: "Codex subscription Responses",
+                        mime: document.mime().to_owned(),
+                    });
+                }
+            }
         }
     }
     Ok(())

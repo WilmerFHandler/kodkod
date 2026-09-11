@@ -14,6 +14,8 @@ struct FreshCodexAccess(AtomicUsize);
 
 struct TestCodexModel;
 
+struct NonVisionCodexModel;
+
 impl kodkod_openai::OpenAiModel for TestCodexModel {
     fn id(&self) -> &str {
         "gpt-test"
@@ -21,6 +23,16 @@ impl kodkod_openai::OpenAiModel for TestCodexModel {
 
     fn supports_vision(&self) -> bool {
         true
+    }
+}
+
+impl kodkod_openai::OpenAiModel for NonVisionCodexModel {
+    fn id(&self) -> &str {
+        "gpt-test"
+    }
+
+    fn supports_vision(&self) -> bool {
+        false
     }
 }
 
@@ -112,7 +124,48 @@ async fn codex_forwards_responses_text_deltas() {
 }
 
 #[tokio::test]
-async fn codex_rejects_documents_before_credentials_or_http() {
+async fn codex_routes_pdf_to_responses_for_completion_and_stream() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(completed("done")))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let provider =
+        CodexProvider::<TestCodexModel>::new(Arc::new(FreshCodexAccess(AtomicUsize::new(0))))
+            .unwrap()
+            .with_test_endpoint(server.uri());
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("read").with_documents(vec![
+        Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
+    ]));
+
+    provider
+        .complete_once(&TestCodexModel, &conversation, &[])
+        .await
+        .unwrap();
+    let continuation = provider.create_continuation(&TestCodexModel);
+    let mut stream = provider.complete_stream(&continuation, &TestCodexModel, &conversation, &[]);
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap(),
+        ProviderEvent::Completed(message, _) if message.content() == "done"
+    ));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_file");
+        assert_eq!(
+            body["input"][0]["content"][1]["file_data"],
+            "data:application/pdf;base64,JVBERg=="
+        );
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn codex_rejects_unverified_documents_before_credentials_or_http() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/responses"))
@@ -124,21 +177,29 @@ async fn codex_rejects_documents_before_credentials_or_http() {
     let provider = CodexProvider::<TestCodexModel>::new(accesses.clone())
         .unwrap()
         .with_test_endpoint(server.uri());
-    let mut conversation = Conversation::new();
-    conversation.push_user_message(UserMessage::new("read").with_documents(vec![
+    let nonvision_provider = CodexProvider::<NonVisionCodexModel>::new(accesses.clone())
+        .unwrap()
+        .with_test_endpoint(server.uri());
+    let mut text_document = Conversation::new();
+    text_document.push_user_message(UserMessage::new("read").with_documents(vec![
+        Document::try_new("text/plain", "notes.txt", b"notes").unwrap(),
+    ]));
+    let mut pdf = Conversation::new();
+    pdf.push_user_message(UserMessage::new("read").with_documents(vec![
         Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
     ]));
 
     let error = provider
-        .complete_once(&TestCodexModel, &conversation, &[])
+        .complete_once(&TestCodexModel, &text_document, &[])
         .await
         .unwrap_err();
     assert!(matches!(
         error,
         kodkod_openai::OpenAiError::UnsupportedDocument { .. }
     ));
-    let continuation = provider.create_continuation(&TestCodexModel);
-    let mut stream = provider.complete_stream(&continuation, &TestCodexModel, &conversation, &[]);
+    let continuation = nonvision_provider.create_continuation(&NonVisionCodexModel);
+    let mut stream =
+        nonvision_provider.complete_stream(&continuation, &NonVisionCodexModel, &pdf, &[]);
     assert!(matches!(
         stream.next().await.unwrap(),
         Err(kodkod_openai::OpenAiError::UnsupportedDocument { .. })
