@@ -277,10 +277,10 @@ fn build_request(
         "include": ["reasoning.encrypted_content"]
     });
     if let Some(effort) = options.reasoning_effort {
-        request["reasoning"] = json!({"effort": effort.as_str()});
+        request["reasoning"] = json!({"effort": effort});
     }
     if let Some(tier) = options.service_tier {
-        request["service_tier"] = Value::String(tier.as_str().to_owned());
+        request["service_tier"] = Value::String(tier);
     }
     if let Some(instructions) = instructions {
         request["instructions"] = Value::String(instructions.to_owned());
@@ -1310,8 +1310,8 @@ mod tests {
         let request = build_request(
             "gpt-test",
             crate::OpenAiRequestOptions {
-                reasoning_effort: Some(crate::ReasoningEffort::Xhigh),
-                service_tier: Some(crate::ServiceTier::Priority),
+                reasoning_effort: Some("xhigh".into()),
+                service_tier: Some("fast".into()),
             },
             None,
             &conversation,
@@ -1321,7 +1321,57 @@ mod tests {
         .unwrap();
         assert_eq!(request["model"], "gpt-test");
         assert_eq!(request["reasoning"]["effort"], "xhigh");
-        assert_eq!(request["service_tier"], "priority");
+        assert_eq!(request["service_tier"], "fast");
+    }
+
+    struct OptionsModel;
+
+    impl OpenAiModel for OptionsModel {
+        fn id(&self) -> &str {
+            "gpt-options"
+        }
+
+        fn supports_vision(&self) -> bool {
+            false
+        }
+
+        fn request_options(&self) -> crate::OpenAiRequestOptions {
+            crate::OpenAiRequestOptions {
+                reasoning_effort: Some("future-effort".into()),
+                service_tier: Some("burst".into()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_request_options_on_the_responses_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(completed(json!([
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}]
+                }
+            ]))))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiResponsesProvider::<OptionsModel>::new(format!("{}/v1", server.uri()));
+        provider
+            .complete_once(&OptionsModel, &Conversation::new(), &[])
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "gpt-options");
+        assert_eq!(body["reasoning"]["effort"], "future-effort");
+        assert_eq!(body["service_tier"], "burst");
+        server.verify().await;
     }
 
     #[tokio::test]

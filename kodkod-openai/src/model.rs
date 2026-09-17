@@ -1,58 +1,17 @@
 use serde::{Deserialize, Serialize};
 
-/// Reasoning effort requested from a model which supports reasoning controls.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReasoningEffort {
-    None,
-    Minimal,
-    Low,
-    Medium,
-    High,
-    Xhigh,
-}
-
-impl ReasoningEffort {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Minimal => "minimal",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Xhigh => "xhigh",
-        }
-    }
-}
-
-/// Provider service tier requested independently of the selected model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceTier {
-    Auto,
-    Default,
-    Priority,
-    Flex,
-}
-
-impl ServiceTier {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Default => "default",
-            Self::Priority => "priority",
-            Self::Flex => "flex",
-        }
-    }
-}
-
 /// Optional per-request controls carried by an OpenAI model value.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The provider forwards these strings without validating them, so callers can
+/// use values added by a future API version before Kodkod publishes a new
+/// release. The owned values also allow settings loaded from persistent data to
+/// survive a serialize/deserialize round trip unchanged.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiRequestOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<ServiceTier>,
+    pub service_tier: Option<String>,
 }
 
 /// Metadata for a model served by an OpenAI-compatible API.
@@ -81,5 +40,38 @@ impl OpenAiModel for str {
 
     fn supports_vision(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenAiRequestOptions;
+    use serde_json::json;
+
+    #[test]
+    fn request_options_round_trip_unknown_values() {
+        let options = OpenAiRequestOptions {
+            reasoning_effort: Some("future-effort".into()),
+            service_tier: Some("burst".into()),
+        };
+
+        let serialized = serde_json::to_value(&options).unwrap();
+        assert_eq!(
+            serialized,
+            json!({
+                "reasoning_effort": "future-effort",
+                "service_tier": "burst"
+            })
+        );
+        let restored: OpenAiRequestOptions = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored, options);
+    }
+
+    #[test]
+    fn request_options_omit_unset_values() {
+        assert_eq!(
+            serde_json::to_value(OpenAiRequestOptions::default()).unwrap(),
+            json!({})
+        );
     }
 }

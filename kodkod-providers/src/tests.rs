@@ -16,6 +16,8 @@ struct TestCodexModel;
 
 struct NonVisionCodexModel;
 
+struct OptionsCodexModel;
+
 impl kodkod_openai::OpenAiModel for TestCodexModel {
     fn id(&self) -> &str {
         "gpt-test"
@@ -33,6 +35,23 @@ impl kodkod_openai::OpenAiModel for NonVisionCodexModel {
 
     fn supports_vision(&self) -> bool {
         false
+    }
+}
+
+impl kodkod_openai::OpenAiModel for OptionsCodexModel {
+    fn id(&self) -> &str {
+        "gpt-options"
+    }
+
+    fn supports_vision(&self) -> bool {
+        false
+    }
+
+    fn request_options(&self) -> kodkod_openai::OpenAiRequestOptions {
+        kodkod_openai::OpenAiRequestOptions {
+            reasoning_effort: Some("future-effort".into()),
+            service_tier: Some("burst".into()),
+        }
     }
 }
 
@@ -145,6 +164,34 @@ async fn codex_forwards_responses_text_deltas() {
     assert!(
         matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::Completed(completion) if completion.message.content() == "final")
     );
+}
+
+#[tokio::test]
+async fn codex_forwards_request_options_to_the_responses_wire() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(completed("done")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider =
+        CodexProvider::<OptionsCodexModel>::new(Arc::new(FreshCodexAccess(AtomicUsize::new(0))))
+            .unwrap()
+            .with_test_endpoint(server.uri());
+    provider
+        .complete_once(&OptionsCodexModel, &Conversation::new(), &[])
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["model"], "gpt-options");
+    assert_eq!(body["reasoning"]["effort"], "future-effort");
+    assert_eq!(body["service_tier"], "burst");
+    server.verify().await;
 }
 
 #[tokio::test]
