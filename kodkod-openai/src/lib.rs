@@ -14,6 +14,6 @@ pub use error::OpenAiError;
 pub use kodkod_http::{
     CredentialError, CredentialFuture, CredentialSource, RequestCredentials, StaticCredentials,
 };
-pub use model::OpenAiModel;
+pub use model::{OpenAiModel, OpenAiRequestOptions, ReasoningEffort, ServiceTier};
 pub use provider::OpenAiCompatibleProvider;
 pub use responses::{OpenAiResponsesProvider, ResponsesContinuation, responses_url};

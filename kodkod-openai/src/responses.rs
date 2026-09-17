@@ -174,6 +174,7 @@ where
         };
         let request = build_request(
             model.id(),
+            model.request_options(),
             self.instructions.as_deref(),
             conversation,
             tools,
@@ -244,6 +245,7 @@ where
 
 fn build_request(
     model: &str,
+    options: crate::OpenAiRequestOptions,
     configured_instructions: Option<&str>,
     conversation: &Conversation,
     tools: &[ToolSpec],
@@ -274,6 +276,12 @@ fn build_request(
         "store": false,
         "include": ["reasoning.encrypted_content"]
     });
+    if let Some(effort) = options.reasoning_effort {
+        request["reasoning"] = json!({"effort": effort.as_str()});
+    }
+    if let Some(tier) = options.service_tier {
+        request["service_tier"] = Value::String(tier.as_str().to_owned());
+    }
     if let Some(instructions) = instructions {
         request["instructions"] = Value::String(instructions.to_owned());
     }
@@ -1127,7 +1135,15 @@ mod tests {
         conversation.push_user_message(UserMessage::new("question"));
         conversation.push_message(Message::Assistant(AssistantMessage::new("answer")));
         conversation.push_user_message(UserMessage::new("next"));
-        let request = build_request("gpt-test", None, &conversation, &[], &continuation).unwrap();
+        let request = build_request(
+            "gpt-test",
+            crate::OpenAiRequestOptions::default(),
+            None,
+            &conversation,
+            &[],
+            &continuation,
+        )
+        .unwrap();
         assert_eq!(request["stream"], true);
         assert_eq!(request["store"], false);
         assert_eq!(request["include"][0], "reasoning.encrypted_content");
@@ -1224,12 +1240,32 @@ mod tests {
         let mut conversation = Conversation::new();
         conversation.push_user_message(UserMessage::new("question"));
         conversation.push_message(Message::Assistant(AssistantMessage::new("edited")));
-        assert!(build_request("gpt-test", None, &conversation, &[], &continuation).is_err());
+        assert!(
+            build_request(
+                "gpt-test",
+                Default::default(),
+                None,
+                &conversation,
+                &[],
+                &continuation
+            )
+            .is_err()
+        );
         conversation.replace_messages(vec![
             Message::User(UserMessage::new("question")),
             Message::Assistant(AssistantMessage::new("original")),
         ]);
-        assert!(build_request("different", None, &conversation, &[], &continuation).is_err());
+        assert!(
+            build_request(
+                "different",
+                Default::default(),
+                None,
+                &conversation,
+                &[],
+                &continuation
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1249,6 +1285,7 @@ mod tests {
 
         let request = build_request(
             "gpt-test",
+            Default::default(),
             None,
             &conversation,
             &[],
@@ -1264,6 +1301,27 @@ mod tests {
                 "file_data": "data:application/pdf;base64,JVBERg==",
             })
         );
+    }
+
+    #[test]
+    fn request_options_are_independent_of_the_model_id() {
+        let mut conversation = Conversation::new();
+        conversation.push_user_message(UserMessage::new("question"));
+        let request = build_request(
+            "gpt-test",
+            crate::OpenAiRequestOptions {
+                reasoning_effort: Some(crate::ReasoningEffort::Xhigh),
+                service_tier: Some(crate::ServiceTier::Priority),
+            },
+            None,
+            &conversation,
+            &[],
+            &ResponsesContinuation::default(),
+        )
+        .unwrap();
+        assert_eq!(request["model"], "gpt-test");
+        assert_eq!(request["reasoning"]["effort"], "xhigh");
+        assert_eq!(request["service_tier"], "priority");
     }
 
     #[tokio::test]
