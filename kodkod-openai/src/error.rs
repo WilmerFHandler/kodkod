@@ -10,6 +10,11 @@ pub enum OpenAiError {
     Http(reqwest::Error),
     Api {
         status: u16,
+        code: Option<String>,
+        message: String,
+    },
+    ResponseFailed {
+        code: Option<String>,
         message: String,
     },
     Json(serde_json::Error),
@@ -33,7 +38,18 @@ impl fmt::Display for OpenAiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Http(error) => write!(f, "http request failed: {error}"),
-            Self::Api { status, message } => write!(f, "api error ({status}): {message}"),
+            Self::Api {
+                status,
+                code,
+                message,
+            } => match code {
+                Some(code) => write!(f, "api error ({status}, {code}): {message}"),
+                None => write!(f, "api error ({status}): {message}"),
+            },
+            Self::ResponseFailed { code, message } => match code {
+                Some(code) => write!(f, "response failed ({code}): {message}"),
+                None => write!(f, "response failed: {message}"),
+            },
             Self::Json(error) => write!(f, "failed to parse response: {error}"),
             Self::EmptyResponse => f.write_str("chat completion returned no choices"),
             Self::Credentials(error) => write!(f, "credentials unavailable: {error}"),
@@ -91,7 +107,11 @@ impl Retryable for OpenAiError {
     fn is_retryable(&self) -> bool {
         match self {
             Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
-            Self::Api { status, .. } => matches!(*status, 429 | 500 | 502 | 503 | 504),
+            Self::Api { status, code, .. } => {
+                !is_subscription_sharing_error(code.as_deref())
+                    && matches!(*status, 429 | 500 | 502 | 503 | 504)
+            }
+            Self::ResponseFailed { .. } => false,
             Self::Json(_)
             | Self::EmptyResponse
             | Self::Credentials(_)
@@ -103,6 +123,15 @@ impl Retryable for OpenAiError {
     }
 }
 
+fn is_subscription_sharing_error(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some(
+            "subscription_sharing_usage_limit_exceeded" | "subscription_sharing_usage_unavailable"
+        )
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +141,7 @@ mod tests {
         assert!(
             OpenAiError::Api {
                 status: 429,
+                code: None,
                 message: "rate limited".into(),
             }
             .is_retryable()
@@ -119,6 +149,7 @@ mod tests {
         assert!(
             OpenAiError::Api {
                 status: 503,
+                code: None,
                 message: "unavailable".into(),
             }
             .is_retryable()
@@ -126,6 +157,7 @@ mod tests {
         assert!(
             !OpenAiError::Api {
                 status: 401,
+                code: None,
                 message: "unauthorized".into(),
             }
             .is_retryable()
@@ -135,5 +167,37 @@ mod tests {
     #[test]
     fn non_retryable_parse_errors() {
         assert!(!OpenAiError::EmptyResponse.is_retryable());
+    }
+
+    #[test]
+    fn subscription_sharing_codes_override_http_retry_statuses() {
+        for code in [
+            "subscription_sharing_usage_limit_exceeded",
+            "subscription_sharing_usage_unavailable",
+        ] {
+            assert!(
+                !OpenAiError::Api {
+                    status: 429,
+                    code: Some(code.into()),
+                    message: "plan limit".into(),
+                }
+                .is_retryable()
+            );
+            assert!(
+                !OpenAiError::Api {
+                    status: 503,
+                    code: Some(code.into()),
+                    message: "sharing unavailable".into(),
+                }
+                .is_retryable()
+            );
+            assert!(
+                !OpenAiError::ResponseFailed {
+                    code: Some(code.into()),
+                    message: "response failed".into(),
+                }
+                .is_retryable()
+            );
+        }
     }
 }

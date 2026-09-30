@@ -85,12 +85,13 @@ pub(crate) async fn complete_with_document_support(
     let status = response.status();
 
     if !status.is_success() {
-        let message = match response.json::<ApiErrorResponse>().await {
-            Ok(body) => body.error.message,
-            Err(_) => status.to_string(),
+        let (code, message) = match response.json::<ApiErrorResponse>().await {
+            Ok(body) => (body.error.code, body.error.message),
+            Err(_) => (None, status.to_string()),
         };
         return Err(OpenAiError::Api {
             status: status.as_u16(),
+            code,
             message,
         });
     }
@@ -128,11 +129,11 @@ pub(crate) fn stream_with_document_support<'a>(
         let response = http_request.send().await?;
         let status = response.status();
         if !status.is_success() {
-            let message = match response.json::<ApiErrorResponse>().await {
-                Ok(body) => body.error.message,
-                Err(_) => status.to_string(),
+            let (code, message) = match response.json::<ApiErrorResponse>().await {
+                Ok(body) => (body.error.code, body.error.message),
+                Err(_) => (None, status.to_string()),
             };
-            Err(OpenAiError::Api { status: status.as_u16(), message })?;
+            Err(OpenAiError::Api { status: status.as_u16(), code, message })?;
             unreachable!("error propagation exits the stream");
         }
 

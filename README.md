@@ -13,9 +13,15 @@ the Go or Zen endpoint, adds its session and user-agent headers, and routes a
 model through Responses, Chat Completions, or Messages according to the bundled
 reviewed catalog.
 
+`ChatGptProvider` uses the public OpenAI Responses endpoint with a caller-owned
+`CredentialSource`. It applies the ChatGPT-plan profile (`store: false`, streamed
+stateless history, developer instructions, and functions grouped under one
+namespace); the application remains responsible for acquiring, refreshing, and
+storing its credentials.
+
 See [`kodkod-providers/examples/provider_setup.rs`](kodkod-providers/examples/provider_setup.rs)
-for a standalone, compile-checked example covering Codex, OpenCode Go, and a
-custom endpoint. The custom protocol adapters remain available as
+for a standalone, compile-checked example covering ChatGPT-plan sharing, Codex,
+OpenCode Go, and a custom endpoint. The custom protocol adapters remain available as
 `kodkod::openai` and `kodkod::anthropic`, while an application with different
 transport needs can implement the core `kodkod::Provider` trait directly.
 

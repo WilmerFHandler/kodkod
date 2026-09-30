@@ -14,6 +14,22 @@ use serde_json::{Value, json};
 use crate::usage::parse_usage;
 use crate::{CredentialSource, OpenAiError, OpenAiModel};
 
+/// Controls Responses request formatting while keeping the OpenAI-compatible
+/// request profile as the default for existing callers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesRequestProfile {
+    #[default]
+    OpenAiCompatible,
+    ChatGptPlan,
+}
+
+impl ResponsesRequestProfile {
+    fn is_chatgpt_plan(self) -> bool {
+        matches!(self, Self::ChatGptPlan)
+    }
+}
+
 pub fn responses_url(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     format!("{base}/responses")
@@ -31,6 +47,8 @@ pub struct ResponsesContinuation {
 #[derive(Clone, Serialize, Deserialize)]
 struct ResponseCheckpoint {
     model: String,
+    #[serde(default)]
+    profile: ResponsesRequestProfile,
     assistant_message_index: usize,
     assistant: AssistantMessage,
     output: Vec<Value>,
@@ -53,6 +71,7 @@ pub struct OpenAiResponsesProvider<M = ()> {
     responses_url: String,
     credentials: Option<Arc<dyn CredentialSource>>,
     instructions: Option<String>,
+    profile: ResponsesRequestProfile,
     client: reqwest::Client,
     _model: PhantomData<M>,
 }
@@ -63,6 +82,7 @@ impl<M> OpenAiResponsesProvider<M> {
             responses_url: responses_url(&base_url.into()),
             credentials: None,
             instructions: None,
+            profile: ResponsesRequestProfile::default(),
             client: reqwest::Client::new(),
             _model: PhantomData,
         }
@@ -81,6 +101,13 @@ impl<M> OpenAiResponsesProvider<M> {
     /// Set the optional Responses `instructions` field for every request.
     pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
         self.instructions = Some(instructions.into());
+        self
+    }
+
+    /// Apply an explicit request profile. The default preserves the generic
+    /// OpenAI-compatible wire format.
+    pub fn with_profile(mut self, profile: ResponsesRequestProfile) -> Self {
+        self.profile = profile;
         self
     }
 
@@ -172,13 +199,14 @@ where
             Some(source) => Some(source.credentials().await?),
             None => None,
         };
-        let request = build_request(
+        let request = build_request_with_profile(
             model.id(),
             model.request_options(),
             self.instructions.as_deref(),
             conversation,
             tools,
             continuation,
+            self.profile,
         )?;
         let mut http_request = self.client.post(&self.responses_url).json(&request);
         if let Some(credentials) = credentials {
@@ -189,18 +217,17 @@ where
         let status = response.status();
         if !status.is_success() {
             let body = read_limited_body(response, MAX_ERROR_BODY_BYTES).await?;
-            let message = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|value| value.pointer("/error/message")?.as_str().map(str::to_owned))
-                .unwrap_or_else(|| {
-                    if body.is_empty() {
-                        status.to_string()
-                    } else {
-                        body
-                    }
-                });
+            let fallback = if body.is_empty() { status.to_string() } else { body.clone() };
+            let body: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let code = body.pointer("/error/code").and_then(Value::as_str).map(str::to_owned);
+            let message = body
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or(fallback);
             Err(OpenAiError::Api {
                 status: status.as_u16(),
+                code,
                 message,
             })?;
             unreachable!("error propagation exits the stream");
@@ -220,10 +247,11 @@ where
                             .and_then(Value::as_array)
                             .cloned()
                             .ok_or_else(|| OpenAiError::Protocol("completed response missing output".into()))?;
-                        let assistant = parse_output(&final_output)?;
+                        let assistant = parse_output_with_profile(&final_output, self.profile)?;
                         let mut next = continuation.clone();
                         next.checkpoints.push(ResponseCheckpoint {
                             model: model.id().to_owned(),
+                            profile: self.profile,
                             assistant_message_index: conversation.messages().len(),
                             assistant: assistant.clone(),
                             output: final_output,
@@ -243,6 +271,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn build_request(
     model: &str,
     options: crate::OpenAiRequestOptions,
@@ -251,7 +280,27 @@ fn build_request(
     tools: &[ToolSpec],
     continuation: &ResponsesContinuation,
 ) -> Result<Value, OpenAiError> {
-    validate_continuation(model, conversation, continuation)?;
+    build_request_with_profile(
+        model,
+        options,
+        configured_instructions,
+        conversation,
+        tools,
+        continuation,
+        ResponsesRequestProfile::OpenAiCompatible,
+    )
+}
+
+fn build_request_with_profile(
+    model: &str,
+    options: crate::OpenAiRequestOptions,
+    configured_instructions: Option<&str>,
+    conversation: &Conversation,
+    tools: &[ToolSpec],
+    continuation: &ResponsesContinuation,
+    profile: ResponsesRequestProfile,
+) -> Result<Value, OpenAiError> {
+    validate_continuation(model, conversation, continuation, profile)?;
     validate_document_mime_types(conversation)?;
     let checkpoints: BTreeMap<usize, &ResponseCheckpoint> = continuation
         .checkpoints
@@ -263,7 +312,7 @@ fn build_request(
         if let Some(checkpoint) = checkpoints.get(&index) {
             input.extend(checkpoint.output.iter().cloned());
         } else {
-            input.extend(convert_message(message));
+            input.extend(convert_message_with_profile(message, profile));
         }
     }
 
@@ -271,7 +320,7 @@ fn build_request(
     let mut request = json!({
         "model": model,
         "input": input,
-        "tools": tools.iter().map(convert_tool).collect::<Vec<_>>(),
+        "tools": convert_tools(tools, profile),
         "stream": true,
         "store": false,
         "include": ["reasoning.encrypted_content"]
@@ -292,12 +341,18 @@ fn validate_continuation(
     model: &str,
     conversation: &Conversation,
     continuation: &ResponsesContinuation,
+    profile: ResponsesRequestProfile,
 ) -> Result<(), OpenAiError> {
     let mut previous_index = None;
     for checkpoint in &continuation.checkpoints {
         if checkpoint.model != model {
             return Err(OpenAiError::Protocol(
                 "continuation belongs to a different model".into(),
+            ));
+        }
+        if checkpoint.profile != profile {
+            return Err(OpenAiError::Protocol(
+                "continuation belongs to a different Responses request profile".into(),
             ));
         }
         if previous_index.is_some_and(|index| checkpoint.assistant_message_index <= index) {
@@ -320,10 +375,10 @@ fn validate_continuation(
     Ok(())
 }
 
-fn convert_message(message: &Message) -> Vec<Value> {
+fn convert_message_with_profile(message: &Message, profile: ResponsesRequestProfile) -> Vec<Value> {
     match message {
         Message::System(system) => vec![json!({
-            "role": "system",
+            "role": if profile.is_chatgpt_plan() { "developer" } else { "system" },
             "content": [{"type": "input_text", "text": system.content()}]
         })],
         Message::User(user) => {
@@ -348,12 +403,18 @@ fn convert_message(message: &Message) -> Vec<Value> {
                     "content": [{"type": "output_text", "text": assistant.content()}]
                 }));
             }
-            items.extend(assistant.tool_calls().iter().map(|call| json!({
-                "type": "function_call",
-                "call_id": call.id(),
-                "name": call.name(),
-                "arguments": serde_json::to_string(call.arguments()).unwrap_or_else(|_| "{}".into())
-            })));
+            items.extend(assistant.tool_calls().iter().map(|call| {
+                let mut item = json!({
+                    "type": "function_call",
+                    "call_id": call.id(),
+                    "name": call.name(),
+                    "arguments": serde_json::to_string(call.arguments()).unwrap_or_else(|_| "{}".into())
+                });
+                if profile.is_chatgpt_plan() {
+                    item["namespace"] = Value::String(FUNCTION_NAMESPACE.into());
+                }
+                item
+            }));
             items
         }
         Message::ToolResult(result) => convert_tool_result(result),
@@ -476,6 +537,25 @@ fn convert_tool(spec: &ToolSpec) -> Value {
         "parameters": spec.input_schema(),
         "strict": false
     })
+}
+
+const FUNCTION_NAMESPACE: &str = "functions";
+
+fn convert_tools(tools: &[ToolSpec], profile: ResponsesRequestProfile) -> Vec<Value> {
+    if profile.is_chatgpt_plan() {
+        if tools.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({
+                "type": "namespace",
+                "name": FUNCTION_NAMESPACE,
+                "description": "Available functions.",
+                "tools": tools.iter().map(convert_tool).collect::<Vec<_>>()
+            })]
+        }
+    } else {
+        tools.iter().map(convert_tool).collect()
+    }
 }
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -689,15 +769,28 @@ fn response_text_delta(event: &SseEvent) -> Result<Option<String>, OpenAiError> 
 }
 
 fn response_failure(event: &Value) -> OpenAiError {
-    let message = event
-        .pointer("/response/error/message")
+    let error = event.pointer("/response/error");
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let message = error
+        .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("response failed")
         .to_owned();
-    OpenAiError::Protocol(message)
+    OpenAiError::ResponseFailed { code, message }
 }
 
+#[cfg(test)]
 fn parse_output(output: &[Value]) -> Result<AssistantMessage, OpenAiError> {
+    parse_output_with_profile(output, ResponsesRequestProfile::OpenAiCompatible)
+}
+
+fn parse_output_with_profile(
+    output: &[Value],
+    profile: ResponsesRequestProfile,
+) -> Result<AssistantMessage, OpenAiError> {
     if output.is_empty() {
         return Err(OpenAiError::Protocol(
             "completed response returned no output items".into(),
@@ -735,7 +828,17 @@ fn parse_output(output: &[Value]) -> Result<AssistantMessage, OpenAiError> {
             }
             Some("function_call") => {
                 let call_id = required_string(item, "call_id")?;
-                let name = required_string(item, "name")?;
+                let name = if profile.is_chatgpt_plan() {
+                    let namespace = required_string(item, "namespace")?;
+                    if namespace != FUNCTION_NAMESPACE {
+                        return Err(OpenAiError::Protocol(format!(
+                            "unexpected function namespace: {namespace}"
+                        )));
+                    }
+                    required_string(item, "name")?
+                } else {
+                    required_string(item, "name")?
+                };
                 let arguments = required_string(item, "arguments")?;
                 let arguments = serde_json::from_str(&arguments)?;
                 calls.push(ToolCall::new(call_id, name, arguments));
@@ -767,7 +870,9 @@ fn required_string(item: &Value, field: &str) -> Result<String, OpenAiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kodkod_core::{Document, Image, ProviderEvent, TokenUsage, UserMessage};
+    use kodkod_core::{
+        Document, Image, Message, ProviderEvent, SystemMessage, TokenUsage, ToolSpec, UserMessage,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -975,6 +1080,7 @@ mod tests {
         let continuation = ResponsesContinuation {
             checkpoints: vec![ResponseCheckpoint {
                 model: "gpt-test".into(),
+                profile: ResponsesRequestProfile::OpenAiCompatible,
                 assistant_message_index: 1,
                 assistant: assistant.clone(),
                 output,
@@ -1123,6 +1229,7 @@ mod tests {
         let continuation = ResponsesContinuation {
             checkpoints: vec![ResponseCheckpoint {
                 model: "gpt-test".into(),
+                profile: ResponsesRequestProfile::OpenAiCompatible,
                 assistant_message_index: 1,
                 assistant: AssistantMessage::new("answer"),
                 output: vec![
@@ -1174,6 +1281,7 @@ mod tests {
         let continuation = ResponsesContinuation {
             checkpoints: vec![ResponseCheckpoint {
                 model: "gpt-test".into(),
+                profile: ResponsesRequestProfile::OpenAiCompatible,
                 assistant_message_index: 0,
                 assistant: AssistantMessage::new(""),
                 output: vec![json!({"type":"reasoning", "encrypted_content":"top-secret"})],
@@ -1228,6 +1336,7 @@ mod tests {
     fn continuation_rejects_edited_history_and_model_changes() {
         let checkpoint = ResponseCheckpoint {
             model: "gpt-test".into(),
+            profile: ResponsesRequestProfile::OpenAiCompatible,
             assistant_message_index: 1,
             assistant: AssistantMessage::new("original"),
             output: vec![
@@ -1269,11 +1378,73 @@ mod tests {
     }
 
     #[test]
+    fn continuation_profile_provenance_rejects_switches_without_rewriting_raw_output() {
+        let raw_call = json!({
+            "type":"function_call", "call_id":"call_1", "name":"lookup", "arguments":"{}"
+        });
+        let assistant = AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+            "call_1",
+            "lookup",
+            json!({}),
+        )]);
+        let legacy = json!({
+            "checkpoints": [{
+                "model":"gpt-test",
+                "assistant_message_index":1,
+                "assistant":serde_json::to_value(&assistant).unwrap(),
+                "output":[raw_call.clone()]
+            }]
+        });
+        let continuation: ResponsesContinuation = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            continuation.checkpoints[0].profile,
+            ResponsesRequestProfile::OpenAiCompatible
+        );
+
+        let mut conversation = Conversation::new();
+        conversation.push_user_message(UserMessage::new("call lookup"));
+        conversation.push_message(Message::Assistant(assistant));
+        let generic_request = build_request(
+            "gpt-test",
+            Default::default(),
+            None,
+            &conversation,
+            &[],
+            &continuation,
+        )
+        .unwrap();
+        assert_eq!(generic_request["input"][1], raw_call);
+
+        let error = build_request_with_profile(
+            "gpt-test",
+            Default::default(),
+            None,
+            &conversation,
+            &[],
+            &continuation,
+            ResponsesRequestProfile::ChatGptPlan,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, OpenAiError::Protocol(message) if message.contains("request profile"))
+        );
+    }
+
+    #[test]
     fn malformed_or_unknown_output_is_rejected() {
         assert!(
             parse_output(&[json!({"type":"function_call", "call_id":"x", "name":"f"})]).is_err()
         );
         assert!(parse_output(&[json!({"type":"future_action", "id":"x"})]).is_err());
+    }
+
+    #[test]
+    fn chatgpt_profile_requires_the_functions_namespace_on_calls() {
+        let call = json!({
+            "type":"function_call", "call_id":"x", "name":"lookup",
+            "namespace":"other", "arguments":"{}"
+        });
+        assert!(parse_output_with_profile(&[call], ResponsesRequestProfile::ChatGptPlan).is_err());
     }
 
     #[test]
@@ -1322,6 +1493,32 @@ mod tests {
         assert_eq!(request["model"], "gpt-test");
         assert_eq!(request["reasoning"]["effort"], "xhigh");
         assert_eq!(request["service_tier"], "fast");
+    }
+
+    #[test]
+    fn generic_profile_keeps_system_items_and_flat_function_tools() {
+        let mut conversation = Conversation::new();
+        conversation.push_message(Message::System(SystemMessage::new("inline system")));
+        let tools = [ToolSpec::new(
+            "lookup",
+            "Look up a value.",
+            json!({"type":"object"}),
+        )];
+        let request = build_request(
+            "gpt-test",
+            Default::default(),
+            None,
+            &conversation,
+            &tools,
+            &ResponsesContinuation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(request["input"][0]["role"], "system");
+        assert_eq!(request["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(request["tools"][0]["type"], "function");
+        assert_eq!(request["tools"][0]["name"], "lookup");
+        assert!(request["tools"][0].get("namespace").is_none());
     }
 
     struct OptionsModel;

@@ -2,7 +2,7 @@
 name = "kodkod-providers"
 version = "0.1.0"
 edition = "2024"
-description = "Named Codex and OpenCode providers for Kodkod."
+description = "Named ChatGPT-plan, Codex, and OpenCode providers for Kodkod."
 license = "MIT"
 repository = "https://github.com/WilmerFHandler/kodkod"
 keywords = ["agent", "llm", "codex", "opencode"]

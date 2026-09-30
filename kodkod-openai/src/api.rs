@@ -128,4 +128,6 @@ pub(crate) struct ApiErrorResponse {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ApiErrorBody {
     pub message: String,
+    #[serde(default)]
+    pub code: Option<String>,
 }

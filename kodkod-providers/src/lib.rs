@@ -1,10 +1,11 @@
-//! Fixed-endpoint providers for Codex subscriptions and OpenCode services.
+//! Fixed-endpoint providers for ChatGPT plans, Codex subscriptions, and OpenCode services.
 //!
 //! Applications remain responsible for login, token refresh, account selection,
 //! and credential storage. These providers ask application-owned sources for
 //! fresh credentials immediately before a request and own the service endpoint,
 //! protocol routing, and required headers.
 
+mod chatgpt;
 mod codex;
 mod opencode;
 
@@ -14,6 +15,7 @@ use std::fmt;
 use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
 
+pub use chatgpt::{CHATGPT_ENDPOINT, ChatGptProvider};
 pub use codex::{
     CODEX_ENDPOINT, CodexAccess, CodexAccessFuture, CodexCredentialSource, CodexProvider,
 };

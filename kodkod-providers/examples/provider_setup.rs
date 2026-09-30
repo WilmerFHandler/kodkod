@@ -4,8 +4,8 @@ use kodkod_core::{Conversation, Provider};
 use kodkod_http::{CredentialFuture, CredentialSource, RequestCredentials};
 use kodkod_openai::{OpenAiModel, OpenAiResponsesProvider};
 use kodkod_providers::{
-    CodexAccess, CodexAccessFuture, CodexCredentialSource, CodexProvider, OpenCodeProvider,
-    OpenCodeService, open_code_model,
+    ChatGptProvider, CodexAccess, CodexAccessFuture, CodexCredentialSource, CodexProvider,
+    OpenCodeProvider, OpenCodeService, open_code_model,
 };
 
 struct AppCodexAccount;
@@ -57,6 +57,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(!text_codex.supports_vision(&text_model));
     let conversation = Conversation::new();
     drop(text_codex.complete_once(&text_model, &conversation, &[]));
+
+    let chatgpt_plan = ChatGptProvider::<AppModel>::new(Arc::new(AppHttpCredentials))?;
+    accepts_any_provider(chatgpt_plan);
 
     let go = OpenCodeProvider::with_api_key(
         OpenCodeService::Go,

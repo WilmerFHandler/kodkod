@@ -1,7 +1,11 @@
 use super::*;
 use futures_util::StreamExt;
-use kodkod_core::{Conversation, Document, Provider, ProviderEvent, TokenUsage, UserMessage};
+use kodkod_core::{
+    Conversation, Document, Message, Provider, ProviderEvent, RetryPolicy, RetryProvider,
+    Retryable, SystemMessage, TokenUsage, ToolOutput, ToolResult, ToolSpec, UserMessage,
+};
 use kodkod_http::{RequestCredentials, StaticCredentials};
+use kodkod_openai::{OpenAiError, OpenAiResponsesProvider};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::json;
 use std::collections::HashSet;
@@ -68,17 +72,21 @@ impl CodexCredentialSource for FreshCodexAccess {
 }
 
 fn completed(text: &str) -> String {
+    completed_output(json!([{
+        "type":"message",
+        "role":"assistant",
+        "content":[{"type":"output_text", "text":text}]
+    }]))
+}
+
+fn completed_output(output: serde_json::Value) -> String {
     format!(
         "event: response.completed\ndata: {}\n\n",
         json!({
             "type": "response.completed",
             "response": {
                 "status": "completed",
-                "output": [{
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": text}]
-                }]
+                "output": output
             }
         })
     )
@@ -106,6 +114,243 @@ fn completed_with_usage(text: &str) -> String {
             }
         })
     )
+}
+
+fn chatgpt_provider<M>() -> ChatGptProvider<M> {
+    let credentials = StaticCredentials::new(RequestCredentials::bearer("plan-token").unwrap());
+    ChatGptProvider::new(Arc::new(credentials)).unwrap()
+}
+
+#[tokio::test]
+async fn chatgpt_uses_stateless_namespaced_functions_and_replays_raw_output() {
+    let server = MockServer::start().await;
+    let raw_reasoning = json!({
+        "id":"rs_1", "type":"reasoning", "encrypted_content":"opaque-reasoning"
+    });
+    let raw_call = json!({
+        "id":"fc_1", "type":"function_call", "call_id":"call_1",
+        "namespace":"functions", "name":"lookup", "arguments":"{\"q\":\"x\"}"
+    });
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(completed_output(json!([
+                raw_reasoning.clone(),
+                raw_call.clone()
+            ]))),
+        )
+        .expect(1)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(completed("found it")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = chatgpt_provider::<TestCodexModel>().with_test_endpoint(server.uri());
+    assert_eq!(provider.endpoint(), CHATGPT_ENDPOINT);
+    assert_eq!(provider.protocol(), Protocol::Responses);
+    let model = TestCodexModel;
+    let tools = [ToolSpec::new(
+        "lookup",
+        "Look up a value.",
+        json!({"type":"object", "properties":{"q":{"type":"string"}}}),
+    )];
+    let mut conversation = Conversation::new().with_system_prompt("Follow the research plan.");
+    conversation.push_message(Message::System(SystemMessage::new("Use citations.")));
+    conversation.push_user_message(UserMessage::new("find x"));
+    let continuation = provider.create_continuation(&model);
+    let completion = provider
+        .complete_with_usage(&continuation, &model, &conversation, &tools)
+        .await
+        .unwrap();
+    assert_eq!(completion.message.tool_calls()[0].name(), "lookup");
+
+    let call_checkpoint = serde_json::to_value(&completion.continuation).unwrap();
+    assert_eq!(
+        call_checkpoint["checkpoints"][0]["output"][0],
+        raw_reasoning
+    );
+    assert_eq!(call_checkpoint["checkpoints"][0]["output"][1], raw_call);
+    conversation.push_message(Message::Assistant(completion.message));
+    conversation.push_message(Message::ToolResult(ToolResult::success(
+        "call_1",
+        ToolOutput::new(json!({"value":"found"})),
+    )));
+    let second = provider
+        .complete_with_usage(&completion.continuation, &model, &conversation, &tools)
+        .await
+        .unwrap();
+    assert_eq!(second.message.content(), "found it");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["instructions"], "Follow the research plan.");
+        assert_eq!(body["tools"][0]["type"], "namespace");
+        assert_eq!(body["tools"][0]["name"], "functions");
+        assert_eq!(body["tools"][0]["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["tools"][0]["name"], "lookup");
+        assert_eq!(body["input"][0]["role"], "developer");
+    }
+    let second_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(second_body["input"][2], raw_reasoning);
+    assert_eq!(second_body["input"][3], raw_call);
+    assert_eq!(second_body["input"][4]["type"], "function_call_output");
+    assert_eq!(second_body["input"][4]["call_id"], "call_1");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn chatgpt_sharing_limit_is_not_retried_but_generic_rate_limit_is() {
+    let chatgpt_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+            "error": {
+                "code": "subscription_sharing_usage_limit_exceeded",
+                "message": "sharing limit reached"
+            }
+        })))
+        .expect(1)
+        .up_to_n_times(1)
+        .mount(&chatgpt_server)
+        .await;
+    let chatgpt = chatgpt_provider::<TestCodexModel>().with_test_endpoint(chatgpt_server.uri());
+    let retrying = RetryProvider::with_policy(
+        chatgpt,
+        RetryPolicy {
+            max_attempts: 3,
+            initial_backoff: std::time::Duration::ZERO,
+            max_backoff: std::time::Duration::ZERO,
+            backoff_multiplier: 1.0,
+        },
+    );
+    let model = TestCodexModel;
+    let error = retrying
+        .complete_once(&model, &Conversation::new(), &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        OpenAiError::Api { status: 429, code: Some(code), .. }
+            if code == "subscription_sharing_usage_limit_exceeded"
+    ));
+    assert!(!error.is_retryable());
+    chatgpt_server.verify().await;
+
+    let generic_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+            "error": {"message":"ordinary rate limit"}
+        })))
+        .expect(1)
+        .up_to_n_times(1)
+        .mount(&generic_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(completed("recovered")))
+        .expect(1)
+        .mount(&generic_server)
+        .await;
+    let generic =
+        OpenAiResponsesProvider::<TestCodexModel>::new(format!("{}/v1", generic_server.uri()));
+    let retrying = RetryProvider::with_policy(
+        generic,
+        RetryPolicy {
+            max_attempts: 2,
+            initial_backoff: std::time::Duration::ZERO,
+            max_backoff: std::time::Duration::ZERO,
+            backoff_multiplier: 1.0,
+        },
+    );
+    assert_eq!(
+        retrying
+            .complete_once(&model, &Conversation::new(), &[])
+            .await
+            .unwrap()
+            .content(),
+        "recovered"
+    );
+    generic_server.verify().await;
+}
+
+#[tokio::test]
+async fn chatgpt_preserves_failed_response_code_after_text_delta() {
+    let server = MockServer::start().await;
+    let body = format!(
+        "event: response.output_text.delta\ndata: {}\n\nevent: response.failed\ndata: {}\n\n",
+        json!({"type":"response.output_text.delta", "delta":"partial"}),
+        json!({
+            "type":"response.failed",
+            "response":{"error":{
+                "code":"subscription_sharing_usage_unavailable",
+                "message":"sharing temporarily unavailable"
+            }}
+        })
+    );
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = chatgpt_provider::<TestCodexModel>().with_test_endpoint(server.uri());
+    let model = TestCodexModel;
+    let continuation = provider.create_continuation(&model);
+    let conversation = Conversation::new();
+    let mut stream = provider.complete_stream(&continuation, &model, &conversation, &[]);
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap(),
+        ProviderEvent::TextDelta(delta) if delta == "partial"
+    ));
+    let error = match stream.next().await.unwrap() {
+        Ok(_) => panic!("expected failed response"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        &error,
+        OpenAiError::ResponseFailed {
+            code: Some(code),
+            ..
+        }
+            if code == "subscription_sharing_usage_unavailable"
+    ));
+    assert!(!error.is_retryable());
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn chatgpt_does_not_forward_credentials_through_redirects() {
+    let redirect_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .and(header("authorization", "Bearer plan-token"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/steal", target_server.uri())),
+        )
+        .expect(1)
+        .mount(&redirect_server)
+        .await;
+
+    let provider = chatgpt_provider::<TestCodexModel>().with_test_endpoint(redirect_server.uri());
+    let error = provider
+        .complete_once(&TestCodexModel, &Conversation::new(), &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, OpenAiError::Api { status: 307, .. }));
+    assert!(target_server.received_requests().await.unwrap().is_empty());
+    redirect_server.verify().await;
 }
 
 #[tokio::test]
