@@ -828,17 +828,21 @@ fn parse_output_with_profile(
             }
             Some("function_call") => {
                 let call_id = required_string(item, "call_id")?;
-                let name = if profile.is_chatgpt_plan() {
-                    let namespace = required_string(item, "namespace")?;
+                if profile.is_chatgpt_plan()
+                    && let Some(namespace) = item.get("namespace").filter(|value| !value.is_null())
+                {
+                    let namespace = namespace.as_str().ok_or_else(|| {
+                        OpenAiError::Protocol(
+                            "function call namespace must be a string or null".into(),
+                        )
+                    })?;
                     if namespace != FUNCTION_NAMESPACE {
                         return Err(OpenAiError::Protocol(format!(
                             "unexpected function namespace: {namespace}"
                         )));
                     }
-                    required_string(item, "name")?
-                } else {
-                    required_string(item, "name")?
-                };
+                }
+                let name = required_string(item, "name")?;
                 let arguments = required_string(item, "arguments")?;
                 let arguments = serde_json::from_str(&arguments)?;
                 calls.push(ToolCall::new(call_id, name, arguments));
@@ -1118,6 +1122,64 @@ mod tests {
         assert_eq!(response["output"][0]["id"], "msg_1");
         assert_eq!(response["output"][0]["status"], "completed");
         assert_eq!(response["output"][0]["content"][0]["text"], "final");
+    }
+
+    #[test]
+    fn chatgpt_plan_function_calls_accept_optional_namespace_and_replay_raw_items() {
+        for namespace in [None, Some(Value::Null), Some(json!(FUNCTION_NAMESPACE))] {
+            let mut call = json!({
+                "id":"fc_1", "type":"function_call", "status":"completed",
+                "call_id":"call_1", "name":"lookup", "arguments":"{\"q\":\"x\"}"
+            });
+            if let Some(namespace) = namespace {
+                call["namespace"] = namespace;
+            }
+
+            let response = parse_complete_stream(
+                format!(
+                    "{}{}",
+                    output_item_done(0, call.clone()),
+                    completed(json!([call.clone()]))
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let output = response["output"].as_array().unwrap();
+            let assistant =
+                parse_output_with_profile(output, ResponsesRequestProfile::ChatGptPlan).unwrap();
+            assert_eq!(assistant.tool_calls()[0].name(), "lookup");
+            assert_eq!(assistant.tool_calls()[0].id(), "call_1");
+
+            let continuation = ResponsesContinuation {
+                checkpoints: vec![ResponseCheckpoint {
+                    model: "gpt-test".into(),
+                    profile: ResponsesRequestProfile::ChatGptPlan,
+                    assistant_message_index: 1,
+                    assistant: assistant.clone(),
+                    output: output.clone(),
+                }],
+            };
+            let serialized = serde_json::to_value(&continuation).unwrap();
+            let restored: ResponsesContinuation = serde_json::from_value(serialized).unwrap();
+            assert_eq!(restored.checkpoints[0].output[0], call);
+
+            let mut conversation = Conversation::new();
+            conversation.push_user_message(UserMessage::new("look"));
+            conversation.push_message(Message::Assistant(assistant));
+            let request = build_request_with_profile(
+                "gpt-test",
+                Default::default(),
+                None,
+                &conversation,
+                &[],
+                &restored,
+                ResponsesRequestProfile::ChatGptPlan,
+            )
+            .unwrap();
+            let replayed = &request["input"][1];
+            assert_eq!(replayed, &call);
+            assert_eq!(replayed.get("namespace"), call.get("namespace"));
+        }
     }
 
     #[test]
@@ -1439,12 +1501,35 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_profile_requires_the_functions_namespace_on_calls() {
+    fn chatgpt_profile_rejects_other_or_non_string_namespaces() {
         let call = json!({
             "type":"function_call", "call_id":"x", "name":"lookup",
             "namespace":"other", "arguments":"{}"
         });
         assert!(parse_output_with_profile(&[call], ResponsesRequestProfile::ChatGptPlan).is_err());
+
+        for namespace in [json!(7), json!(false), json!([]), json!({})] {
+            let call = json!({
+                "type":"function_call", "call_id":"x", "name":"lookup",
+                "namespace":namespace, "arguments":"{}"
+            });
+            assert!(
+                parse_output_with_profile(&[call], ResponsesRequestProfile::ChatGptPlan).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn chatgpt_profile_still_requires_function_call_fields() {
+        for call in [
+            json!({"type":"function_call", "name":"lookup", "arguments":"{}"}),
+            json!({"type":"function_call", "call_id":"x", "arguments":"{}"}),
+            json!({"type":"function_call", "call_id":"x", "name":"lookup"}),
+        ] {
+            assert!(
+                parse_output_with_profile(&[call], ResponsesRequestProfile::ChatGptPlan).is_err()
+            );
+        }
     }
 
     #[test]
