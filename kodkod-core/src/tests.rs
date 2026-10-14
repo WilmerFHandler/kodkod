@@ -2296,3 +2296,93 @@ async fn cancellation_keeps_each_finished_tool_result_without_waiting_for_siblin
         .collect::<Vec<_>>();
     assert_eq!(results, ["fast-call"]);
 }
+
+#[tokio::test]
+async fn immediate_steering_restarts_pending_inference_without_committing_old_preview() {
+    struct RedirectableProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    impl Provider for RedirectableProvider {
+        type Model = TestModel;
+        type Error = TestError;
+        type Continuation = usize;
+        fn supports_vision(&self, _: &TestModel) -> bool {
+            false
+        }
+        fn create_continuation(&self, _: &TestModel) -> usize {
+            0
+        }
+        async fn complete(
+            &self,
+            _: &usize,
+            _: &TestModel,
+            _: &Conversation,
+            _: &[ToolSpec],
+        ) -> Result<(AssistantMessage, usize), TestError> {
+            unreachable!()
+        }
+        fn complete_stream<'a>(
+            &'a self,
+            continuation: &'a usize,
+            _: &'a TestModel,
+            conversation: &'a Conversation,
+            _: &'a [ToolSpec],
+        ) -> ProviderStream<'a, usize, TestError> {
+            Box::pin(async_stream::try_stream! {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(*continuation, 0, "Abandoned inference cannot advance its checkpoint");
+                if call == 0 {
+                    yield ProviderEvent::TextDelta("old provisional response".into());
+                    futures::future::pending::<()>().await;
+                } else {
+                    assert!(matches!(conversation.messages().last(), Some(Message::User(user)) if user.content() == "Use the updated requirements"));
+                    yield ProviderEvent::Completed(ProviderCompletion::new(AssistantMessage::new("updated response"), 1, TokenUsage::zero()));
+                }
+            })
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::new(RedirectableProvider {
+        calls: calls.clone(),
+    })
+    .with_immediate_steering();
+    let control = TaskControl::new();
+    let model = TestModel::new();
+    let mut conversation = Conversation::new();
+    let mut task = agent.run_turn(
+        &mut conversation,
+        &model,
+        UserMessage::new("original requirements"),
+        &control,
+    );
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::AssistantTextDelta(_)
+    ));
+    control
+        .steer(UserMessage::new("Use the updated requirements"))
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), task.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentEvent::AssistantPreviewReset
+    );
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::Steered(_)
+    ));
+    let rest: Vec<_> = task.collect().await;
+    assert!(rest.iter().any(|event| matches!(event, Ok(AgentEvent::Completed(message, _)) if message.content() == "updated response")));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        conversation
+            .messages()
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant(_)))
+            .count(),
+        1
+    );
+}

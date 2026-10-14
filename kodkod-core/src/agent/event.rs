@@ -9,6 +9,9 @@ use crate::{AssistantMessage, Conversation, TokenUsage, ToolCall, ToolResult, Us
 pub enum AgentEvent {
     /// Provisional assistant text from the current provider round.
     AssistantTextDelta(String),
+    /// Discard provisional text when inference restarts with newly accepted steering.
+    /// No authoritative reply or tool effect is rolled back.
+    AssistantPreviewReset,
     /// The provider returned an assistant message for the current round.
     AssistantReply(AssistantMessage, TokenUsage),
     /// A user message was steered into the turn at a round boundary.

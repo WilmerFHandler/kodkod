@@ -26,6 +26,7 @@ struct TaskControlInner {
     cancelled: AtomicBool,
     compact_requested: AtomicBool,
     cancellation: Event,
+    steering_available: Event,
     steering: Mutex<SteeringMailbox>,
 }
 
@@ -64,6 +65,7 @@ impl TaskControl {
                 cancelled: AtomicBool::new(false),
                 compact_requested: AtomicBool::new(false),
                 cancellation: Event::new(),
+                steering_available: Event::new(),
                 steering: Mutex::new(SteeringMailbox {
                     admission: Admission::Fresh,
                     pending: VecDeque::new(),
@@ -119,7 +121,26 @@ impl TaskControl {
             return Err(SteerError { message });
         }
         mailbox.pending.push_back(message.with_steered(true));
+        drop(mailbox);
+        self.inner.steering_available.notify(usize::MAX);
         Ok(())
+    }
+
+    pub(crate) async fn steering_ready(&self) {
+        loop {
+            let listener = self.inner.steering_available.listen();
+            if !self
+                .inner
+                .steering
+                .lock()
+                .expect("steering mailbox poisoned")
+                .pending
+                .is_empty()
+            {
+                return;
+            }
+            listener.await;
+        }
     }
 
     pub(crate) fn open(&self) -> Result<(), ()> {

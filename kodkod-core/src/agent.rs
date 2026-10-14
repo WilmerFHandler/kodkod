@@ -42,6 +42,7 @@ pub struct Agent<P> {
     provider: P,
     tools: ToolExecutor,
     max_tool_rounds: Option<usize>,
+    immediate_steering: bool,
 }
 
 /// Opaque provider continuation retained by an application across agent turns.
@@ -114,6 +115,7 @@ where
             provider,
             tools: ToolExecutor::new(),
             max_tool_rounds: None,
+            immediate_steering: false,
         }
     }
     pub fn provider(&self) -> &P {
@@ -129,6 +131,15 @@ where
         self.register_tool(tool);
         self
     }
+    /// Restart in-progress client-only inference from its last accepted checkpoint
+    /// when steering arrives. Running local tools still finish normally. Applications
+    /// must handle AssistantPreviewReset and should not opt in for hosted tools
+    /// with remote side effects. This is not provider-native WebSocket steering.
+    pub fn with_immediate_steering(mut self) -> Self {
+        self.immediate_steering = true;
+        self
+    }
+
     pub fn with_max_tool_rounds(mut self, max: usize) -> Self {
         self.max_tool_rounds = Some(max);
         self
@@ -239,7 +250,7 @@ where
             let mut tool_rounds_executed = 0;
             let mut turn_usage = TokenUsage::zero();
 
-            loop {
+            'rounds: loop {
                 let steers = control.drain_pending_steers_unless_cancelled()
                     .ok_or(AgentError::Cancelled)?;
                 for user in steers {
@@ -311,7 +322,28 @@ where
                 );
                 let (message, next_continuation, round_usage) = loop {
                     // Cancellation wins when both become ready in one poll.
-                    let event = cancel_or(control, provider_stream.next()).await;
+                    let event = if self.immediate_steering {
+                        let steering = control.steering_ready();
+                        let next = provider_stream.next();
+                        futures::pin_mut!(steering, next);
+                        let interrupted = futures::future::poll_fn(|cx| {
+                            if control.is_cancelled() { Poll::Ready(Some(None)) }
+                            else if steering.as_mut().poll(cx).is_ready() { Poll::Ready(None) }
+                            else { next.as_mut().poll(cx).map(|event| Some(Some(event))) }
+                        });
+                        match cancel_or(control, interrupted).await {
+                            Some(None) => {
+                                drop(provider_stream);
+                                drop(provider_input);
+                                yield AgentEvent::AssistantPreviewReset;
+                                continue 'rounds;
+                            }
+                            Some(Some(event)) => event,
+                            None => None,
+                        }
+                    } else {
+                        cancel_or(control, provider_stream.next()).await
+                    };
                     match event {
                         Some(Some(Ok(ProviderEvent::TextDelta(delta))))
                             if !control.is_cancelled() =>
