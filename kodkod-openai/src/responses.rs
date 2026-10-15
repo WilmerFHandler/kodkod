@@ -873,13 +873,23 @@ const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_ASSEMBLED_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT_ITEMS: usize = 512;
 const MAX_COMPACTION_INPUT_BYTES: usize = 64 * 1024 * 1024;
-const MAX_COMPACTION_RESPONSE_BYTES: usize = MAX_ASSEMBLED_OUTPUT_BYTES + MAX_ERROR_BODY_BYTES;
+const MAX_NATIVE_COMPACTION_OUTPUT_BYTES: usize = MAX_COMPACTION_INPUT_BYTES;
+const MAX_NATIVE_COMPACTION_OUTPUT_ITEMS: usize = 16_384;
+const MAX_COMPACTION_RESPONSE_BYTES: usize = MAX_COMPACTION_INPUT_BYTES;
 
 fn validate_output_window(output: &[Value]) -> Result<(), String> {
+    validate_bounded_output_window(output, MAX_ASSEMBLED_OUTPUT_BYTES, MAX_OUTPUT_ITEMS)
+}
+
+fn validate_bounded_output_window(
+    output: &[Value],
+    max_bytes: usize,
+    max_items: usize,
+) -> Result<(), String> {
     if output.is_empty() {
         return Err("output window is empty".into());
     }
-    if output.len() > MAX_OUTPUT_ITEMS {
+    if output.len() > max_items {
         return Err("output window contains too many items".into());
     }
     let mut serialized_bytes = 0usize;
@@ -892,7 +902,7 @@ fn validate_output_window(output: &[Value]) -> Result<(), String> {
             .len();
         serialized_bytes = serialized_bytes
             .checked_add(item_bytes)
-            .filter(|bytes| *bytes <= MAX_ASSEMBLED_OUTPUT_BYTES)
+            .filter(|bytes| *bytes <= max_bytes)
             .ok_or_else(|| "output window exceeds its size limit".to_owned())?;
     }
     Ok(())
@@ -911,7 +921,11 @@ fn validate_native_compaction_response(payload: &Value) -> Result<Vec<Value>, St
 }
 
 fn validate_native_compaction_output(output: &[Value]) -> Result<(), String> {
-    validate_output_window(output)?;
+    validate_bounded_output_window(
+        output,
+        MAX_NATIVE_COMPACTION_OUTPUT_BYTES,
+        MAX_NATIVE_COMPACTION_OUTPUT_ITEMS,
+    )?;
     let mut found_compaction = false;
     for item in output {
         if item.get("type").and_then(Value::as_str) != Some("compaction") {
@@ -1345,9 +1359,76 @@ mod tests {
     }
 
     #[test]
-    fn native_context_window_rejects_too_many_items() {
+    fn ordinary_response_window_rejects_too_many_items() {
         let output = vec![json!({"role":"user"}); MAX_OUTPUT_ITEMS + 1];
         assert!(validate_output_window(&output).is_err());
+    }
+
+    #[test]
+    fn native_compaction_window_has_a_separate_item_limit() {
+        let mut output = vec![json!({"type":"compaction", "encrypted_content":"opaque"})];
+        output.extend(vec![
+            json!({"type":"retained_context"});
+            MAX_NATIVE_COMPACTION_OUTPUT_ITEMS - 1
+        ]);
+        assert!(validate_native_compaction_output(&output).is_ok());
+
+        output.push(json!({"type":"retained_context"}));
+        assert!(validate_native_compaction_output(&output).is_err());
+    }
+
+    #[tokio::test]
+    async fn native_compaction_accepts_a_9_mib_retained_user_item() {
+        let retained_text = "x".repeat(9 * 1024 * 1024);
+        let expected_len = retained_text.len();
+        let compacted_output = json!([
+            {"type":"compaction", "encrypted_content":"opaque-window"},
+            {"role":"user", "content":[{"type":"input_text", "text":retained_text.clone()}]}
+        ]);
+        let compacted_items = compacted_output.as_array().unwrap();
+        assert!(validate_native_compaction_output(compacted_items).is_ok());
+        assert!(validate_output_window(compacted_items).is_err());
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses/compact"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object":"response.compaction",
+                "output": compacted_output,
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiResponsesProvider::<TestModel>::new(format!("{}/v1", server.uri()))
+            .with_native_compaction(true);
+        let mut conversation = Conversation::new();
+        conversation.push_user_message(UserMessage::new(retained_text));
+        let compacted = provider
+            .compact_context(
+                &ResponsesContinuation::default(),
+                &TestModel,
+                &conversation,
+                CompactOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            compacted
+                .continuation
+                .native_window
+                .as_ref()
+                .unwrap()
+                .output[1]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .len(),
+            expected_len
+        );
+        assert!(Provider::validate_context(&provider, &TestModel, &compacted.continuation).is_ok());
+        server.verify().await;
     }
 
     #[tokio::test]
