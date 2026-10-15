@@ -1153,15 +1153,7 @@ fn handle_sse_event(
                 .to_owned();
             Err(OpenAiError::Incomplete { reason })
         }
-        "error" => {
-            let message = payload
-                .get("message")
-                .or_else(|| payload.pointer("/error/message"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown streaming error")
-                .to_owned();
-            Err(OpenAiError::Protocol(message))
-        }
+        "error" => Err(response_failure(&payload)),
         _ => Ok(None),
     }
 }
@@ -1188,13 +1180,30 @@ fn response_text_delta(event: &SseEvent) -> Result<Option<String>, OpenAiError> 
 }
 
 fn response_failure(event: &Value) -> OpenAiError {
-    let error = event.pointer("/response/error");
+    let error = event
+        .pointer("/response/error")
+        .or_else(|| event.pointer("/error"));
     let code = error
         .and_then(|error| error.get("code"))
         .and_then(Value::as_str)
-        .map(str::to_owned);
+        .filter(|code| !code.is_empty())
+        .or_else(|| {
+            event
+                .get("code")
+                .and_then(Value::as_str)
+                .filter(|code| !code.is_empty())
+        })
+        .map(str::to_owned)
+        .or_else(|| {
+            error
+                .and_then(|error| error.get("type"))
+                .and_then(Value::as_str)
+                .filter(|error_type| !error_type.is_empty() && *error_type != "error")
+                .map(str::to_owned)
+        });
     let message = error
         .and_then(|error| error.get("message"))
+        .or_else(|| event.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("response failed")
         .to_owned();
@@ -1294,7 +1303,8 @@ fn required_string(item: &Value, field: &str) -> Result<String, OpenAiError> {
 mod tests {
     use super::*;
     use kodkod_core::{
-        Document, Image, Message, ProviderEvent, SystemMessage, TokenUsage, ToolSpec, UserMessage,
+        Document, Image, Message, ProviderEvent, Retryable, SystemMessage, TokenUsage, ToolSpec,
+        UserMessage,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{header, method, path};
@@ -2104,6 +2114,91 @@ mod tests {
         assert!(
             matches!(output.insert(&oversized), Err(OpenAiError::Protocol(message)) if message.contains("size limit"))
         );
+    }
+
+    #[test]
+    fn provider_error_events_preserve_structured_failure_codes() {
+        let top_level = json!({
+            "type": "error",
+            "code": "server_error",
+            "message": "Our servers are currently overloaded. Please try again later."
+        });
+        let error =
+            parse_complete_stream(format!("event: error\ndata: {top_level}\n\n").as_bytes())
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            OpenAiError::ResponseFailed { code: Some(code), message }
+                if code == "server_error"
+                    && message == "Our servers are currently overloaded. Please try again later."
+        ));
+
+        let nested_type = json!({
+            "type": "error",
+            "error": {
+                "type": "overloaded_error",
+                "message": "server overloaded"
+            }
+        });
+        let error =
+            parse_complete_stream(format!("event: error\ndata: {nested_type}\n\n").as_bytes())
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            OpenAiError::ResponseFailed { code: Some(code), .. }
+                if code == "overloaded_error"
+        ));
+
+        let generic = json!({
+            "type": "error",
+            "message": "Our servers are currently overloaded. Please try again later."
+        });
+        let error = parse_complete_stream(format!("event: error\ndata: {generic}\n\n").as_bytes())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OpenAiError::ResponseFailed { code: None, .. }
+        ));
+
+        let top_level_quota_with_null_nested_code = json!({
+            "type": "error",
+            "code": "subscription_sharing_usage_limit_exceeded",
+            "error": {
+                "code": null,
+                "type": "overloaded_error",
+                "message": "Our servers are currently overloaded. Please try again later."
+            }
+        });
+        let error = parse_complete_stream(
+            format!("event: error\ndata: {top_level_quota_with_null_nested_code}\n\n").as_bytes(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &error,
+            OpenAiError::ResponseFailed { code: Some(code), .. }
+                if code == "subscription_sharing_usage_limit_exceeded"
+        ));
+        assert!(!error.is_retryable());
+
+        let nested_quota_precedes_transient_hints = json!({
+            "type": "error",
+            "code": "server_error",
+            "error": {
+                "code": "subscription_sharing_usage_limit_exceeded",
+                "type": "overloaded_error",
+                "message": "Our servers are currently overloaded. Please try again later."
+            }
+        });
+        let error = parse_complete_stream(
+            format!("event: error\ndata: {nested_quota_precedes_transient_hints}\n\n").as_bytes(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &error,
+            OpenAiError::ResponseFailed { code: Some(code), .. }
+                if code == "subscription_sharing_usage_limit_exceeded"
+        ));
+        assert!(!error.is_retryable());
     }
 
     #[test]

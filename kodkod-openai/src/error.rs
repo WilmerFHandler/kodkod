@@ -127,7 +127,9 @@ impl Retryable for OpenAiError {
                 !is_subscription_sharing_error(code.as_deref())
                     && matches!(*status, 429 | 500 | 502 | 503 | 504)
             }
-            Self::ResponseFailed { .. } => false,
+            Self::ResponseFailed { code, message } => {
+                is_retryable_response_failure(code.as_deref(), message)
+            }
             Self::Json(_)
             | Self::EmptyResponse
             | Self::Credentials(_)
@@ -136,6 +138,17 @@ impl Retryable for OpenAiError {
             | Self::Incomplete { .. }
             | Self::Protocol(_) => false,
         }
+    }
+}
+
+const KNOWN_PROVIDER_OVERLOAD_MESSAGE: &str =
+    "Our servers are currently overloaded. Please try again later.";
+
+fn is_retryable_response_failure(code: Option<&str>, message: &str) -> bool {
+    match code {
+        Some("server_error" | "overloaded_error") => true,
+        Some(_) => false,
+        None => message.trim() == KNOWN_PROVIDER_OVERLOAD_MESSAGE,
     }
 }
 
@@ -183,6 +196,50 @@ mod tests {
     #[test]
     fn non_retryable_parse_errors() {
         assert!(!OpenAiError::EmptyResponse.is_retryable());
+    }
+
+    #[test]
+    fn retries_only_known_transient_stream_failures() {
+        for code in ["server_error", "overloaded_error"] {
+            assert!(
+                OpenAiError::ResponseFailed {
+                    code: Some(code.into()),
+                    message: "provider unavailable".into(),
+                }
+                .is_retryable()
+            );
+        }
+
+        for code in [
+            "subscription_sharing_usage_limit_exceeded",
+            "subscription_sharing_usage_unavailable",
+            "subscription_sharing_user_not_eligible",
+            "unknown_error",
+        ] {
+            assert!(
+                !OpenAiError::ResponseFailed {
+                    code: Some(code.into()),
+                    message: KNOWN_PROVIDER_OVERLOAD_MESSAGE.into(),
+                }
+                .is_retryable()
+            );
+        }
+
+        assert!(
+            OpenAiError::ResponseFailed {
+                code: None,
+                message: format!(" {KNOWN_PROVIDER_OVERLOAD_MESSAGE} "),
+            }
+            .is_retryable()
+        );
+        assert!(
+            !OpenAiError::ResponseFailed {
+                code: None,
+                message: "The server is temporarily unavailable".into(),
+            }
+            .is_retryable()
+        );
+        assert!(!OpenAiError::Protocol(KNOWN_PROVIDER_OVERLOAD_MESSAGE.into()).is_retryable());
     }
 
     #[test]
