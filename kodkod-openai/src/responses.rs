@@ -231,7 +231,7 @@ where
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .unwrap_or(fallback);
-            if is_native_compaction_unsupported(status.as_u16(), code.as_deref()) {
+            if is_native_compaction_unsupported(self.profile, status.as_u16(), code.as_deref()) {
                 return Err(CompactError::Unsupported(
                     "the Responses endpoint does not support standalone compaction".into(),
                 ));
@@ -946,8 +946,18 @@ fn validate_native_compaction_output(output: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
-fn is_native_compaction_unsupported(status: u16, code: Option<&str>) -> bool {
-    matches!(status, 404 | 405) || (status == 400 && code == Some("unsupported_operation"))
+fn is_native_compaction_unsupported(
+    profile: ResponsesRequestProfile,
+    status: u16,
+    code: Option<&str>,
+) -> bool {
+    matches!(status, 404 | 405)
+        || (status == 400 && code == Some("unsupported_operation"))
+        // ChatPass may authorize inference while denying this optional operation.
+        // This exact scoped capability denial is not an invalid credential.
+        || (profile.is_chatgpt_plan()
+            && status == 401
+            && code == Some("hardened_oauth_rule_missing"))
 }
 
 async fn read_bounded_body(
@@ -1601,6 +1611,31 @@ mod tests {
         assert!(matches!(
             result,
             Err(CompactError::Provider(OpenAiError::Api { status: 401, .. }))
+        ));
+    }
+
+    #[test]
+    fn chatpass_compact_capability_denial_is_narrowly_scoped() {
+        use ResponsesRequestProfile::{ChatGptPlan, OpenAiCompatible};
+        assert!(is_native_compaction_unsupported(
+            ChatGptPlan,
+            401,
+            Some("hardened_oauth_rule_missing")
+        ));
+        assert!(!is_native_compaction_unsupported(
+            OpenAiCompatible,
+            401,
+            Some("hardened_oauth_rule_missing")
+        ));
+        assert!(!is_native_compaction_unsupported(
+            ChatGptPlan,
+            401,
+            Some("invalid_api_key")
+        ));
+        assert!(!is_native_compaction_unsupported(
+            ChatGptPlan,
+            403,
+            Some("chatpass_v2_scope_not_authorized")
         ));
     }
 
