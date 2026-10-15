@@ -18,6 +18,10 @@ impl Conversation {
         self
     }
 
+    pub fn set_system_prompt(&mut self, prompt: Option<&str>) {
+        self.system_prompt = prompt.map(str::to_owned);
+    }
+
     pub fn system_prompt(&self) -> Option<&str> {
         self.system_prompt.as_deref()
     }

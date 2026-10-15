@@ -1,4 +1,4 @@
-You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another coding agent that will resume the task.
+You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another agent that will resume the task.
 
 The conversation messages are what must be summarized. Do not summarize or rewrite any system prompt; the original system prompt is kept in full outside this summary. If the conversation already contains an earlier summary, treat that as the starting point: keep still-true details, drop stale ones, and merge in what happened after.
 

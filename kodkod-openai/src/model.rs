@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use kodkod_core::ContextBudget;
+
 /// Optional per-request controls carried by an OpenAI model value.
 ///
 /// The provider forwards these strings without validating them, so callers can
@@ -20,6 +22,11 @@ pub trait OpenAiModel: Sync {
     fn supports_vision(&self) -> bool;
     fn request_options(&self) -> OpenAiRequestOptions {
         OpenAiRequestOptions::default()
+    }
+
+    /// Effective input-token budget for this model, when the caller has reviewed one.
+    fn context_budget(&self) -> Option<ContextBudget> {
+        None
     }
 }
 

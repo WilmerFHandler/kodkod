@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use kodkod_core::{
-    AssistantMessage, Conversation, Message, Provider, ProviderCompletion, ProviderEvent,
-    ProviderStream, ToolCall, ToolExecutorError, ToolResult, ToolResultOutcome, ToolSpec,
+    AssistantMessage, CompactError, CompactOptions, ContextBudget, ContextCompaction, Conversation,
+    Message, Provider, ProviderCompletion, ProviderEvent, ProviderStream, ToolCall,
+    ToolExecutorError, ToolResult, ToolResultOutcome, ToolSpec,
 };
 use kodkod_http::{SseDecoder, SseEvent};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,12 @@ pub enum ResponsesRequestProfile {
     #[default]
     OpenAiCompatible,
     ChatGptPlan,
+}
+
+#[derive(Clone, Copy)]
+struct ResponsesRoute<'a> {
+    profile: ResponsesRequestProfile,
+    endpoint: &'a str,
 }
 
 impl ResponsesRequestProfile {
@@ -42,6 +49,18 @@ pub fn responses_url(base_url: &str) -> String {
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ResponsesContinuation {
     checkpoints: Vec<ResponseCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_window: Option<NativeContextWindow>,
+}
+
+/// Canonical output returned by `/responses/compact`. Its opaque items must be
+/// replayed verbatim and remain bound to the route that created them.
+#[derive(Clone, Serialize, Deserialize)]
+struct NativeContextWindow {
+    model: String,
+    profile: ResponsesRequestProfile,
+    endpoint: String,
+    output: Vec<Value>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -58,6 +77,7 @@ impl std::fmt::Debug for ResponsesContinuation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResponsesContinuation")
             .field("checkpoint_count", &self.checkpoints.len())
+            .field("has_native_window", &self.native_window.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -72,6 +92,7 @@ pub struct OpenAiResponsesProvider<M = ()> {
     credentials: Option<Arc<dyn CredentialSource>>,
     instructions: Option<String>,
     profile: ResponsesRequestProfile,
+    native_compaction: bool,
     client: reqwest::Client,
     _model: PhantomData<M>,
 }
@@ -83,6 +104,7 @@ impl<M> OpenAiResponsesProvider<M> {
             credentials: None,
             instructions: None,
             profile: ResponsesRequestProfile::default(),
+            native_compaction: false,
             client: reqwest::Client::new(),
             _model: PhantomData,
         }
@@ -111,6 +133,13 @@ impl<M> OpenAiResponsesProvider<M> {
         self
     }
 
+    /// Enable the standalone `/responses/compact` endpoint for deployments
+    /// known to support it. Generic compatible gateways keep this disabled.
+    pub fn with_native_compaction(mut self, enabled: bool) -> Self {
+        self.native_compaction = enabled;
+        self
+    }
+
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.client = client;
         self
@@ -118,6 +147,128 @@ impl<M> OpenAiResponsesProvider<M> {
 
     pub fn responses_url(&self) -> &str {
         &self.responses_url
+    }
+
+    fn compaction_url(&self) -> String {
+        format!("{}/compact", self.responses_url.trim_end_matches('/'))
+    }
+}
+
+impl<M> OpenAiResponsesProvider<M>
+where
+    M: OpenAiModel,
+{
+    async fn compact_native(
+        &self,
+        continuation: &ResponsesContinuation,
+        model: &M,
+        conversation: &Conversation,
+    ) -> Result<ContextCompaction<ResponsesContinuation>, CompactError<OpenAiError>> {
+        validate_documents(conversation, model.supports_vision())
+            .map_err(CompactError::Provider)?;
+        let input = build_input_for_endpoint(
+            model.id(),
+            conversation,
+            continuation,
+            self.profile,
+            &self.responses_url,
+        )
+        .map_err(|error| CompactError::Context(error.to_string()))?;
+        let input_size = serde_json::to_vec(&input)
+            .map_err(OpenAiError::from)
+            .map_err(CompactError::Provider)?
+            .len();
+        if input_size > MAX_COMPACTION_INPUT_BYTES {
+            return Err(CompactError::Context(
+                "native compaction input exceeded its size limit".into(),
+            ));
+        }
+
+        let credentials = match &self.credentials {
+            Some(source) => Some(
+                source
+                    .credentials()
+                    .await
+                    .map_err(OpenAiError::from)
+                    .map_err(CompactError::Provider)?,
+            ),
+            None => None,
+        };
+        let mut request = json!({ "model": model.id(), "input": input });
+        let instructions = self
+            .instructions
+            .as_deref()
+            .or(conversation.system_prompt());
+        if let Some(instructions) = instructions {
+            request["instructions"] = Value::String(instructions.to_owned());
+        }
+        let mut http_request = self.client.post(self.compaction_url()).json(&request);
+        if let Some(credentials) = credentials {
+            http_request = http_request.headers(credentials.headers().clone());
+        }
+        let response = http_request
+            .send()
+            .await
+            .map_err(OpenAiError::from)
+            .map_err(CompactError::Provider)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = read_limited_body(response, MAX_ERROR_BODY_BYTES)
+                .await
+                .map_err(CompactError::Provider)?;
+            let fallback = if body.is_empty() {
+                status.to_string()
+            } else {
+                body.clone()
+            };
+            let body: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let code = body
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let message = body
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or(fallback);
+            if is_native_compaction_unsupported(status.as_u16(), code.as_deref()) {
+                return Err(CompactError::Unsupported(
+                    "the Responses endpoint does not support standalone compaction".into(),
+                ));
+            }
+            return Err(CompactError::Provider(OpenAiError::Api {
+                status: status.as_u16(),
+                code,
+                message,
+            }));
+        }
+
+        let body = read_bounded_body(response, MAX_COMPACTION_RESPONSE_BYTES)
+            .await
+            .map_err(CompactError::Provider)?;
+        let payload: Value = serde_json::from_slice(&body).map_err(|_| {
+            CompactError::Context("native compaction returned malformed JSON".into())
+        })?;
+        let output =
+            validate_native_compaction_response(&payload).map_err(CompactError::Context)?;
+
+        let mut compacted_conversation = Conversation::new();
+        if let Some(system_prompt) = conversation.system_prompt() {
+            compacted_conversation = compacted_conversation.with_system_prompt(system_prompt);
+        }
+        Ok(ContextCompaction {
+            conversation: compacted_conversation,
+            continuation: ResponsesContinuation {
+                checkpoints: Vec::new(),
+                native_window: Some(NativeContextWindow {
+                    model: model.id().to_owned(),
+                    profile: self.profile,
+                    endpoint: self.responses_url.clone(),
+                    output,
+                }),
+            },
+            usage: parse_usage(&payload),
+        })
     }
 }
 
@@ -142,18 +293,78 @@ where
     }
 
     fn estimate_continuation_tokens(continuation: &Self::Continuation) -> u64 {
-        continuation
+        // This is a lower-bound heuristic for readable reasoning summaries;
+        // encrypted reasoning bytes are opaque and must not be treated as text.
+        let mut estimate = 0_u64;
+        for item in continuation
             .checkpoints
             .iter()
             .flat_map(|checkpoint| &checkpoint.output)
-            .filter(|item| {
-                !matches!(
-                    item.get("type").and_then(Value::as_str),
-                    Some("message" | "function_call")
-                )
-            })
-            .map(|item| serde_json::to_string(item).map_or(0, |text| text.len().div_ceil(4) as u64))
-            .sum()
+        {
+            if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+                continue;
+            }
+            let Some(summary) = item.get("summary").and_then(Value::as_array) else {
+                continue;
+            };
+            for part in summary {
+                if part.get("type").and_then(Value::as_str) == Some("summary_text")
+                    && let Some(text) = part.get("text").and_then(Value::as_str)
+                {
+                    estimate = estimate.saturating_add(text.len().div_ceil(4) as u64);
+                }
+            }
+        }
+        estimate
+    }
+
+    fn context_budget(&self, model: &M) -> Option<ContextBudget> {
+        model.context_budget()
+    }
+
+    fn has_opaque_context(&self, continuation: &Self::Continuation) -> bool {
+        continuation.native_window.is_some()
+    }
+
+    fn validate_context(&self, model: &M, continuation: &Self::Continuation) -> Result<(), String> {
+        validate_continuation_provenance(
+            model.id(),
+            &self.responses_url,
+            continuation,
+            self.profile,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn is_context_overflow(&self, error: &Self::Error) -> bool {
+        error.is_context_overflow()
+    }
+
+    async fn compact_context(
+        &self,
+        continuation: &Self::Continuation,
+        model: &M,
+        conversation: &Conversation,
+        options: CompactOptions,
+    ) -> Result<ContextCompaction<Self::Continuation>, CompactError<Self::Error>> {
+        if !self.native_compaction {
+            if continuation.native_window.is_some() {
+                return Err(CompactError::Context(
+                    "cannot compact a native Responses window while native compaction is disabled"
+                        .into(),
+                ));
+            }
+            let compacted = self
+                .compact_with_usage(model, conversation, options)
+                .await?;
+            return Ok(ContextCompaction {
+                conversation: compacted.conversation,
+                continuation: self.create_continuation(model),
+                usage: compacted.usage,
+            });
+        }
+
+        self.compact_native(continuation, model, conversation).await
     }
 
     async fn complete(
@@ -199,14 +410,17 @@ where
             Some(source) => Some(source.credentials().await?),
             None => None,
         };
-        let request = build_request_with_profile(
+        let request = build_request_for_endpoint(
             model.id(),
             model.request_options(),
             self.instructions.as_deref(),
             conversation,
             tools,
             continuation,
-            self.profile,
+            ResponsesRoute {
+                profile: self.profile,
+                endpoint: &self.responses_url,
+            },
         )?;
         let mut http_request = self.client.post(&self.responses_url).json(&request);
         if let Some(credentials) = credentials {
@@ -291,6 +505,7 @@ fn build_request(
     )
 }
 
+#[cfg(test)]
 fn build_request_with_profile(
     model: &str,
     options: crate::OpenAiRequestOptions,
@@ -300,27 +515,42 @@ fn build_request_with_profile(
     continuation: &ResponsesContinuation,
     profile: ResponsesRequestProfile,
 ) -> Result<Value, OpenAiError> {
-    validate_continuation(model, conversation, continuation, profile)?;
-    validate_document_mime_types(conversation)?;
-    let checkpoints: BTreeMap<usize, &ResponseCheckpoint> = continuation
-        .checkpoints
-        .iter()
-        .map(|checkpoint| (checkpoint.assistant_message_index, checkpoint))
-        .collect();
-    let mut input = Vec::new();
-    for (index, message) in conversation.messages().iter().enumerate() {
-        if let Some(checkpoint) = checkpoints.get(&index) {
-            input.extend(checkpoint.output.iter().cloned());
-        } else {
-            input.extend(convert_message_with_profile(message, profile));
-        }
-    }
+    build_request_for_endpoint(
+        model,
+        options,
+        configured_instructions,
+        conversation,
+        tools,
+        continuation,
+        ResponsesRoute {
+            profile,
+            endpoint: "",
+        },
+    )
+}
+
+fn build_request_for_endpoint(
+    model: &str,
+    options: crate::OpenAiRequestOptions,
+    configured_instructions: Option<&str>,
+    conversation: &Conversation,
+    tools: &[ToolSpec],
+    continuation: &ResponsesContinuation,
+    route: ResponsesRoute<'_>,
+) -> Result<Value, OpenAiError> {
+    let input = build_input_for_endpoint(
+        model,
+        conversation,
+        continuation,
+        route.profile,
+        route.endpoint,
+    )?;
 
     let instructions = configured_instructions.or(conversation.system_prompt());
     let mut request = json!({
         "model": model,
         "input": input,
-        "tools": convert_tools(tools, profile),
+        "tools": convert_tools(tools, route.profile),
         "stream": true,
         "store": false,
         "include": ["reasoning.encrypted_content"]
@@ -337,12 +567,42 @@ fn build_request_with_profile(
     Ok(request)
 }
 
-fn validate_continuation(
+fn build_input_for_endpoint(
     model: &str,
     conversation: &Conversation,
     continuation: &ResponsesContinuation,
     profile: ResponsesRequestProfile,
+    endpoint: &str,
+) -> Result<Vec<Value>, OpenAiError> {
+    validate_continuation_for_endpoint(model, conversation, continuation, profile, endpoint)?;
+    validate_document_mime_types(conversation)?;
+    let mut input = continuation
+        .native_window
+        .as_ref()
+        .map_or_else(Vec::new, |window| window.output.clone());
+    let checkpoints: BTreeMap<usize, &ResponseCheckpoint> = continuation
+        .checkpoints
+        .iter()
+        .map(|checkpoint| (checkpoint.assistant_message_index, checkpoint))
+        .collect();
+    for (index, message) in conversation.messages().iter().enumerate() {
+        if let Some(checkpoint) = checkpoints.get(&index) {
+            input.extend(checkpoint.output.iter().cloned());
+        } else {
+            input.extend(convert_message_with_profile(message, profile));
+        }
+    }
+    Ok(input)
+}
+
+fn validate_continuation_for_endpoint(
+    model: &str,
+    conversation: &Conversation,
+    continuation: &ResponsesContinuation,
+    profile: ResponsesRequestProfile,
+    endpoint: &str,
 ) -> Result<(), OpenAiError> {
+    validate_continuation_provenance(model, endpoint, continuation, profile)?;
     let mut previous_index = None;
     for checkpoint in &continuation.checkpoints {
         if checkpoint.model != model {
@@ -373,6 +633,57 @@ fn validate_continuation(
         previous_index = Some(checkpoint.assistant_message_index);
     }
     Ok(())
+}
+
+fn validate_continuation_provenance(
+    model: &str,
+    endpoint: &str,
+    continuation: &ResponsesContinuation,
+    profile: ResponsesRequestProfile,
+) -> Result<(), OpenAiError> {
+    let mut previous_index = None;
+    for checkpoint in &continuation.checkpoints {
+        if checkpoint.model != model {
+            return Err(OpenAiError::Protocol(
+                "continuation belongs to a different model".into(),
+            ));
+        }
+        if checkpoint.profile != profile {
+            return Err(OpenAiError::Protocol(
+                "continuation belongs to a different Responses request profile".into(),
+            ));
+        }
+        if previous_index.is_some_and(|index| checkpoint.assistant_message_index <= index) {
+            return Err(OpenAiError::Protocol(
+                "continuation checkpoints are out of order".into(),
+            ));
+        }
+        validate_output_window(&checkpoint.output).map_err(|message| {
+            OpenAiError::Protocol(format!("invalid continuation output: {message}"))
+        })?;
+        previous_index = Some(checkpoint.assistant_message_index);
+    }
+    let Some(window) = &continuation.native_window else {
+        return Ok(());
+    };
+    if window.model != model {
+        return Err(OpenAiError::Protocol(
+            "native context window belongs to a different model".into(),
+        ));
+    }
+    if window.profile != profile {
+        return Err(OpenAiError::Protocol(
+            "native context window belongs to a different Responses request profile".into(),
+        ));
+    }
+    if !endpoint.is_empty() && window.endpoint != endpoint {
+        return Err(OpenAiError::Protocol(
+            "native context window belongs to a different Responses endpoint".into(),
+        ));
+    }
+    validate_native_compaction_output(&window.output).map_err(|message| {
+        OpenAiError::Protocol(format!("invalid native context window: {message}"))
+    })
 }
 
 fn convert_message_with_profile(message: &Message, profile: ResponsesRequestProfile) -> Vec<Value> {
@@ -561,6 +872,90 @@ fn convert_tools(tools: &[ToolSpec], profile: ResponsesRequestProfile) -> Vec<Va
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_ASSEMBLED_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT_ITEMS: usize = 512;
+const MAX_COMPACTION_INPUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_COMPACTION_RESPONSE_BYTES: usize = MAX_ASSEMBLED_OUTPUT_BYTES + MAX_ERROR_BODY_BYTES;
+
+fn validate_output_window(output: &[Value]) -> Result<(), String> {
+    if output.is_empty() {
+        return Err("output window is empty".into());
+    }
+    if output.len() > MAX_OUTPUT_ITEMS {
+        return Err("output window contains too many items".into());
+    }
+    let mut serialized_bytes = 0usize;
+    for item in output {
+        if !item.is_object() {
+            return Err("output window contains a non-object item".into());
+        }
+        let item_bytes = serde_json::to_vec(item)
+            .map_err(|_| "output window item could not be serialized".to_owned())?
+            .len();
+        serialized_bytes = serialized_bytes
+            .checked_add(item_bytes)
+            .filter(|bytes| *bytes <= MAX_ASSEMBLED_OUTPUT_BYTES)
+            .ok_or_else(|| "output window exceeds its size limit".to_owned())?;
+    }
+    Ok(())
+}
+
+fn validate_native_compaction_response(payload: &Value) -> Result<Vec<Value>, String> {
+    if payload.get("object").and_then(Value::as_str) != Some("response.compaction") {
+        return Err("native compaction response has an invalid object type".into());
+    }
+    let output = payload
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "native compaction response is missing output".to_owned())?;
+    validate_native_compaction_output(output)?;
+    Ok(output.clone())
+}
+
+fn validate_native_compaction_output(output: &[Value]) -> Result<(), String> {
+    validate_output_window(output)?;
+    let mut found_compaction = false;
+    for item in output {
+        if item.get("type").and_then(Value::as_str) != Some("compaction") {
+            continue;
+        }
+        found_compaction = true;
+        if item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err("compaction item is missing non-empty encrypted_content".into());
+        }
+    }
+    if !found_compaction {
+        return Err("output window is missing a compaction item".into());
+    }
+    Ok(())
+}
+
+fn is_native_compaction_unsupported(status: u16, code: Option<&str>) -> bool {
+    matches!(status, 404 | 405) || (status == 400 && code == Some("unsupported_operation"))
+}
+
+async fn read_bounded_body(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, OpenAiError> {
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let new_len = bytes
+            .len()
+            .checked_add(chunk.len())
+            .filter(|length| *length <= limit)
+            .ok_or_else(|| {
+                OpenAiError::Protocol("native compaction response exceeded its size limit".into())
+            })?;
+        bytes.reserve(new_len.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
 
 #[cfg(test)]
 fn process_sse_chunk(
@@ -949,6 +1344,337 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn native_context_window_rejects_too_many_items() {
+        let output = vec![json!({"role":"user"}); MAX_OUTPUT_ITEMS + 1];
+        assert!(validate_output_window(&output).is_err());
+    }
+
+    #[tokio::test]
+    async fn native_compaction_replays_the_complete_opaque_window_and_appends_new_input() {
+        let server = MockServer::start().await;
+        let compacted_output = json!([
+            {"type":"compaction", "encrypted_content":"opaque-compaction", "future":"kept"},
+            {"role":"user", "content":[{"type":"input_text", "text":"retained user item"}]}
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/v1/responses/compact"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object":"response.compaction",
+                "output": compacted_output,
+                "usage": {"input_tokens": 200, "output_tokens": 10, "total_tokens": 210}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(completed(json!([{
+                    "type":"message", "role":"assistant",
+                    "content":[{"type":"output_text", "text":"continued"}]
+                }]))),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let model = OptionsModel;
+        let provider = OpenAiResponsesProvider::<OptionsModel>::new(format!("{}/v1", server.uri()))
+            .with_native_compaction(true);
+        let mut original = Conversation::new().with_system_prompt("system");
+        original.push_user_message(UserMessage::new("old history"));
+        let compacted = provider
+            .compact_context(
+                &ResponsesContinuation::default(),
+                &model,
+                &original,
+                CompactOptions {
+                    keep_tail_tokens: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(compacted.conversation.is_empty());
+        assert_eq!(compacted.conversation.system_prompt(), Some("system"));
+        assert_eq!(compacted.usage.input_tokens, Some(200));
+        assert_eq!(
+            <OpenAiResponsesProvider<OptionsModel> as Provider>::estimate_continuation_tokens(
+                &compacted.continuation
+            ),
+            0
+        );
+        assert!(Provider::has_opaque_context(
+            &provider,
+            &compacted.continuation
+        ));
+        assert!(Provider::validate_context(&provider, &model, &compacted.continuation).is_ok());
+        assert!(!format!("{:?}", compacted.continuation).contains("opaque-compaction"));
+
+        let serialized = serde_json::to_value(&compacted.continuation).unwrap();
+        assert_eq!(
+            serialized["native_window"]["output"], compacted_output,
+            "the compact endpoint output must be retained without normalizing opaque fields"
+        );
+        let restored: ResponsesContinuation = serde_json::from_value(serialized).unwrap();
+        let mut next = compacted.conversation.clone();
+        next.push_user_message(UserMessage::new("new turn"));
+        let completion = provider
+            .complete(&restored, &model, &next, &[])
+            .await
+            .unwrap();
+        assert_eq!(completion.0.content(), "continued");
+
+        let requests = server.received_requests().await.unwrap();
+        let compact_request: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(compact_request["model"], "gpt-options");
+        assert_eq!(compact_request["instructions"], "system");
+        assert_eq!(compact_request["input"][0]["role"], "user");
+        assert_eq!(
+            compact_request["input"][0]["content"][0]["text"],
+            "old history"
+        );
+        assert!(compact_request.get("stream").is_none());
+        assert!(compact_request.get("store").is_none());
+        assert!(compact_request.get("reasoning").is_none());
+        assert!(compact_request.get("service_tier").is_none());
+
+        let continuation_request: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let request_input = continuation_request["input"].as_array().unwrap();
+        assert_eq!(&request_input[..2], compacted_output.as_array().unwrap());
+        assert_eq!(continuation_request["input"][2]["role"], "user");
+        assert_eq!(
+            continuation_request["input"][2]["content"][0]["text"],
+            "new turn"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn native_compaction_rejects_malformed_windows_and_only_marks_known_unsupported_routes() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses/compact"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object":"response.compaction",
+                "output": [null]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = OpenAiResponsesProvider::<TestModel>::new(format!("{}/v1", server.uri()))
+            .with_native_compaction(true);
+        let malformed = provider
+            .compact_context(
+                &ResponsesContinuation::default(),
+                &TestModel,
+                &Conversation::new(),
+                CompactOptions::default(),
+            )
+            .await;
+        assert!(matches!(malformed, Err(CompactError::Context(_))));
+
+        let unsupported = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses/compact"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": {"code":"not_found", "message":"route unavailable"}
+            })))
+            .expect(1)
+            .mount(&unsupported)
+            .await;
+        let unsupported_provider =
+            OpenAiResponsesProvider::<TestModel>::new(format!("{}/v1", unsupported.uri()))
+                .with_native_compaction(true);
+        let result = unsupported_provider
+            .compact_context(
+                &ResponsesContinuation::default(),
+                &TestModel,
+                &Conversation::new(),
+                CompactOptions::default(),
+            )
+            .await;
+        assert!(matches!(result, Err(CompactError::Unsupported(_))));
+
+        let denied = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses/compact"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"code":"invalid_api_key", "message":"unauthorized"}
+            })))
+            .expect(1)
+            .mount(&denied)
+            .await;
+        let denied_provider =
+            OpenAiResponsesProvider::<TestModel>::new(format!("{}/v1", denied.uri()))
+                .with_native_compaction(true);
+        let result = denied_provider
+            .compact_context(
+                &ResponsesContinuation::default(),
+                &TestModel,
+                &Conversation::new(),
+                CompactOptions::default(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(CompactError::Provider(OpenAiError::Api { status: 401, .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_compaction_rejects_noncanonical_success_before_replacing_context() {
+        let valid_item = json!({"type":"compaction", "encrypted_content":"opaque"});
+        let malformed_responses = [
+            (
+                "missing response.compaction envelope",
+                json!({"output":[valid_item.clone()]}),
+            ),
+            (
+                "ordinary message output",
+                json!({
+                    "object":"response.compaction",
+                    "output":[{
+                        "type":"message",
+                        "role":"assistant",
+                        "content":[{"type":"output_text", "text":"looks successful"}]
+                    }]
+                }),
+            ),
+            (
+                "empty encrypted content",
+                json!({
+                    "object":"response.compaction",
+                    "output":[{"type":"compaction", "encrypted_content":""}]
+                }),
+            ),
+            (
+                "malformed compaction item after a valid item",
+                json!({
+                    "object":"response.compaction",
+                    "output":[valid_item, {"type":"compaction", "encrypted_content":null}]
+                }),
+            ),
+        ];
+
+        let continuation = ResponsesContinuation::default();
+        let continuation_before = serde_json::to_value(&continuation).unwrap();
+        let mut conversation = Conversation::new().with_system_prompt("keep this system prompt");
+        conversation.push_user_message(UserMessage::new("keep this user message"));
+
+        for (case, payload) in malformed_responses {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/responses/compact"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(payload))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let provider =
+                OpenAiResponsesProvider::<TestModel>::new(format!("{}/v1", server.uri()))
+                    .with_native_compaction(true);
+            let result = provider
+                .compact_context(
+                    &continuation,
+                    &TestModel,
+                    &conversation,
+                    CompactOptions::default(),
+                )
+                .await;
+
+            assert!(
+                matches!(result, Err(CompactError::Context(_))),
+                "{case} should be rejected as invalid compaction"
+            );
+            assert_eq!(
+                serde_json::to_value(&continuation).unwrap(),
+                continuation_before,
+                "{case} must leave the original continuation intact"
+            );
+            assert_eq!(
+                conversation.system_prompt(),
+                Some("keep this system prompt")
+            );
+            assert_eq!(conversation.messages().len(), 1);
+            server.verify().await;
+        }
+    }
+
+    #[test]
+    fn restored_native_window_requires_a_nonempty_compaction_item() {
+        let provider = OpenAiResponsesProvider::<TestModel>::new("https://example.test/v1")
+            .with_native_compaction(true);
+        let continuation = ResponsesContinuation {
+            checkpoints: Vec::new(),
+            native_window: Some(NativeContextWindow {
+                model: "gpt-test".into(),
+                profile: ResponsesRequestProfile::OpenAiCompatible,
+                endpoint: "https://example.test/v1/responses".into(),
+                output: vec![json!({"type":"message", "content":[]})],
+            }),
+        };
+
+        assert!(Provider::validate_context(&provider, &TestModel, &continuation).is_err());
+    }
+
+    #[tokio::test]
+    async fn native_window_provenance_rejects_model_profile_and_endpoint_changes() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses/compact"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object":"response.compaction",
+                "output": [{"type":"compaction", "encrypted_content":"opaque"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = OpenAiResponsesProvider::<TestModel>::new(format!("{}/v1", server.uri()))
+            .with_native_compaction(true);
+        let compacted = provider
+            .compact_context(
+                &ResponsesContinuation::default(),
+                &TestModel,
+                &Conversation::new(),
+                CompactOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let other_endpoint = OpenAiResponsesProvider::<TestModel>::new("https://example.test/v1")
+            .with_native_compaction(true);
+        assert!(
+            Provider::validate_context(&other_endpoint, &TestModel, &compacted.continuation)
+                .is_err()
+        );
+
+        let other_profile =
+            OpenAiResponsesProvider::<TestModel>::new(format!("{}/v1", server.uri()))
+                .with_profile(ResponsesRequestProfile::ChatGptPlan)
+                .with_native_compaction(true);
+        assert!(
+            Provider::validate_context(&other_profile, &TestModel, &compacted.continuation)
+                .is_err()
+        );
+
+        struct OtherModel;
+        impl OpenAiModel for OtherModel {
+            fn id(&self) -> &str {
+                "other-model"
+            }
+            fn supports_vision(&self) -> bool {
+                false
+            }
+        }
+        let other_model_provider =
+            OpenAiResponsesProvider::<OtherModel>::new(format!("{}/v1", server.uri()));
+        assert!(
+            Provider::validate_context(&other_model_provider, &OtherModel, &compacted.continuation)
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn streams_and_replays_opaque_output_with_fresh_credentials() {
         let server = MockServer::start().await;
@@ -1089,6 +1815,7 @@ mod tests {
                 assistant: assistant.clone(),
                 output,
             }],
+            native_window: None,
         };
 
         assert_eq!(assistant.content(), "working");
@@ -1158,6 +1885,7 @@ mod tests {
                     assistant: assistant.clone(),
                     output: output.clone(),
                 }],
+                native_window: None,
             };
             let serialized = serde_json::to_value(&continuation).unwrap();
             let restored: ResponsesContinuation = serde_json::from_value(serialized).unwrap();
@@ -1299,6 +2027,7 @@ mod tests {
                     json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}),
                 ],
             }],
+            native_window: None,
         };
         let mut conversation = Conversation::new().with_system_prompt("system");
         conversation.push_user_message(UserMessage::new("question"));
@@ -1348,8 +2077,35 @@ mod tests {
                 assistant: AssistantMessage::new(""),
                 output: vec![json!({"type":"reasoning", "encrypted_content":"top-secret"})],
             }],
+            native_window: None,
         };
         assert!(!format!("{continuation:?}").contains("top-secret"));
+    }
+
+    #[test]
+    fn continuation_estimate_counts_readable_reasoning_summary_not_encrypted_bytes() {
+        let summary = "readable reasoning summary";
+        let continuation = ResponsesContinuation {
+            checkpoints: vec![ResponseCheckpoint {
+                model: "gpt-test".into(),
+                profile: ResponsesRequestProfile::OpenAiCompatible,
+                assistant_message_index: 0,
+                assistant: AssistantMessage::new(""),
+                output: vec![json!({
+                    "type":"reasoning",
+                    "encrypted_content":"opaque".repeat(16_384),
+                    "summary":[{"type":"summary_text", "text":summary}]
+                })],
+            }],
+            native_window: None,
+        };
+
+        assert_eq!(
+            <OpenAiResponsesProvider<TestModel> as Provider>::estimate_continuation_tokens(
+                &continuation
+            ),
+            summary.len().div_ceil(4) as u64
+        );
     }
 
     #[test]
@@ -1407,6 +2163,7 @@ mod tests {
         };
         let continuation = ResponsesContinuation {
             checkpoints: vec![checkpoint],
+            native_window: None,
         };
         let mut conversation = Conversation::new();
         conversation.push_user_message(UserMessage::new("question"));

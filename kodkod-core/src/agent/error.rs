@@ -4,6 +4,7 @@ use std::fmt;
 #[derive(Debug)]
 pub enum AgentError<E> {
     Provider(E),
+    ContextMaintenance(String),
     /// A provider stream ended without its authoritative completion event.
     ProviderStreamEnded,
     MaxToolRoundsExceeded {
@@ -26,6 +27,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Provider(error) => write!(f, "provider failed: {error}"),
+            Self::ContextMaintenance(message) => write!(f, "context maintenance failed: {message}"),
             Self::ProviderStreamEnded => {
                 write!(f, "provider stream ended before completing the response")
             }
@@ -51,7 +53,8 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Provider(error) => Some(error),
-            Self::ProviderStreamEnded
+            Self::ContextMaintenance(_)
+            | Self::ProviderStreamEnded
             | Self::MaxToolRoundsExceeded { .. }
             | Self::UnsupportedDocument { .. }
             | Self::Cancelled

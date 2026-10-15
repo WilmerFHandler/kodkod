@@ -34,6 +34,22 @@ pub enum OpenAiError {
     Protocol(String),
 }
 
+impl OpenAiError {
+    pub(crate) fn is_context_overflow(&self) -> bool {
+        match self {
+            Self::Api {
+                status: 400,
+                code: Some(code),
+                ..
+            }
+            | Self::ResponseFailed {
+                code: Some(code), ..
+            } => code == "context_length_exceeded",
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for OpenAiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -167,6 +183,41 @@ mod tests {
     #[test]
     fn non_retryable_parse_errors() {
         assert!(!OpenAiError::EmptyResponse.is_retryable());
+    }
+
+    #[test]
+    fn context_recovery_requires_the_context_length_error_code() {
+        assert!(
+            OpenAiError::Api {
+                status: 400,
+                code: Some("context_length_exceeded".into()),
+                message: "input exceeded the model context".into(),
+            }
+            .is_context_overflow()
+        );
+        assert!(
+            OpenAiError::ResponseFailed {
+                code: Some("context_length_exceeded".into()),
+                message: "input exceeded the model context".into(),
+            }
+            .is_context_overflow()
+        );
+        assert!(
+            !OpenAiError::Api {
+                status: 400,
+                code: Some("invalid_api_key".into()),
+                message: "unauthorized".into(),
+            }
+            .is_context_overflow()
+        );
+        assert!(
+            !OpenAiError::Api {
+                status: 413,
+                code: Some("context_length_exceeded".into()),
+                message: "too large".into(),
+            }
+            .is_context_overflow()
+        );
     }
 
     #[test]

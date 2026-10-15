@@ -36,6 +36,8 @@ impl Default for CompactOptions {
 #[derive(Debug, PartialEq, Eq)]
 pub enum CompactError<E> {
     NothingToCompact,
+    Unsupported(String),
+    Context(String),
     EmptySummary,
     MissingSummary,
     Provider(E),
@@ -51,6 +53,7 @@ pub struct CompactionResult {
 impl<E: fmt::Display> fmt::Display for CompactError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Unsupported(message) | Self::Context(message) => f.write_str(message),
             Self::NothingToCompact => f.write_str("conversation has nothing to compact"),
             Self::EmptySummary => f.write_str("compaction model returned an empty summary"),
             Self::MissingSummary => f.write_str("compaction model did not call summarize"),
@@ -63,7 +66,11 @@ impl<E: StdError + 'static> StdError for CompactError<E> {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Provider(error) => Some(error),
-            Self::NothingToCompact | Self::EmptySummary | Self::MissingSummary => None,
+            Self::NothingToCompact
+            | Self::EmptySummary
+            | Self::MissingSummary
+            | Self::Unsupported(_)
+            | Self::Context(_) => None,
         }
     }
 }
@@ -80,15 +87,97 @@ pub(crate) async fn run_with_usage<P: Provider + ?Sized>(
         conversation,
         tail_starts_at(&kept, conversation.messages().len()),
     );
-    let completion = provider
-        .complete_once_with_usage(model, &request, &[summarize_tool()])
-        .await
-        .map_err(CompactError::Provider)?;
-    let summary = summary_from_reply(&completion.message)?;
+    let tools = [summarize_tool()];
+    let budget = provider.context_budget(model).map(|b| b.max_input_tokens);
+    let (summary, usage) = if budget.is_some_and(|limit| request.estimate_tokens(&tools) >= limit) {
+        summarize_bounded(
+            provider,
+            model,
+            &conversation.messages()[..tail_starts_at(&kept, conversation.messages().len())],
+            budget.unwrap(),
+            &tools,
+        )
+        .await?
+    } else {
+        let completion = provider
+            .complete_once_with_usage(model, &request, &tools)
+            .await
+            .map_err(CompactError::Provider)?;
+        (summary_from_reply(&completion.message)?, completion.usage)
+    };
     Ok(CompactionResult {
         conversation: splice(conversation, &kept, AssistantMessage::new(summary)),
-        usage: completion.usage,
+        usage,
     })
+}
+
+/// Rebase long transcripts without silently dropping old exchanges. Tool batches stay
+/// together; a single unsplittable oversized item produces an actionable error.
+async fn summarize_bounded<P: Provider + ?Sized>(
+    provider: &P,
+    model: &P::Model,
+    messages: &[Message],
+    budget: u64,
+    tools: &[ToolSpec],
+) -> Result<(String, TokenUsage), CompactError<P::Error>> {
+    let mut boundaries = Vec::new();
+    let mut pending = HashSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        match message {
+            Message::Assistant(a) => {
+                for call in a.tool_calls() {
+                    pending.insert(call.id().to_owned());
+                }
+            }
+            Message::ToolResult(r) => {
+                pending.remove(r.tool_call_id());
+            }
+            _ => {}
+        }
+        if pending.is_empty() {
+            boundaries.push(index + 1);
+        }
+    }
+    let mut costs = vec![0_u64];
+    for message in messages {
+        costs.push(
+            costs
+                .last()
+                .unwrap()
+                .saturating_add(message.estimate_tokens()),
+        );
+    }
+    let mut start = 0;
+    let mut summary = String::new();
+    let mut usage = TokenUsage::zero();
+    while start < messages.len() {
+        let mut request = Conversation::new().with_system_prompt(COMPACTION_SYSTEM.trim());
+        if !summary.is_empty() {
+            request.push_message(Message::Assistant(AssistantMessage::new(&summary)));
+        }
+        request.push_user_message(UserMessage::new(COMPACTION_USER));
+        let overhead = request.estimate_tokens(tools);
+        let end=boundaries.iter().copied().skip_while(|end|*end<=start).take_while(|end|overhead.saturating_add(costs[*end].saturating_sub(costs[start]))<budget).last().ok_or_else(||CompactError::Context("A single retained exchange exceeds the compaction budget; reduce its attachments or tool output before retrying".into()))?;
+        let mut request = Conversation::new().with_system_prompt(COMPACTION_SYSTEM.trim());
+        if !summary.is_empty() {
+            request.push_message(Message::Assistant(AssistantMessage::new(&summary)));
+        }
+        for message in &messages[start..end] {
+            request.push_message(message.clone());
+        }
+        request.push_user_message(UserMessage::new(COMPACTION_USER));
+        let completion = provider
+            .complete_once_with_usage(model, &request, tools)
+            .await
+            .map_err(CompactError::Provider)?;
+        summary = summary_from_reply(&completion.message)?;
+        usage.add_round(completion.usage);
+        start = end;
+    }
+    if summary.is_empty() {
+        return Err(CompactError::EmptySummary);
+    }
+    Ok((summary, usage))
 }
 
 fn plan(messages: &[Message], keep_tail_tokens: u64) -> Option<Vec<usize>> {

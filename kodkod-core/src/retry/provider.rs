@@ -61,6 +61,34 @@ where
         self.inner.supports_computer_use(model)
     }
 
+    fn estimate_continuation_tokens(c: &Self::Continuation) -> u64 {
+        P::estimate_continuation_tokens(c)
+    }
+    fn context_budget(&self, m: &Self::Model) -> Option<crate::ContextBudget> {
+        self.inner.context_budget(m)
+    }
+    fn validate_context(&self, m: &Self::Model, c: &Self::Continuation) -> Result<(), String> {
+        self.inner.validate_context(m, c)
+    }
+    fn has_opaque_context(&self, c: &Self::Continuation) -> bool {
+        self.inner.has_opaque_context(c)
+    }
+    fn is_context_overflow(&self, e: &Self::Error) -> bool {
+        self.inner.is_context_overflow(e)
+    }
+    async fn compact_context(
+        &self,
+        c: &Self::Continuation,
+        m: &Self::Model,
+        conversation: &Conversation,
+        options: crate::CompactOptions,
+    ) -> Result<crate::ContextCompaction<Self::Continuation>, crate::CompactError<Self::Error>>
+    {
+        self.inner
+            .compact_context(c, m, conversation, options)
+            .await
+    }
+
     async fn complete(
         &self,
         continuation: &Self::Continuation,

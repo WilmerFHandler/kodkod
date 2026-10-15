@@ -132,3 +132,55 @@ tail.
 ## License
 
 MIT
+
+## Automatic compaction and durable context
+
+For a long-running agent, use `context_from_history` and `run_turn_context` rather
+than the fresh-context `run_turn` convenience API. `AgentContext` owns active
+messages and their matching provider state; `Conversation` remains portable data.
+
+```rust,ignore
+let mut active = agent.context_from_history(&model, "provider/model/account", &history);
+let mut updates = agent.run_turn_context(
+    &mut active, &model, user, &control, Some(CompactionPolicy::default()),
+);
+while let Some(update) = updates.next().await {
+    let update = update?;
+    // Append semantic user/assistant/tool events to your original transcript.
+    // Save that transcript and update.checkpoint atomically BEFORE polling again.
+    persist(update)?;
+}
+```
+
+The host supplies a stable, non-secret binding for the selected provider, model,
+endpoint and account. A checkpoint carries a versioned hash cursor into the
+original transcript. `restore_context` verifies that prefix, accepts an appended
+suffix, and validates provider compatibility; edited or incompatible history
+requires an explicit rebase from the original transcript. Exporting a checkpoint
+requires only that the provider's continuation support Serde. Provider state must
+never contain login credentials. The old split `run_turn_in` API remains usable,
+but marks its context ineligible for canonical execution or checkpoint export;
+rebase with `context_from_history` when migrating it.
+
+`CompactionPolicy` uses the provider's effective input budget unless explicitly
+overridden. Unknown limits do not invent a context window. The core checks before
+model requests, after completed tool batches, and on explicit compact requests.
+It preserves recent input and tool-call/result pairing, picks up steering arriving
+during compaction, and permits one recovery after a typed context-overflow error.
+A failed/cancelled replacement never replaces accepted context. A reduction that
+still cannot fit fails instead of issuing repeated requests or deleting history.
+Large portable transcripts are summarized in bounded, protocol-safe chunks;
+single oversized exchanges need an explicit reduction by the caller.
+
+Providers implement `compact_context` to return replacement messages, authoritative
+provider state, and usage together. The default is a portable summary. Adapters
+with opaque history must override it, and must never summarize only the visible
+messages while silently discarding their hidden state. Explicitly unsupported
+native compaction can fall back to the portable path only while the full source
+is available. Authorization, quota and network failures do not trigger that fallback.
+The same maintenance operation serves manual and automatic compaction.
+
+A pull-stream checkpoint is a persistence boundary, not an exactly-once tool
+executor. Persist tool intent before dispatch. A crash after dispatch and before a
+result leaves an uncertain outcome; reconcile it or use explicit tool idempotency,
+never replay the tool merely because its receipt is missing.

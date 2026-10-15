@@ -1,8 +1,9 @@
 use super::*;
 use futures_util::StreamExt;
 use kodkod_core::{
-    Conversation, Document, Message, Provider, ProviderEvent, RetryPolicy, RetryProvider,
-    Retryable, SystemMessage, TokenUsage, ToolOutput, ToolResult, ToolSpec, UserMessage,
+    CompactOptions, ContextBudget, Conversation, Document, Message, Provider, ProviderEvent,
+    RetryPolicy, RetryProvider, Retryable, SystemMessage, TokenUsage, ToolOutput, ToolResult,
+    ToolSpec, UserMessage,
 };
 use kodkod_http::{RequestCredentials, StaticCredentials};
 use kodkod_openai::{OpenAiError, OpenAiResponsesProvider};
@@ -29,6 +30,12 @@ impl kodkod_openai::OpenAiModel for TestCodexModel {
 
     fn supports_vision(&self) -> bool {
         true
+    }
+
+    fn context_budget(&self) -> Option<ContextBudget> {
+        Some(ContextBudget {
+            max_input_tokens: 32_000,
+        })
     }
 }
 
@@ -204,6 +211,53 @@ async fn chatgpt_uses_stateless_namespaced_functions_and_replays_raw_output() {
     assert_eq!(second_body["input"][3], raw_call);
     assert_eq!(second_body["input"][4]["type"], "function_call_output");
     assert_eq!(second_body["input"][4]["call_id"], "call_1");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn chatgpt_forwards_native_compaction_and_model_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses/compact"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object":"response.compaction",
+            "output": [{"type":"compaction", "encrypted_content":"opaque-window"}],
+            "usage": {"input_tokens": 99, "output_tokens": 2, "total_tokens": 101}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = chatgpt_provider::<TestCodexModel>().with_test_endpoint(server.uri());
+    let model = TestCodexModel;
+    assert_eq!(
+        provider.context_budget(&model),
+        Some(ContextBudget {
+            max_input_tokens: 32_000,
+        })
+    );
+    let mut conversation = Conversation::new().with_system_prompt("Follow the plan.");
+    conversation.push_user_message(UserMessage::new("remember this"));
+    let compacted = provider
+        .compact_context(
+            &provider.create_continuation(&model),
+            &model,
+            &conversation,
+            CompactOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(Provider::has_opaque_context(
+        &provider,
+        &compacted.continuation
+    ));
+    assert!(Provider::validate_context(&provider, &model, &compacted.continuation).is_ok());
+    assert_eq!(compacted.usage.input_tokens, Some(99));
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["instructions"], "Follow the plan.");
+    assert_eq!(body["input"][0]["role"], "user");
     server.verify().await;
 }
 

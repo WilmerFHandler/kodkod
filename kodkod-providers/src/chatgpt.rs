@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use kodkod_core::{
-    AssistantMessage, Conversation, Provider, ProviderCompletion, ProviderEvent, ProviderStream,
-    ToolSpec,
+    AssistantMessage, CompactError, CompactOptions, ContextBudget, ContextCompaction, Conversation,
+    Provider, ProviderCompletion, ProviderEvent, ProviderStream, ToolSpec,
 };
 use kodkod_http::CredentialSource;
 use kodkod_openai::{
@@ -49,6 +49,7 @@ impl<M> ChatGptProvider<M> {
             .with_credentials(self.source.clone())
             .with_client(self.client.clone())
             .with_profile(ResponsesRequestProfile::ChatGptPlan)
+            .with_native_compaction(true)
     }
 
     #[cfg(test)]
@@ -72,6 +73,22 @@ where
 
     fn supports_document(&self, model: &M, mime: &str) -> bool {
         self.inner().supports_document(model, mime)
+    }
+
+    fn context_budget(&self, model: &M) -> Option<ContextBudget> {
+        self.inner().context_budget(model)
+    }
+
+    fn has_opaque_context(&self, continuation: &Self::Continuation) -> bool {
+        self.inner().has_opaque_context(continuation)
+    }
+
+    fn validate_context(&self, model: &M, continuation: &Self::Continuation) -> Result<(), String> {
+        self.inner().validate_context(model, continuation)
+    }
+
+    fn is_context_overflow(&self, error: &Self::Error) -> bool {
+        self.inner().is_context_overflow(error)
     }
 
     fn create_continuation(&self, _model: &M) -> Self::Continuation {
@@ -103,6 +120,18 @@ where
     ) -> Result<ProviderCompletion<Self::Continuation>, Self::Error> {
         self.inner()
             .complete_with_usage(continuation, model, conversation, tools)
+            .await
+    }
+
+    async fn compact_context(
+        &self,
+        continuation: &Self::Continuation,
+        model: &M,
+        conversation: &Conversation,
+        options: CompactOptions,
+    ) -> Result<ContextCompaction<Self::Continuation>, CompactError<Self::Error>> {
+        self.inner()
+            .compact_context(continuation, model, conversation, options)
             .await
     }
 

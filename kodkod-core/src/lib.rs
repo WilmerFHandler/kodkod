@@ -14,12 +14,17 @@ pub mod tool;
 pub mod turns;
 
 mod compact;
+mod context;
 mod estimate;
 mod usage;
 
-pub use agent::{Agent, AgentContext, AgentError, AgentEvent, SteerError, Task, TaskControl};
+pub use agent::{Agent, AgentError, AgentEvent, SteerError, Task, TaskControl};
 pub use compact::{
     CompactError, CompactOptions, CompactionResult, DEFAULT_KEEP_TAIL_TOKENS, TurnCompaction,
+};
+pub use context::{
+    AgentContext, AgentUpdate, CompactionPolicy, ContextBudget, ContextCheckpoint,
+    ContextCompaction, ContextCursor, ContextMeasurement, ContextTask,
 };
 pub use conversation::Conversation;
 pub use message::{

@@ -21,8 +21,8 @@ pub use event::AgentEvent;
 pub type Task<'a, E> = futures::stream::BoxStream<'a, Result<AgentEvent, AgentError<E>>>;
 
 use crate::{
-    CompactError, ContextEstimate, Conversation, Message, Provider, ProviderCompletion,
-    ProviderEvent, TokenUsage, Tool, ToolExecutor, ToolSpec, TurnCompaction, UserMessage,
+    CompactError, Conversation, Message, Provider, ProviderCompletion, ProviderEvent, TokenUsage,
+    Tool, ToolExecutor, TurnCompaction, UserMessage,
 };
 
 async fn cancel_or<T>(control: &TaskControl, operation: impl Future<Output = T>) -> Option<T> {
@@ -45,56 +45,115 @@ pub struct Agent<P> {
     immediate_steering: bool,
 }
 
-/// Opaque provider continuation retained by an application across agent turns.
-///
-/// Create one with [`Agent::new_context`] and pass it to [`Agent::run_turn_in`].
-/// Its checkpoint advances only when the corresponding assistant message is
-/// accepted into the conversation.
-pub struct AgentContext<P: Provider> {
-    continuation: P::Continuation,
-}
-
-impl<P: Provider> AgentContext<P> {
-    /// Conservatively estimate provider-private tokens replayed on the next request.
-    pub fn estimated_continuation_tokens(&self) -> u64 {
-        P::estimate_continuation_tokens(&self.continuation)
-    }
-
-    /// Estimate the next request context, including provider-private replay.
-    /// The result is a bounded heuristic and must not be treated as provider
-    /// reported usage.
-    pub fn estimated_current_context(
-        &self,
-        conversation: &Conversation,
-        tools: &[ToolSpec],
-    ) -> ContextEstimate {
-        ContextEstimate::heuristic(
-            conversation
-                .estimate_tokens(tools)
-                .saturating_add(self.estimated_continuation_tokens()),
-        )
-    }
-}
+pub use crate::context::AgentContext;
+use crate::{
+    AgentUpdate, CompactionPolicy, ContextCheckpoint, ContextCompaction, ContextCursor,
+    ContextMeasurement, ContextTask,
+};
 
 enum ContextSlot<'a, P: Provider> {
-    Owned(AgentContext<P>),
-    Borrowed(&'a mut AgentContext<P>),
+    Owned(Arc<P::Continuation>),
+    Borrowed(&'a mut Arc<P::Continuation>),
 }
-
 impl<P: Provider> ContextSlot<'_, P> {
     fn continuation(&self) -> &P::Continuation {
         match self {
-            Self::Owned(context) => &context.continuation,
-            Self::Borrowed(context) => &context.continuation,
+            Self::Owned(c) => c,
+            Self::Borrowed(c) => c,
         }
     }
-
+    fn shared(&self) -> Arc<P::Continuation> {
+        match self {
+            Self::Owned(c) => c.clone(),
+            Self::Borrowed(c) => (*c).clone(),
+        }
+    }
     fn checkpoint(&mut self, continuation: P::Continuation) {
         match self {
-            Self::Owned(context) => context.continuation = continuation,
-            Self::Borrowed(context) => context.continuation = continuation,
+            Self::Owned(c) => *c = Arc::new(continuation),
+            Self::Borrowed(c) => **c = Arc::new(continuation),
         }
     }
+}
+struct ContextTracker<'a> {
+    cursor: &'a mut ContextCursor,
+    binding: &'a str,
+    measurement: &'a mut Option<ContextMeasurement>,
+}
+fn update<P: Provider>(
+    event: AgentEvent,
+    conversation: &Conversation,
+    context: Option<&ContextSlot<'_, P>>,
+    tracker: &Option<ContextTracker<'_>>,
+) -> AgentUpdate<P::Continuation> {
+    let accepted = matches!(
+        &event,
+        AgentEvent::Steered(_)
+            | AgentEvent::AssistantReply(..)
+            | AgentEvent::ToolFinished(_)
+            | AgentEvent::Compacted(_)
+    );
+    let checkpoint = if accepted {
+        tracker
+            .as_ref()
+            .zip(context)
+            .map(|(t, c)| ContextCheckpoint {
+                version: 1,
+                binding: t.binding.to_owned(),
+                cursor: t.cursor.clone(),
+                conversation: conversation.clone(),
+                continuation: c.shared(),
+                measurement: *t.measurement,
+            })
+    } else {
+        None
+    };
+    AgentUpdate { event, checkpoint }
+}
+fn legacy<'a, C: Send + 'a, E: 'a>(task: ContextTask<'a, C, E>) -> Task<'a, E> {
+    Box::pin(task.map(|result| result.map(|update| update.event)))
+}
+
+async fn maintain<P: Provider>(
+    provider: &P,
+    c: &P::Continuation,
+    m: &P::Model,
+    conversation: &Conversation,
+    options: crate::CompactOptions,
+) -> Result<ContextCompaction<P::Continuation>, CompactError<P::Error>> {
+    match provider.compact_context(c, m, conversation, options).await {
+        Err(CompactError::Unsupported(_)) if !provider.has_opaque_context(c) => {
+            let portable = provider
+                .compact_with_usage(m, conversation, options)
+                .await?;
+            Ok(ContextCompaction {
+                conversation: portable.conversation,
+                continuation: provider.create_continuation(m),
+                usage: portable.usage,
+            })
+        }
+        Err(CompactError::Provider(error))
+            if provider.is_context_overflow(&error) && !provider.has_opaque_context(c) =>
+        {
+            let portable = provider
+                .compact_with_usage(m, conversation, options)
+                .await?;
+            Ok(ContextCompaction {
+                conversation: portable.conversation,
+                continuation: provider.create_continuation(m),
+                usage: portable.usage,
+            })
+        }
+        result => result,
+    }
+}
+
+struct RunState<'a, P: Provider> {
+    context: ContextSlot<'a, P>,
+    compaction: Option<TurnCompaction<&'a P::Model>>,
+    guard: TurnGuard<'a>,
+    tracker: Option<ContextTracker<'a>>,
+    policy: Option<CompactionPolicy>,
 }
 
 struct TurnGuard<'a> {
@@ -151,7 +210,12 @@ where
     /// Create a fresh context which can retain provider continuation across turns.
     pub fn new_context(&self, model: &P::Model) -> AgentContext<P> {
         AgentContext {
-            continuation: self.provider.create_continuation(model),
+            continuation: Arc::new(self.provider.create_continuation(model)),
+            conversation: Conversation::new(),
+            cursor: ContextCursor::default(),
+            binding: String::new(),
+            measurement: None,
+            managed: true,
         }
     }
 
@@ -169,15 +233,19 @@ where
             }));
         }
         conversation.push_message(Message::User(user.with_steered(false)));
-        let context = ContextSlot::Owned(self.new_context(model));
-        self.run_opened(
+        let context = ContextSlot::Owned(Arc::new(self.provider.create_continuation(model)));
+        legacy(self.run_opened(
             conversation,
             model,
             control,
-            context,
-            None,
-            TurnGuard { control },
-        )
+            RunState {
+                context,
+                compaction: None,
+                guard: TurnGuard { control },
+                tracker: None,
+                policy: None,
+            },
+        ))
     }
 
     /// Run one logical user turn in a retained provider context.
@@ -195,15 +263,20 @@ where
                 Err(AgentError::ControlAlreadyUsed)
             }));
         }
+        context.managed = false;
         conversation.push_message(Message::User(user.with_steered(false)));
-        self.run_opened(
+        legacy(self.run_opened(
             conversation,
             model,
             control,
-            ContextSlot::Borrowed(context),
-            compaction,
-            TurnGuard { control },
-        )
+            RunState {
+                context: ContextSlot::Borrowed(&mut context.continuation),
+                compaction,
+                guard: TurnGuard { control },
+                tracker: None,
+                policy: None,
+            },
+        ))
     }
 
     /// Compatibility entry point. Uses a fresh continuation without appending a prompt.
@@ -219,15 +292,159 @@ where
                 Err(AgentError::ControlAlreadyUsed)
             }));
         }
-        let context = ContextSlot::Owned(self.new_context(model));
-        self.run_opened(
+        let context = ContextSlot::Owned(Arc::new(self.provider.create_continuation(model)));
+        legacy(self.run_opened(
             conversation,
             model,
             control,
-            context,
-            None,
-            TurnGuard { control },
+            RunState {
+                context,
+                compaction: None,
+                guard: TurnGuard { control },
+                tracker: None,
+                policy: None,
+            },
+        ))
+    }
+
+    /// Seed active context from a complete transcript. `binding` is a stable, non-secret
+    /// provider/model/account identity supplied by the host, never an access token.
+    pub fn context_from_history(
+        &self,
+        model: &P::Model,
+        binding: impl Into<String>,
+        history: &Conversation,
+    ) -> AgentContext<P> {
+        AgentContext {
+            conversation: history.clone(),
+            continuation: Arc::new(self.provider.create_continuation(model)),
+            cursor: ContextCursor::for_history(history),
+            binding: binding.into(),
+            measurement: None,
+            managed: true,
+        }
+    }
+
+    /// Restore only against the exact source transcript. Edits and incompatible accounts
+    /// require an explicit rebase from complete history, never silently dropped native state.
+    pub fn restore_context(
+        &self,
+        model: &P::Model,
+        binding: &str,
+        history: &Conversation,
+        checkpoint: ContextCheckpoint<P::Continuation>,
+    ) -> Result<AgentContext<P>, String> {
+        if checkpoint.version != 1
+            || checkpoint.binding != binding
+            || checkpoint.cursor.position > history.messages().len()
+        {
+            return Err(
+                "Context checkpoint does not match its transcript or provider binding".into(),
+            );
+        }
+        let mut prefix = Conversation::new();
+        for message in &history.messages()[..checkpoint.cursor.position] {
+            prefix.push_message(message.clone());
+        }
+        if checkpoint.cursor != ContextCursor::for_history(&prefix) {
+            return Err("Context checkpoint source history was edited".into());
+        }
+        self.provider
+            .validate_context(model, &checkpoint.continuation)?;
+        let mut active = AgentContext {
+            conversation: checkpoint.conversation,
+            continuation: checkpoint.continuation,
+            cursor: checkpoint.cursor,
+            binding: checkpoint.binding,
+            measurement: checkpoint.measurement,
+            managed: true,
+        };
+        for message in &history.messages()[active.cursor.position..] {
+            active.cursor.append(message);
+            active.conversation.push_message(message.clone());
+        }
+        active.set_system_prompt(history.system_prompt());
+        Ok(active)
+    }
+
+    /// Canonical persistent loop. Persist each checkpoint together with its semantic
+    /// transcript event before polling again; this also fences tool dispatch on save errors.
+    pub fn run_turn_context<'a>(
+        &'a self,
+        context: &'a mut AgentContext<P>,
+        model: &'a P::Model,
+        user: UserMessage,
+        control: &'a TaskControl,
+        policy: Option<CompactionPolicy>,
+    ) -> ContextTask<'a, P::Continuation, P::Error> {
+        if !context.managed {
+            return Box::pin(futures::stream::once(async {
+                Err(AgentError::ContextMaintenance(
+                    "Legacy split context must be explicitly rebased before canonical execution"
+                        .into(),
+                ))
+            }));
+        }
+        if let Err(message) = self.provider.validate_context(model, &context.continuation) {
+            return Box::pin(futures::stream::once(async move {
+                Err(AgentError::ContextMaintenance(message))
+            }));
+        }
+        if control.open().is_err() {
+            return Box::pin(futures::stream::once(async {
+                Err(AgentError::ControlAlreadyUsed)
+            }));
+        }
+        let message = Message::User(user.with_steered(false));
+        context.cursor.append(&message);
+        context.conversation.push_message(message);
+        let tracker = ContextTracker {
+            cursor: &mut context.cursor,
+            binding: &context.binding,
+            measurement: &mut context.measurement,
+        };
+        self.run_opened(
+            &mut context.conversation,
+            model,
+            control,
+            RunState {
+                context: ContextSlot::Borrowed(&mut context.continuation),
+                compaction: None,
+                guard: TurnGuard { control },
+                tracker: Some(tracker),
+                policy,
+            },
         )
+    }
+
+    /// Manual maintenance uses the same contextual provider operation as automatic maintenance.
+    /// No mutation occurs until the replacement has been returned successfully.
+    pub async fn compact_context(
+        &self,
+        context: &mut AgentContext<P>,
+        model: &P::Model,
+        options: crate::CompactOptions,
+    ) -> Result<TokenUsage, CompactError<P::Error>> {
+        if !context.managed {
+            return Err(CompactError::Context(
+                "Legacy split context must be explicitly rebased before compaction".into(),
+            ));
+        }
+        self.provider
+            .validate_context(model, &context.continuation)
+            .map_err(CompactError::Context)?;
+        let replacement = maintain(
+            &self.provider,
+            &context.continuation,
+            model,
+            &context.conversation,
+            options,
+        )
+        .await?;
+        context.conversation = replacement.conversation;
+        context.continuation = Arc::new(replacement.continuation);
+        context.measurement = None;
+        Ok(replacement.usage)
     }
 
     fn run_opened<'a>(
@@ -235,10 +452,15 @@ where
         conversation: &'a mut Conversation,
         model: &'a P::Model,
         control: &'a TaskControl,
-        context: ContextSlot<'a, P>,
-        compaction: Option<TurnCompaction<&'a P::Model>>,
-        guard: TurnGuard<'a>,
-    ) -> Task<'a, P::Error> {
+        state: RunState<'a, P>,
+    ) -> ContextTask<'a, P::Continuation, P::Error> {
+        let RunState {
+            context,
+            compaction,
+            guard,
+            mut tracker,
+            policy,
+        } = state;
         Box::pin(try_stream! {
             // Keep these options so terminal paths release retained state and
             // close steering before yielding Completed.
@@ -246,16 +468,144 @@ where
             let mut guard = Some(guard);
             let vision_enabled = self.provider.supports_vision(model);
             let computer_use_enabled = self.provider.supports_computer_use(model);
-            let tool_specs = self.tools.specs_for_capabilities(vision_enabled, computer_use_enabled);
+            let tool_specs = self
+                .tools
+                .specs_for_capabilities(vision_enabled, computer_use_enabled);
             let mut tool_rounds_executed = 0;
             let mut turn_usage = TokenUsage::zero();
+            let mut force_compaction = false;
+            let mut overflow_recovered = false;
 
             'rounds: loop {
-                let steers = control.drain_pending_steers_unless_cancelled()
+                let steers = control
+                    .drain_pending_steers_unless_cancelled()
                     .ok_or(AgentError::Cancelled)?;
                 for user in steers {
-                    conversation.push_message(Message::User(user.clone()));
-                    yield AgentEvent::Steered(user);
+                    let message = Message::User(user.clone());
+                    if let Some(t) = tracker.as_mut() {
+                        t.cursor.append(&message);
+                    }
+                    conversation.push_message(message);
+                    yield update(
+                        AgentEvent::Steered(user),
+                        conversation,
+                        context.as_ref(),
+                        &tracker,
+                    );
+                }
+
+                if let Some(policy) = policy {
+                    let raw_estimate = conversation.estimate_tokens(&tool_specs).saturating_add(
+                        P::estimate_continuation_tokens(
+                            context.as_ref().expect("context exists").continuation(),
+                        ),
+                    );
+                    let measured = tracker
+                        .as_ref()
+                        .and_then(|t| *t.measurement)
+                        .map_or(0, |m| {
+                            m.tokens
+                                .saturating_add(raw_estimate.saturating_sub(m.estimated_tokens))
+                        });
+                    let estimate = raw_estimate.max(measured);
+                    let budget = policy
+                        .budget
+                        .or_else(|| self.provider.context_budget(model));
+                    let due = budget.is_some_and(|b| estimate >= b.max_input_tokens);
+                    let manual = control.take_compact_request();
+                    if force_compaction || due || manual {
+                        yield update(
+                            AgentEvent::CompactionStarted,
+                            conversation,
+                            context.as_ref(),
+                            &tracker,
+                        );
+                        let replacement = cancel_or(
+                            control,
+                            maintain(
+                                &self.provider,
+                                context.as_ref().expect("context exists").continuation(),
+                                model,
+                                conversation,
+                                policy.options(),
+                            ),
+                        )
+                        .await
+                        .ok_or(AgentError::Cancelled)?;
+                        match replacement {
+                            Ok(ContextCompaction {
+                                conversation: replacement,
+                                continuation,
+                                usage,
+                            }) => {
+                                if control.is_cancelled() {
+                                    Err(AgentError::Cancelled)?;
+                                }
+                                let next_estimate = replacement
+                                    .estimate_tokens(&tool_specs)
+                                    .saturating_add(P::estimate_continuation_tokens(&continuation));
+                                if (due || force_compaction)
+                                    && next_estimate >= raw_estimate
+                                    && !self.provider.has_opaque_context(&continuation)
+                                {
+                                    Err(AgentError::ContextMaintenance("Compaction made no room; reduce the input or use a larger context window".into()))?;
+                                }
+                                *conversation = replacement;
+                                context
+                                    .as_mut()
+                                    .expect("context exists")
+                                    .checkpoint(continuation);
+                                if let Some(t) = tracker.as_mut() {
+                                    *t.measurement = None;
+                                }
+                                turn_usage.add_round(usage);
+                                yield update(
+                                    AgentEvent::Compacted(conversation.clone()),
+                                    conversation,
+                                    context.as_ref(),
+                                    &tracker,
+                                );
+                            }
+                            Err(CompactError::NothingToCompact) if !due && !force_compaction => {}
+                            Err(error) => {
+                                yield update(
+                                    AgentEvent::CompactionFailed(error.to_string()),
+                                    conversation,
+                                    context.as_ref(),
+                                    &tracker,
+                                );
+                                if due || force_compaction {
+                                    Err(AgentError::ContextMaintenance(error.to_string()))?;
+                                }
+                            }
+                        }
+                        force_compaction = false;
+                        // Accept any steering that arrived while maintenance was in flight.
+                        let steers = control
+                            .drain_pending_steers_unless_cancelled()
+                            .ok_or(AgentError::Cancelled)?;
+                        for user in steers {
+                            let message = Message::User(user.clone());
+                            if let Some(t) = tracker.as_mut() {
+                                t.cursor.append(&message);
+                            }
+                            conversation.push_message(message);
+                            yield update(
+                                AgentEvent::Steered(user),
+                                conversation,
+                                context.as_ref(),
+                                &tracker,
+                            );
+                        }
+                        let final_size = conversation.estimate_tokens(&tool_specs).saturating_add(
+                            P::estimate_continuation_tokens(
+                                context.as_ref().expect("context exists").continuation(),
+                            ),
+                        );
+                        if budget.is_some_and(|b| final_size >= b.max_input_tokens) {
+                            Err(AgentError::ContextMaintenance("The retained input, instructions, or tools still exceed this model's input budget".into()))?;
+                        }
+                    }
                 }
 
                 if let Some(document) = conversation.messages().iter().find_map(|message| {
@@ -272,7 +622,12 @@ where
                 }
 
                 if let Some(compaction) = compaction.filter(|_| control.take_compact_request()) {
-                    yield AgentEvent::CompactionStarted;
+                    yield update(
+                        AgentEvent::CompactionStarted,
+                        conversation,
+                        context.as_ref(),
+                        &tracker,
+                    );
                     let result = match cancel_or(
                         control,
                         self.provider.compact_with_usage(
@@ -299,11 +654,21 @@ where
                                 .as_mut()
                                 .expect("agent context exists")
                                 .checkpoint(self.provider.create_continuation(model));
-                            yield AgentEvent::Compacted(compacted);
+                            yield update(
+                                AgentEvent::Compacted(compacted),
+                                conversation,
+                                context.as_ref(),
+                                &tracker,
+                            );
                         }
                         Err(CompactError::NothingToCompact) => {}
                         Err(error) => {
-                            yield AgentEvent::CompactionFailed(error.to_string());
+                            yield update(
+                                AgentEvent::CompactionFailed(error.to_string()),
+                                conversation,
+                                context.as_ref(),
+                                &tracker,
+                            );
                         }
                     }
                 }
@@ -315,27 +680,39 @@ where
                 };
 
                 let mut provider_stream = self.provider.complete_stream(
-                    context.as_ref().expect("agent context exists").continuation(),
+                    context
+                        .as_ref()
+                        .expect("agent context exists")
+                        .continuation(),
                     model,
                     &provider_input,
                     &tool_specs,
                 );
-                let (message, next_continuation, round_usage) = loop {
+                let completed = loop {
                     // Cancellation wins when both become ready in one poll.
                     let event = if self.immediate_steering {
                         let steering = control.steering_ready();
                         let next = provider_stream.next();
                         futures::pin_mut!(steering, next);
                         let interrupted = futures::future::poll_fn(|cx| {
-                            if control.is_cancelled() { Poll::Ready(Some(None)) }
-                            else if steering.as_mut().poll(cx).is_ready() { Poll::Ready(None) }
-                            else { next.as_mut().poll(cx).map(|event| Some(Some(event))) }
+                            if control.is_cancelled() {
+                                Poll::Ready(Some(None))
+                            } else if steering.as_mut().poll(cx).is_ready() {
+                                Poll::Ready(None)
+                            } else {
+                                next.as_mut().poll(cx).map(|event| Some(Some(event)))
+                            }
                         });
                         match cancel_or(control, interrupted).await {
                             Some(None) => {
                                 drop(provider_stream);
                                 drop(provider_input);
-                                yield AgentEvent::AssistantPreviewReset;
+                                yield update(
+                                    AgentEvent::AssistantPreviewReset,
+                                    conversation,
+                                    context.as_ref(),
+                                    &tracker,
+                                );
                                 continue 'rounds;
                             }
                             Some(Some(event)) => event,
@@ -345,10 +722,13 @@ where
                         cancel_or(control, provider_stream.next()).await
                     };
                     match event {
-                        Some(Some(Ok(ProviderEvent::TextDelta(delta))))
-                            if !control.is_cancelled() =>
-                        {
-                            yield AgentEvent::AssistantTextDelta(delta);
+                        Some(Some(Ok(ProviderEvent::TextDelta(delta)))) if !control.is_cancelled() => {
+                            yield update(
+                                AgentEvent::AssistantTextDelta(delta),
+                                conversation,
+                                context.as_ref(),
+                                &tracker,
+                            );
                         }
                         Some(Some(Ok(ProviderEvent::Completed(ProviderCompletion {
                             message,
@@ -357,24 +737,69 @@ where
                         }))))
                             if !control.is_cancelled() =>
                         {
-                            break (message, continuation, usage);
+                            break Ok((message, continuation, usage));
                         }
                         Some(Some(Ok(_))) | None => Err(AgentError::Cancelled)?,
-                        Some(Some(Err(error))) => Err(AgentError::Provider(error))?,
+                        Some(Some(Err(error))) => break Err(error),
                         Some(None) => Err(AgentError::ProviderStreamEnded)?,
                     }
                 };
-                turn_usage.add_round(round_usage);
                 drop(provider_stream);
                 drop(provider_input);
+                let (message, next_continuation, round_usage) = match completed {
+                    Ok(completed) => completed,
+                    Err(error)
+                        if policy.is_some()
+                            && !overflow_recovered
+                            && self.provider.is_context_overflow(&error) =>
+                    {
+                        overflow_recovered = true;
+                        force_compaction = true;
+                        yield update(
+                            AgentEvent::AssistantPreviewReset,
+                            conversation,
+                            context.as_ref(),
+                            &tracker,
+                        );
+                        continue 'rounds;
+                    }
+                    Err(error) => Err(AgentError::Provider(error))?,
+                };
+                overflow_recovered = false;
+                turn_usage.add_round(round_usage);
 
                 // The transcript and continuation are one logical checkpoint.
                 // No cancellation check occurs between these operations: once
                 // accepted, both survive cancellation racing immediately after.
                 let tool_calls = message.tool_calls().to_vec();
-                conversation.push_message(Message::Assistant(message.clone()));
-                context.as_mut().expect("agent context exists").checkpoint(next_continuation);
-                yield AgentEvent::AssistantReply(message.clone(), round_usage);
+                let accepted = Message::Assistant(message.clone());
+                if let Some(t) = tracker.as_mut() {
+                    t.cursor.append(&accepted);
+                }
+                conversation.push_message(accepted);
+                context
+                    .as_mut()
+                    .expect("agent context exists")
+                    .checkpoint(next_continuation);
+                if let Some(t) = tracker.as_mut()
+                    && let Some(input) = round_usage.input_tokens
+                {
+                    let estimated_tokens = conversation.estimate_tokens(&tool_specs).saturating_add(
+                        P::estimate_continuation_tokens(
+                            context.as_ref().expect("context exists").continuation(),
+                        ),
+                    );
+                    *t.measurement = Some(ContextMeasurement {
+                        tokens: input.saturating_add(round_usage.output_tokens.unwrap_or(0)),
+                        estimated_tokens,
+                    });
+                }
+                yield update(
+                    AgentEvent::AssistantReply(message.clone(), round_usage),
+                    conversation,
+                    context.as_ref(),
+                    &tracker,
+                );
 
                 if tool_calls.is_empty() {
                     if !control.close_if_empty() {
@@ -382,7 +807,12 @@ where
                     }
                     drop(context.take());
                     drop(guard.take());
-                    yield AgentEvent::Completed(message, turn_usage);
+                    yield update(
+                        AgentEvent::Completed(message, turn_usage),
+                        conversation,
+                        context.as_ref(),
+                        &tracker,
+                    );
                     return;
                 }
 
@@ -393,7 +823,12 @@ where
                 }
 
                 for tool_call in &tool_calls {
-                    yield AgentEvent::ToolStarted(tool_call.clone());
+                    yield update(
+                        AgentEvent::ToolStarted(tool_call.clone()),
+                        conversation,
+                        context.as_ref(),
+                        &tracker,
+                    );
                 }
                 let mut results = futures::stream::FuturesUnordered::new();
                 for tool_call in &tool_calls {
@@ -408,8 +843,17 @@ where
                         Err(AgentError::Cancelled)?
                     };
                     let Some(result) = result else { break };
-                    conversation.push_message(Message::ToolResult(result.clone()));
-                    yield AgentEvent::ToolFinished(result);
+                    let accepted = Message::ToolResult(result.clone());
+                    if let Some(t) = tracker.as_mut() {
+                        t.cursor.append(&accepted);
+                    }
+                    conversation.push_message(accepted);
+                    yield update(
+                        AgentEvent::ToolFinished(result),
+                        conversation,
+                        context.as_ref(),
+                        &tracker,
+                    );
                 }
                 tool_rounds_executed += 1;
             }

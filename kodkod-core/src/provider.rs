@@ -79,6 +79,58 @@ pub trait Provider: Sync {
         0
     }
 
+    /// Model/route-specific effective input budget. Unknown is distinct from zero.
+    fn context_budget(&self, _model: &Self::Model) -> Option<crate::ContextBudget> {
+        None
+    }
+
+    /// Check restored state before it is used with a different model or deployment.
+    fn validate_context(
+        &self,
+        _model: &Self::Model,
+        _continuation: &Self::Continuation,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Whether essential history lives outside portable messages. Opaque byte size is not a token count.
+    fn has_opaque_context(&self, _continuation: &Self::Continuation) -> bool {
+        false
+    }
+
+    /// Only a typed context-length rejection permits compaction recovery.
+    fn is_context_overflow(&self, _error: &Self::Error) -> bool {
+        false
+    }
+
+    /// Replace active input and provider state together. Adapters carrying hidden native
+    /// history must override this operation; summarizing visible messages alone would lose it.
+    fn compact_context(
+        &self,
+        continuation: &Self::Continuation,
+        model: &Self::Model,
+        conversation: &Conversation,
+        options: CompactOptions,
+    ) -> impl Future<
+        Output = Result<crate::ContextCompaction<Self::Continuation>, CompactError<Self::Error>>,
+    > + Send {
+        async move {
+            if self.has_opaque_context(continuation) {
+                return Err(CompactError::Context(
+                    "Provider must implement contextual compaction for opaque history".into(),
+                ));
+            }
+            let result = self
+                .compact_with_usage(model, conversation, options)
+                .await?;
+            Ok(crate::ContextCompaction {
+                conversation: result.conversation,
+                continuation: self.create_continuation(model),
+                usage: result.usage,
+            })
+        }
+    }
+
     /// Produce one assistant response and its next continuation checkpoint.
     ///
     /// `continuation` is never modified in place. The caller accepts the returned
