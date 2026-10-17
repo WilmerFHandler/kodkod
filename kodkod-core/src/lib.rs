@@ -9,6 +9,7 @@ pub mod agent;
 pub mod conversation;
 pub mod message;
 pub mod provider;
+pub mod request_diagnostics;
 pub mod retry;
 pub mod tool;
 pub mod turns;
@@ -31,6 +32,12 @@ pub use message::{
     AssistantMessage, Document, DocumentError, Image, Message, SystemMessage, UserMessage,
 };
 pub use provider::{Provider, ProviderCompletion, ProviderEvent, ProviderStream};
+pub use request_diagnostics::{
+    RequestCacheDiagnostics, RequestCacheReason, RequestCacheType, RequestDiagnostic,
+    RequestDiagnosticEvent, RequestFailureKind, RequestFingerprint, RequestIdentity,
+    RequestInputPrefixFingerprint, RequestMetadata, RequestObserver, RequestOperation,
+    RequestOptionClass, RequestProfile, RequestPromptFingerprints, RequestUsage,
+};
 pub use retry::{RetryPolicy, RetryProvider, Retryable};
 pub use tool::{
     Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolOutput, ToolResult,

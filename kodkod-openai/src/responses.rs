@@ -1,18 +1,23 @@
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures_util::StreamExt;
 use kodkod_core::{
     AssistantMessage, CompactError, CompactOptions, ContextBudget, ContextCompaction, Conversation,
-    Message, Provider, ProviderCompletion, ProviderEvent, ProviderStream, ToolCall,
-    ToolExecutorError, ToolResult, ToolResultOutcome, ToolSpec,
+    Document, Image, Message, Provider, ProviderCompletion, ProviderEvent, ProviderStream,
+    RequestDiagnostic, RequestDiagnosticEvent, RequestFailureKind, RequestFingerprint,
+    RequestIdentity, RequestInputPrefixFingerprint, RequestMetadata, RequestObserver,
+    RequestOperation, RequestOptionClass, RequestProfile, RequestPromptFingerprints, RequestUsage,
+    ToolCall, ToolExecutorError, ToolResult, ToolResultOutcome, ToolSpec,
 };
 use kodkod_http::{SseDecoder, SseEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::usage::parse_usage;
+use crate::usage::parse_request_usage;
 use crate::{CredentialSource, OpenAiError, OpenAiModel};
 
 /// Controls Responses request formatting while keeping the OpenAI-compatible
@@ -93,6 +98,7 @@ pub struct OpenAiResponsesProvider<M = ()> {
     instructions: Option<String>,
     profile: ResponsesRequestProfile,
     native_compaction: bool,
+    request_observer: Option<Arc<dyn RequestObserver>>,
     client: reqwest::Client,
     _model: PhantomData<M>,
 }
@@ -105,6 +111,7 @@ impl<M> OpenAiResponsesProvider<M> {
             instructions: None,
             profile: ResponsesRequestProfile::default(),
             native_compaction: false,
+            request_observer: None,
             client: reqwest::Client::new(),
             _model: PhantomData,
         }
@@ -145,12 +152,356 @@ impl<M> OpenAiResponsesProvider<M> {
         self
     }
 
+    /// Observe metadata-only diagnostics for each physical request attempt.
+    pub fn with_request_observer(mut self, observer: Arc<dyn RequestObserver>) -> Self {
+        self.request_observer = Some(observer);
+        self
+    }
+
     pub fn responses_url(&self) -> &str {
         &self.responses_url
     }
 
     fn compaction_url(&self) -> String {
         format!("{}/compact", self.responses_url.trim_end_matches('/'))
+    }
+}
+
+struct RequestAttemptGuard {
+    observer: Arc<dyn RequestObserver>,
+    identity: RequestIdentity,
+    operation: RequestOperation,
+    started_at: Instant,
+    terminal: bool,
+}
+
+impl RequestAttemptGuard {
+    fn start(
+        observer: Option<Arc<dyn RequestObserver>>,
+        operation: RequestOperation,
+        metadata: RequestMetadata,
+    ) -> Option<Self> {
+        let observer = observer?;
+        let identity = RequestIdentity::next_process_unique();
+        observe_diagnostic(
+            observer.as_ref(),
+            RequestDiagnostic {
+                identity,
+                operation,
+                metadata: Some(metadata),
+                event: RequestDiagnosticEvent::Started,
+            },
+        );
+        Some(Self {
+            observer,
+            identity,
+            operation,
+            started_at: Instant::now(),
+            terminal: false,
+        })
+    }
+
+    fn headers(&self, status: u16, provider_request_id: Option<String>) {
+        observe_diagnostic(
+            self.observer.as_ref(),
+            RequestDiagnostic {
+                identity: self.identity,
+                operation: self.operation,
+                metadata: None,
+                event: RequestDiagnosticEvent::Headers {
+                    status,
+                    provider_request_id,
+                },
+            },
+        );
+    }
+
+    fn finish(
+        &mut self,
+        failure: Option<RequestFailureKind>,
+        response_id: Option<String>,
+        usage: Option<RequestUsage>,
+    ) {
+        if self.terminal {
+            return;
+        }
+        self.terminal = true;
+        observe_diagnostic(
+            self.observer.as_ref(),
+            RequestDiagnostic {
+                identity: self.identity,
+                operation: self.operation,
+                metadata: None,
+                event: RequestDiagnosticEvent::Finished {
+                    duration_micros: self.started_at.elapsed().as_micros().min(u64::MAX as u128)
+                        as u64,
+                    failure,
+                    response_id,
+                    usage,
+                },
+            },
+        );
+    }
+}
+
+impl Drop for RequestAttemptGuard {
+    fn drop(&mut self) {
+        if self.terminal {
+            return;
+        }
+        self.terminal = true;
+        observe_diagnostic(
+            self.observer.as_ref(),
+            RequestDiagnostic {
+                identity: self.identity,
+                operation: self.operation,
+                metadata: None,
+                event: RequestDiagnosticEvent::Abandoned {
+                    duration_micros: self.started_at.elapsed().as_micros().min(u64::MAX as u128)
+                        as u64,
+                    failure: RequestFailureKind::Unknown,
+                },
+            },
+        );
+    }
+}
+
+fn observe_diagnostic(observer: &dyn RequestObserver, diagnostic: RequestDiagnostic) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        observer.observe(diagnostic);
+    }));
+}
+
+fn request_fingerprint(
+    observer: &dyn RequestObserver,
+    domain: &str,
+    bytes: &[u8],
+) -> RequestFingerprint {
+    let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        observer.fingerprint(domain, bytes)
+    }))
+    .ok()
+    .flatten()
+    .filter(|value| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    });
+    RequestFingerprint {
+        byte_len: bytes.len(),
+        value,
+    }
+}
+
+fn safe_provider_id(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        .map(str::to_owned)
+}
+
+fn response_request_id(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| safe_provider_id(Some(value)))
+}
+
+fn failure_kind(error: &OpenAiError) -> RequestFailureKind {
+    match error {
+        OpenAiError::Http(_) => RequestFailureKind::Transport,
+        OpenAiError::Api { status, .. } => RequestFailureKind::HttpStatus(*status),
+        OpenAiError::ResponseFailed { .. } => RequestFailureKind::ProviderResponse,
+        OpenAiError::Incomplete { .. } => RequestFailureKind::Incomplete,
+        OpenAiError::Json(_) | OpenAiError::EmptyResponse | OpenAiError::Protocol(_) => {
+            RequestFailureKind::Protocol
+        }
+        OpenAiError::Credentials(_)
+        | OpenAiError::UnsupportedDocument { .. }
+        | OpenAiError::DocumentLimitExceeded { .. } => RequestFailureKind::Unknown,
+    }
+}
+
+fn safe_model_id(value: &str) -> Option<String> {
+    (!value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
+        }))
+    .then(|| value.to_owned())
+}
+
+fn classify_reasoning_effort(value: Option<&str>) -> RequestOptionClass {
+    match value {
+        None | Some("none") => RequestOptionClass::None,
+        Some("low") => RequestOptionClass::Low,
+        Some("medium") => RequestOptionClass::Medium,
+        Some("high") => RequestOptionClass::High,
+        Some("xhigh") => RequestOptionClass::XHigh,
+        Some(_) => RequestOptionClass::Other,
+    }
+}
+
+fn classify_service_tier(value: Option<&str>) -> RequestOptionClass {
+    match value {
+        None => RequestOptionClass::None,
+        Some("auto") => RequestOptionClass::Auto,
+        Some("default") => RequestOptionClass::Default,
+        Some("flex") => RequestOptionClass::Flex,
+        Some("priority") => RequestOptionClass::Priority,
+        Some(_) => RequestOptionClass::Other,
+    }
+}
+
+fn request_metadata<M: OpenAiModel>(
+    observer: &dyn RequestObserver,
+    model: &M,
+    options: &crate::OpenAiRequestOptions,
+    profile: ResponsesRequestProfile,
+    conversation: &Conversation,
+    tools: &[ToolSpec],
+    continuation: &ResponsesContinuation,
+    request: &Value,
+) -> RequestMetadata {
+    let request_size = json_size(request);
+    let continuation_bytes = continuation_output_bytes(continuation);
+    let (image_count, image_bytes, document_count, document_bytes) =
+        attachment_counts(conversation);
+    let input = request
+        .get("input")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut prompt_fingerprints = RequestPromptFingerprints::default();
+    if let Some(instructions) = request.get("instructions") {
+        let bytes = serde_json::to_vec(instructions).unwrap_or_default();
+        prompt_fingerprints.instructions =
+            Some(request_fingerprint(observer, "instructions", &bytes));
+    }
+    if let Some(tools_value) = request.get("tools") {
+        let bytes = serde_json::to_vec(tools_value).unwrap_or_default();
+        prompt_fingerprints.tools = Some(request_fingerprint(observer, "tools", &bytes));
+    }
+    for count in [1usize, 4, 16, 64] {
+        if input.len() >= count {
+            let bytes = serde_json::to_vec(&input[..count]).unwrap_or_default();
+            prompt_fingerprints
+                .input_prefixes
+                .push(RequestInputPrefixFingerprint {
+                    item_count: Some(count),
+                    fingerprint: request_fingerprint(
+                        observer,
+                        &format!("input-prefix-{count}"),
+                        &bytes,
+                    ),
+                });
+        }
+    }
+    let input_bytes = serde_json::to_vec(input).unwrap_or_default();
+    prompt_fingerprints
+        .input_prefixes
+        .push(RequestInputPrefixFingerprint {
+            item_count: None,
+            fingerprint: request_fingerprint(observer, "input-total", &input_bytes),
+        });
+
+    RequestMetadata {
+        model: safe_model_id(model.id()),
+        profile: match profile {
+            ResponsesRequestProfile::OpenAiCompatible => RequestProfile::OpenAiCompatible,
+            ResponsesRequestProfile::ChatGptPlan => RequestProfile::ChatGptPlan,
+        },
+        reasoning_effort: classify_reasoning_effort(options.reasoning_effort.as_deref()),
+        service_tier: classify_service_tier(options.service_tier.as_deref()),
+        vision_enabled: model.supports_vision(),
+        context_estimate_tokens: conversation.estimate_tokens(tools).saturating_add(
+            <OpenAiResponsesProvider<M> as Provider>::estimate_continuation_tokens(continuation),
+        ),
+        context_budget_tokens: model.context_budget().map(|budget| budget.max_input_tokens),
+        message_count: conversation.messages().len(),
+        tool_definition_count: tools.len(),
+        image_count,
+        image_bytes,
+        document_count,
+        document_bytes,
+        serialized_request_bytes: request_size,
+        continuation_bytes,
+        prompt_fingerprints,
+    }
+}
+
+fn attachment_counts(conversation: &Conversation) -> (usize, usize, usize, usize) {
+    let mut image_count = 0usize;
+    let mut image_bytes = 0usize;
+    let mut document_count = 0usize;
+    let mut document_bytes = 0usize;
+    for message in conversation.messages() {
+        match message {
+            Message::User(user) => {
+                add_images(user.images(), &mut image_count, &mut image_bytes);
+                add_documents(user.documents(), &mut document_count, &mut document_bytes);
+            }
+            Message::ToolResult(result) => {
+                if let ToolResultOutcome::Success(output) = result.outcome() {
+                    add_images(output.images(), &mut image_count, &mut image_bytes);
+                }
+            }
+            Message::System(_) | Message::Assistant(_) => {}
+        }
+    }
+    (image_count, image_bytes, document_count, document_bytes)
+}
+
+fn add_images(images: &[Image], count: &mut usize, bytes: &mut usize) {
+    *count = count.saturating_add(images.len());
+    for image in images {
+        *bytes = bytes.saturating_add(image.data().len());
+    }
+}
+
+fn add_documents(documents: &[Document], count: &mut usize, bytes: &mut usize) {
+    *count = count.saturating_add(documents.len());
+    for document in documents {
+        *bytes = bytes.saturating_add(document.data().len());
+    }
+}
+
+fn continuation_output_bytes(continuation: &ResponsesContinuation) -> usize {
+    let mut total = 0usize;
+    for checkpoint in &continuation.checkpoints {
+        total = total.saturating_add(json_size(&checkpoint.output));
+    }
+    if let Some(window) = &continuation.native_window {
+        total = total.saturating_add(json_size(&window.output));
+    }
+    total
+}
+
+fn json_size<T: Serialize + ?Sized>(value: &T) -> usize {
+    struct CountingWriter(usize);
+    impl Write for CountingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0 = self.0.saturating_add(buffer.len());
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = CountingWriter(0);
+    if serde_json::to_writer(&mut writer, value).is_ok() {
+        writer.0
+    } else {
+        0
     }
 }
 
@@ -202,20 +553,58 @@ where
         if let Some(instructions) = instructions {
             request["instructions"] = Value::String(instructions.to_owned());
         }
+        let mut attempt = self
+            .request_observer
+            .as_deref()
+            .map(|observer| {
+                RequestAttemptGuard::start(
+                    self.request_observer.clone(),
+                    RequestOperation::Compaction,
+                    request_metadata(
+                        observer,
+                        model,
+                        &crate::OpenAiRequestOptions::default(),
+                        self.profile,
+                        conversation,
+                        &[],
+                        continuation,
+                        &request,
+                    ),
+                )
+            })
+            .flatten();
         let mut http_request = self.client.post(self.compaction_url()).json(&request);
         if let Some(credentials) = credentials {
             http_request = http_request.headers(credentials.headers().clone());
         }
-        let response = http_request
-            .send()
-            .await
-            .map_err(OpenAiError::from)
-            .map_err(CompactError::Provider)?;
+        let response = match http_request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let error = OpenAiError::from(error);
+                if let Some(attempt) = &mut attempt {
+                    attempt.finish(Some(failure_kind(&error)), None, None);
+                }
+                return Err(CompactError::Provider(error));
+            }
+        };
         let status = response.status();
+        if let Some(attempt) = &attempt {
+            attempt.headers(status.as_u16(), response_request_id(&response));
+        }
         if !status.is_success() {
-            let body = read_limited_body(response, MAX_ERROR_BODY_BYTES)
-                .await
-                .map_err(CompactError::Provider)?;
+            let body = match read_limited_body(response, MAX_ERROR_BODY_BYTES).await {
+                Ok(body) => body,
+                Err(error) => {
+                    if let Some(attempt) = &mut attempt {
+                        attempt.finish(
+                            Some(RequestFailureKind::HttpStatus(status.as_u16())),
+                            None,
+                            None,
+                        );
+                    }
+                    return Err(CompactError::Provider(error));
+                }
+            };
             let fallback = if body.is_empty() {
                 status.to_string()
             } else {
@@ -232,9 +621,23 @@ where
                 .map(str::to_owned)
                 .unwrap_or(fallback);
             if is_native_compaction_unsupported(self.profile, status.as_u16(), code.as_deref()) {
+                if let Some(attempt) = &mut attempt {
+                    attempt.finish(
+                        Some(RequestFailureKind::HttpStatus(status.as_u16())),
+                        None,
+                        None,
+                    );
+                }
                 return Err(CompactError::Unsupported(
                     "the Responses endpoint does not support standalone compaction".into(),
                 ));
+            }
+            if let Some(attempt) = &mut attempt {
+                attempt.finish(
+                    Some(RequestFailureKind::HttpStatus(status.as_u16())),
+                    None,
+                    None,
+                );
             }
             return Err(CompactError::Provider(OpenAiError::Api {
                 status: status.as_u16(),
@@ -243,14 +646,43 @@ where
             }));
         }
 
-        let body = read_bounded_body(response, MAX_COMPACTION_RESPONSE_BYTES)
-            .await
-            .map_err(CompactError::Provider)?;
-        let payload: Value = serde_json::from_slice(&body).map_err(|_| {
-            CompactError::Context("native compaction returned malformed JSON".into())
-        })?;
-        let output =
-            validate_native_compaction_response(&payload).map_err(CompactError::Context)?;
+        let body = match read_bounded_body(response, MAX_COMPACTION_RESPONSE_BYTES).await {
+            Ok(body) => body,
+            Err(error) => {
+                if let Some(attempt) = &mut attempt {
+                    attempt.finish(Some(failure_kind(&error)), None, None);
+                }
+                return Err(CompactError::Provider(error));
+            }
+        };
+        let payload: Value = match serde_json::from_slice(&body) {
+            Ok(payload) => payload,
+            Err(_) => {
+                if let Some(attempt) = &mut attempt {
+                    attempt.finish(Some(RequestFailureKind::Protocol), None, None);
+                }
+                return Err(CompactError::Context(
+                    "native compaction returned malformed JSON".into(),
+                ));
+            }
+        };
+        let output = match validate_native_compaction_response(&payload) {
+            Ok(output) => output,
+            Err(error) => {
+                if let Some(attempt) = &mut attempt {
+                    attempt.finish(Some(RequestFailureKind::Protocol), None, None);
+                }
+                return Err(CompactError::Context(error));
+            }
+        };
+        let request_usage = parse_request_usage(&payload);
+        if let Some(attempt) = &mut attempt {
+            attempt.finish(
+                None,
+                safe_provider_id(payload.get("id").and_then(Value::as_str)),
+                Some(request_usage),
+            );
+        }
 
         let mut compacted_conversation = Conversation::new();
         if let Some(system_prompt) = conversation.system_prompt() {
@@ -267,7 +699,7 @@ where
                     output,
                 }),
             },
-            usage: parse_usage(&payload),
+            usage: request_usage.token_usage,
         })
     }
 }
@@ -279,6 +711,11 @@ where
     type Model = M;
     type Error = OpenAiError;
     type Continuation = ResponsesContinuation;
+
+    fn with_request_observer(mut self, observer: Arc<dyn RequestObserver>) -> Self {
+        self.request_observer = Some(observer);
+        self
+    }
 
     fn supports_vision(&self, model: &M) -> bool {
         model.supports_vision()
@@ -405,47 +842,99 @@ where
         tools: &'a [ToolSpec],
     ) -> ProviderStream<'a, Self::Continuation, Self::Error> {
         Box::pin(async_stream::try_stream! {
-        validate_documents(conversation, model.supports_vision())?;
-        let credentials = match &self.credentials {
-            Some(source) => Some(source.credentials().await?),
-            None => None,
-        };
-        let request = build_request_for_endpoint(
-            model.id(),
-            model.request_options(),
-            self.instructions.as_deref(),
-            conversation,
-            tools,
-            continuation,
-            ResponsesRoute {
-                profile: self.profile,
-                endpoint: &self.responses_url,
-            },
-        )?;
-        let mut http_request = self.client.post(&self.responses_url).json(&request);
-        if let Some(credentials) = credentials {
-            http_request = http_request.headers(credentials.headers().clone());
-        }
+            validate_documents(conversation, model.supports_vision())?;
+            let credentials = match &self.credentials {
+                Some(source) => Some(source.credentials().await?),
+                None => None,
+            };
+            let options = model.request_options();
+            let request = build_request_for_endpoint(
+                model.id(),
+                options.clone(),
+                self.instructions.as_deref(),
+                conversation,
+                tools,
+                continuation,
+                ResponsesRoute {
+                    profile: self.profile,
+                    endpoint: &self.responses_url,
+                },
+            )?;
+            let mut attempt = if let Some(observer) = self.request_observer.as_ref() {
+                let metadata = request_metadata(
+                    observer.as_ref(),
+                    model,
+                    &options,
+                    self.profile,
+                    conversation,
+                    tools,
+                    continuation,
+                    &request,
+                );
+                RequestAttemptGuard::start(
+                    Some(observer.clone()),
+                    RequestOperation::Completion,
+                    metadata,
+                )
+            } else {
+                None
+            };
+            let mut http_request = self.client.post(&self.responses_url).json(&request);
+            if let Some(credentials) = credentials {
+                http_request = http_request.headers(credentials.headers().clone());
+            }
 
-        let response = http_request.send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = read_limited_body(response, MAX_ERROR_BODY_BYTES).await?;
-            let fallback = if body.is_empty() { status.to_string() } else { body.clone() };
-            let body: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            let code = body.pointer("/error/code").and_then(Value::as_str).map(str::to_owned);
-            let message = body
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or(fallback);
-            Err(OpenAiError::Api {
-                status: status.as_u16(),
-                code,
-                message,
-            })?;
-            unreachable!("error propagation exits the stream");
-        }
+            let response = match http_request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = OpenAiError::from(error);
+                    if let Some(attempt) = &mut attempt {
+                        attempt.finish(Some(failure_kind(&error)), None, None);
+                    }
+                    Err(error)?
+                }
+            };
+            let status = response.status();
+            if let Some(attempt) = &attempt {
+                attempt.headers(status.as_u16(), response_request_id(&response));
+            }
+            if !status.is_success() {
+                let body = match read_limited_body(response, MAX_ERROR_BODY_BYTES).await {
+                    Ok(body) => body,
+                    Err(error) => {
+                        if let Some(attempt) = &mut attempt {
+                            attempt.finish(
+                                Some(RequestFailureKind::HttpStatus(status.as_u16())),
+                                None,
+                                None,
+                            );
+                        }
+                        Err(error)?;
+                        unreachable!("error propagation exits the stream");
+                    }
+                };
+                let fallback = if body.is_empty() { status.to_string() } else { body.clone() };
+                let body: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                let code = body.pointer("/error/code").and_then(Value::as_str).map(str::to_owned);
+                let message = body
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or(fallback);
+                if let Some(attempt) = &mut attempt {
+                    attempt.finish(
+                        Some(RequestFailureKind::HttpStatus(status.as_u16())),
+                        None,
+                        None,
+                    );
+                }
+                Err(OpenAiError::Api {
+                    status: status.as_u16(),
+                    code,
+                    message,
+                })?;
+                unreachable!("error propagation exits the stream");
+            }
 
             let mut bytes = response.bytes_stream();
             let mut decoder = SseDecoder::default();
@@ -470,10 +959,18 @@ where
                             assistant: assistant.clone(),
                             output: final_output,
                         });
+                        let request_usage = parse_request_usage(&terminal);
+                        if let Some(attempt) = &mut attempt {
+                            attempt.finish(
+                                None,
+                                safe_provider_id(terminal.get("id").and_then(Value::as_str)),
+                                Some(request_usage),
+                            );
+                        }
                         yield ProviderEvent::Completed(ProviderCompletion::new(
                             assistant,
                             next,
-                            parse_usage(&terminal),
+                            request_usage.token_usage,
                         ));
                         return;
                     }
@@ -1303,13 +1800,16 @@ fn required_string(item: &Value, field: &str) -> Result<String, OpenAiError> {
 mod tests {
     use super::*;
     use kodkod_core::{
-        Document, Image, Message, ProviderEvent, Retryable, SystemMessage, TokenUsage, ToolSpec,
-        UserMessage,
+        Document, Image, Message, ProviderEvent, RetryPolicy, RetryProvider, Retryable,
+        SystemMessage, TokenUsage, ToolSpec, UserMessage,
     };
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[derive(Clone)]
     struct TestModel;
     impl OpenAiModel for TestModel {
         fn id(&self) -> &str {
@@ -1317,6 +1817,32 @@ mod tests {
         }
         fn supports_vision(&self) -> bool {
             true
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        diagnostics: Mutex<Vec<RequestDiagnostic>>,
+        fingerprint_domains: Mutex<Vec<String>>,
+    }
+
+    impl RecordingObserver {
+        fn diagnostics(&self) -> Vec<RequestDiagnostic> {
+            self.diagnostics.lock().unwrap().clone()
+        }
+    }
+
+    impl RequestObserver for RecordingObserver {
+        fn observe(&self, diagnostic: RequestDiagnostic) {
+            self.diagnostics.lock().unwrap().push(diagnostic);
+        }
+
+        fn fingerprint(&self, domain: &str, bytes: &[u8]) -> Option<String> {
+            self.fingerprint_domains
+                .lock()
+                .unwrap()
+                .push(domain.to_owned());
+            Some(format!("digest_{}", bytes.len()))
         }
     }
 
@@ -1353,6 +1879,291 @@ mod tests {
                 "response": {"status": "completed", "output": output, "usage": usage}
             })
         )
+    }
+
+    fn diagnostic_response(output: Value, usage: Value, id: &str) -> String {
+        format!(
+            "event: response.completed\ndata: {}\n\n",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": id,
+                    "status": "completed",
+                    "output": output,
+                    "usage": usage
+                }
+            })
+        )
+    }
+
+    #[tokio::test]
+    async fn diagnostics_are_content_free_and_finish_before_completed_is_yielded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-request-id", "req_safe-123")
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(diagnostic_response(
+                        json!([{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "private-response"}]
+                        }]),
+                        json!({
+                            "input_tokens": 20,
+                            "input_tokens_details": {
+                                "cached_tokens": 4,
+                                "cache_write_tokens": 2
+                            },
+                            "output_tokens": 3,
+                            "total_tokens": 23,
+                            "prompt_cache_diagnostics": {
+                                "reason": "cache_hit",
+                                "type": "prompt_prefix",
+                                "private": "private-diagnostic"
+                            }
+                        }),
+                        "resp_safe-456",
+                    )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let observer = Arc::new(RecordingObserver::default());
+        let provider = OpenAiResponsesProvider::<TestModel>::new(format!("{}/v1", server.uri()))
+            .with_profile(ResponsesRequestProfile::ChatGptPlan)
+            .with_instructions("private-instructions")
+            .with_request_observer(observer.clone());
+        let provider = provider.clone();
+        let mut conversation = Conversation::new().with_system_prompt("private-system");
+        conversation.push_user_message(
+            UserMessage::new("private-user")
+                .with_images(vec![Image::new("image/png", b"private-image".to_vec())])
+                .with_documents(vec![
+                    Document::try_new("text/plain", "private.txt", b"private-document").unwrap(),
+                ]),
+        );
+        let tools = [ToolSpec::new(
+            "private-tool",
+            "private tool description",
+            json!({"type":"object"}),
+        )];
+        let continuation = ResponsesContinuation::default();
+        let mut stream = provider.complete_stream(&continuation, &TestModel, &conversation, &tools);
+
+        let completed = stream.next().await.unwrap().unwrap();
+        assert!(matches!(completed, ProviderEvent::Completed(_)));
+        assert!(stream.next().await.is_none());
+
+        let diagnostics = observer.diagnostics();
+        assert_eq!(diagnostics.len(), 3);
+        assert!(matches!(
+            diagnostics[0].event,
+            RequestDiagnosticEvent::Started
+        ));
+        assert_eq!(diagnostics[0].operation, RequestOperation::Completion);
+        let metadata = diagnostics[0].metadata.as_ref().unwrap();
+        assert_eq!(metadata.model.as_deref(), Some("gpt-test"));
+        assert_eq!(metadata.profile, RequestProfile::ChatGptPlan);
+        assert_eq!(metadata.message_count, 1);
+        assert_eq!(metadata.tool_definition_count, 1);
+        assert_eq!((metadata.image_count, metadata.image_bytes), (1, 13));
+        assert_eq!((metadata.document_count, metadata.document_bytes), (1, 16));
+        assert!(metadata.serialized_request_bytes > 0);
+        assert_eq!(
+            metadata
+                .prompt_fingerprints
+                .instructions
+                .as_ref()
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("digest_22")
+        );
+        assert!(matches!(
+            diagnostics[1].event,
+            RequestDiagnosticEvent::Headers {
+                status: 200,
+                provider_request_id: Some(_)
+            }
+        ));
+        assert!(matches!(
+            diagnostics[2].event,
+            RequestDiagnosticEvent::Finished {
+                failure: None,
+                response_id: Some(ref id),
+                usage: Some(RequestUsage {
+                    cache_write_tokens: Some(2),
+                    ..
+                }),
+                ..
+            } if id == "resp_safe-456"
+        ));
+        assert_eq!(
+            observer.fingerprint_domains.lock().unwrap().as_slice(),
+            ["instructions", "tools", "input-prefix-1", "input-total"]
+        );
+        let diagnostic_text = format!("{diagnostics:?}");
+        for secret in [
+            "private-instructions",
+            "private-system",
+            "private-user",
+            "private-image",
+            "private-document",
+            "private-tool",
+            "private tool description",
+            "private-response",
+            "private-diagnostic",
+        ] {
+            assert!(!diagnostic_text.contains(secret));
+        }
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| matches!(
+                    diagnostic.event,
+                    RequestDiagnosticEvent::Finished { usage: Some(_), .. }
+                ))
+                .count(),
+            1
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_a_stream_emits_abandoned_without_claiming_remote_cancellation() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!(
+                        "event: response.output_text.delta\ndata: {}\n\n",
+                        json!({
+                            "type": "response.output_text.delta",
+                            "delta": "private-stream-text"
+                        })
+                    )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let observer = Arc::new(RecordingObserver::default());
+        let provider = OpenAiResponsesProvider::<TestModel>::new(format!("{}/v1", server.uri()))
+            .with_request_observer(observer.clone());
+        let conversation = Conversation::new();
+        let continuation = ResponsesContinuation::default();
+        let mut stream = provider.complete_stream(&continuation, &TestModel, &conversation, &[]);
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            ProviderEvent::TextDelta(_)
+        ));
+        drop(stream);
+
+        let diagnostics = observer.diagnostics();
+        assert_eq!(diagnostics.len(), 3);
+        assert!(matches!(
+            diagnostics[2].event,
+            RequestDiagnosticEvent::Abandoned {
+                failure: RequestFailureKind::Unknown,
+                ..
+            }
+        ));
+        assert!(!format!("{diagnostics:?}").contains("private-stream-text"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn each_retry_has_a_distinct_started_and_terminal_request_identity() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer first"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": {"code":"server_error", "message":"private failure text"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer second"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(completed_with_usage(
+                        json!([{
+                            "type":"message", "role":"assistant",
+                            "content":[{"type":"output_text", "text":"done"}]
+                        }]),
+                        json!({"input_tokens": 5, "output_tokens": 1, "total_tokens": 6}),
+                    )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let observer = Arc::new(RecordingObserver::default());
+        let provider = OpenAiResponsesProvider::<TestModel>::new(format!("{}/v1", server.uri()))
+            .with_credentials(Arc::new(RotatingCredentials(AtomicUsize::new(0))));
+        let retry_provider = RetryProvider::with_policy(
+            provider,
+            RetryPolicy {
+                max_attempts: 2,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+                backoff_multiplier: 1.0,
+            },
+        )
+        .with_request_observer(observer.clone());
+
+        let completion = retry_provider
+            .complete_with_usage(
+                &ResponsesContinuation::default(),
+                &TestModel,
+                &Conversation::new(),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(completion.usage.input_tokens, Some(5));
+
+        let diagnostics = observer.diagnostics();
+        let started: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| matches!(diagnostic.event, RequestDiagnosticEvent::Started))
+            .collect();
+        let finished: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                matches!(diagnostic.event, RequestDiagnosticEvent::Finished { .. })
+            })
+            .collect();
+        assert_eq!(started.len(), 2);
+        assert_eq!(finished.len(), 2);
+        assert_ne!(
+            started[0].identity.request_id,
+            started[1].identity.request_id
+        );
+        assert_eq!(
+            finished
+                .iter()
+                .filter(|diagnostic| matches!(
+                    diagnostic.event,
+                    RequestDiagnosticEvent::Finished {
+                        usage: Some(_),
+                        failure: None,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(!format!("{diagnostics:?}").contains("private failure text"));
+        server.verify().await;
     }
 
     fn output_item_done(index: usize, item: Value) -> String {

@@ -1,11 +1,12 @@
 use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::Stream;
 
 use crate::compact::{CompactError, CompactOptions};
-use crate::{AssistantMessage, Conversation, TokenUsage, ToolSpec};
+use crate::{AssistantMessage, Conversation, RequestObserver, TokenUsage, ToolSpec};
 
 /// The authoritative result of one completed provider round.
 ///
@@ -51,6 +52,15 @@ pub trait Provider: Sync {
     type Error: Error + Send + Sync + 'static;
     /// Provider-private state which can be retained between agent turns.
     type Continuation: Send + Sync;
+
+    /// Attach an optional observer for request lifecycle diagnostics.
+    /// Providers that do not issue observable requests may keep the default.
+    fn with_request_observer(self, _observer: Arc<dyn RequestObserver>) -> Self
+    where
+        Self: Sized,
+    {
+        self
+    }
 
     fn supports_vision(&self, model: &Self::Model) -> bool;
 

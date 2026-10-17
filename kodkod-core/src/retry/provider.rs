@@ -1,6 +1,10 @@
 use futures::StreamExt;
+use std::sync::Arc;
 
-use crate::{Conversation, Provider, ProviderCompletion, ProviderEvent, ProviderStream, ToolSpec};
+use crate::{
+    Conversation, Provider, ProviderCompletion, ProviderEvent, ProviderStream, RequestObserver,
+    ToolSpec,
+};
 
 use super::{RetryPolicy, Retryable};
 
@@ -44,6 +48,11 @@ where
     type Model = P::Model;
     type Error = P::Error;
     type Continuation = P::Continuation;
+
+    fn with_request_observer(mut self, observer: Arc<dyn RequestObserver>) -> Self {
+        self.inner = self.inner.with_request_observer(observer);
+        self
+    }
 
     fn create_continuation(&self, model: &Self::Model) -> Self::Continuation {
         self.inner.create_continuation(model)
