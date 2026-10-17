@@ -622,14 +622,16 @@ where
                             Err(CompactError::NothingToCompact)
                                 if !hard_due && !force_compaction && !manual =>
                             {
+                                if soft_due
+                                    && let Some(t) = tracker.as_mut()
+                                {
+                                    t.maintenance_state.soft_compaction_after_tokens = Some(
+                                        estimate.saturating_add(
+                                            policy.maintenance_growth_tokens.max(1),
+                                        ),
+                                    );
+                                }
                                 if soft_due {
-                                    if let Some(t) = tracker.as_mut() {
-                                        t.maintenance_state.soft_compaction_after_tokens = Some(
-                                            estimate.saturating_add(
-                                                policy.maintenance_growth_tokens.max(1),
-                                            ),
-                                        );
-                                    }
                                     yield update(
                                         AgentEvent::CompactionFailed(
                                             "Soft maintenance had nothing to compact; it will retry after context grows".into(),
@@ -641,14 +643,16 @@ where
                                 }
                             }
                             Err(error) => {
-                                if soft_due && !hard_due && !force_compaction {
-                                    if let Some(t) = tracker.as_mut() {
-                                        t.maintenance_state.soft_compaction_after_tokens = Some(
-                                            estimate.saturating_add(
-                                                policy.maintenance_growth_tokens.max(1),
-                                            ),
-                                        );
-                                    }
+                                if soft_due
+                                    && !hard_due
+                                    && !force_compaction
+                                    && let Some(t) = tracker.as_mut()
+                                {
+                                    t.maintenance_state.soft_compaction_after_tokens = Some(
+                                        estimate.saturating_add(
+                                            policy.maintenance_growth_tokens.max(1),
+                                        ),
+                                    );
                                 }
                                 yield update(
                                     AgentEvent::CompactionFailed(error.to_string()),
