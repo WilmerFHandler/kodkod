@@ -481,13 +481,17 @@ async fn opaque_maintenance_rebases_from_first_measurement_then_triggers_at_soft
 async fn manual_opaque_compaction_waits_for_the_first_measured_response() {
     let fixture = Arc::new(Fixture {
         opaque_compaction: true,
-        compact_input_tokens: Some(500_000),
+        compact_input_tokens: None,
         measured_input_tokens: Mutex::new(None),
         ..Default::default()
     });
     let agent = Agent::new(Backend(fixture.clone()));
     let transcript = history();
     let mut context = agent.context_from_history(&(), "fixture", &transcript);
+    context.measurement = Some(ContextMeasurement {
+        tokens: 500_000,
+        estimated_tokens: transcript.estimate_tokens(&[]),
+    });
 
     agent
         .compact_context(&mut context, &(), CompactOptions::default())

@@ -458,6 +458,11 @@ where
             .estimate_tokens(&[])
             .saturating_add(P::estimate_continuation_tokens(&replacement.continuation));
         let maintenance_baseline = prior_estimate
+            .max(
+                context
+                    .measurement
+                    .map_or(0, |measurement| measurement.tokens),
+            )
             .max(replacement_estimate)
             .max(replacement.usage.input_tokens.unwrap_or(0));
         context.conversation = replacement.conversation;
