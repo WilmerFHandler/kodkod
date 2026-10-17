@@ -12,6 +12,8 @@ use std::{
 #[derive(Serialize, Deserialize)]
 struct State {
     rounds: usize,
+    #[serde(default)]
+    opaque: bool,
 }
 #[derive(Default)]
 struct Fixture {
@@ -22,6 +24,9 @@ struct Fixture {
     tool: bool,
     hang: bool,
     no_progress: bool,
+    opaque_compaction: bool,
+    compact_input_tokens: Option<u64>,
+    measured_input_tokens: Option<u64>,
     steer: Option<TaskControl>,
     reject: bool,
 }
@@ -35,7 +40,16 @@ impl Provider for Backend {
         true
     }
     fn create_continuation(&self, _: &()) -> State {
-        State { rounds: 0 }
+        State {
+            rounds: 0,
+            opaque: false,
+        }
+    }
+    fn has_opaque_context(&self, continuation: &State) -> bool {
+        continuation.opaque
+    }
+    fn estimate_continuation_tokens(continuation: &State) -> u64 {
+        u64::from(continuation.opaque)
     }
     fn validate_context(&self, _: &(), _: &State) -> Result<(), String> {
         if self.0.reject {
@@ -81,8 +95,29 @@ impl Provider for Backend {
             reply,
             State {
                 rounds: c.rounds + 1,
+                opaque: c.opaque,
             },
         ))
+    }
+    async fn complete_with_usage(
+        &self,
+        continuation: &State,
+        model: &(),
+        history: &Conversation,
+        tools: &[ToolSpec],
+    ) -> Result<ProviderCompletion<State>, io::Error> {
+        let (message, next) = self.complete(continuation, model, history, tools).await?;
+        let usage = self
+            .0
+            .measured_input_tokens
+            .map_or_else(TokenUsage::unknown, |input_tokens| TokenUsage {
+                input_tokens: Some(input_tokens),
+                cached_input_tokens: None,
+                output_tokens: Some(1),
+                reasoning_output_tokens: None,
+                total_tokens: Some(input_tokens.saturating_add(1)),
+            });
+        Ok(ProviderCompletion::new(message, next, usage))
     }
     async fn compact_context(
         &self,
@@ -116,8 +151,20 @@ impl Provider for Backend {
         };
         Ok(ContextCompaction {
             conversation,
-            continuation: State { rounds: 1 },
-            usage: TokenUsage::zero(),
+            continuation: State {
+                rounds: 1,
+                opaque: self.0.opaque_compaction,
+            },
+            usage: self
+                .0
+                .compact_input_tokens
+                .map_or_else(TokenUsage::zero, |input_tokens| TokenUsage {
+                    input_tokens: Some(input_tokens),
+                    cached_input_tokens: None,
+                    output_tokens: Some(10),
+                    reasoning_output_tokens: None,
+                    total_tokens: Some(input_tokens.saturating_add(10)),
+                }),
         })
     }
 }
@@ -258,6 +305,71 @@ async fn failed_soft_maintenance_waits_for_growth_across_checkpoint_restore() {
         .collect::<Vec<_>>()
         .await;
     assert!(updates.iter().all(Result::is_ok));
+    assert_eq!(fixture.compactions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn opaque_maintenance_uses_measured_input_as_growth_baseline_after_restore() {
+    let fixture = Arc::new(Fixture {
+        opaque_compaction: true,
+        compact_input_tokens: Some(500_000),
+        measured_input_tokens: Some(500_000),
+        ..Default::default()
+    });
+    let agent = Agent::new(Backend(fixture.clone()));
+    let mut transcript = history();
+    let mut context = agent.context_from_history(&(), "fixture", &transcript);
+    let policy = CompactionPolicy {
+        maintenance_trigger_tokens: Some(100),
+        maintenance_growth_tokens: 32_000,
+        keep_tail_tokens: 10,
+        ..CompactionPolicy::default()
+    };
+    let first_user = UserMessage::new("first");
+    let first_control = TaskControl::new();
+    let mut first_task = agent.run_turn_context(
+        &mut context,
+        &(),
+        first_user.clone(),
+        &first_control,
+        Some(policy),
+    );
+    let mut saved = None;
+    while let Some(update) = first_task.next().await {
+        let update = update.unwrap();
+        if let AgentEvent::AssistantReply(message, _) = &update.event {
+            transcript.push_message(Message::User(first_user.clone()));
+            transcript.push_message(Message::Assistant(message.clone()));
+        }
+        if let Some(checkpoint) = update.checkpoint {
+            saved = Some(checkpoint);
+        }
+    }
+    drop(first_task);
+    assert_eq!(fixture.compactions.load(Ordering::SeqCst), 1);
+
+    let checkpoint = saved.unwrap();
+    assert_eq!(
+        checkpoint.maintenance_state.soft_compaction_after_tokens,
+        Some(532_000)
+    );
+    let checkpoint = serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    let mut restored = agent
+        .restore_context(&(), "fixture", &transcript, checkpoint)
+        .unwrap();
+    let second_control = TaskControl::new();
+    let second_updates = agent
+        .run_turn_context(
+            &mut restored,
+            &(),
+            UserMessage::new("second"),
+            &second_control,
+            Some(policy),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+    assert!(second_updates.iter().all(Result::is_ok));
     assert_eq!(fixture.compactions.load(Ordering::SeqCst), 1);
 }
 

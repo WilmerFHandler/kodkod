@@ -66,8 +66,14 @@ struct NativeContextWindow {
     profile: ResponsesRequestProfile,
     endpoint: String,
     output: Vec<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    output_tokens: Option<u64>,
+    /// Generated-token usage for `/responses/compact`; this is only a lower
+    /// bound for the replay window because canonical output may retain inputs.
+    #[serde(
+        default,
+        rename = "output_tokens",
+        skip_serializing_if = "Option::is_none"
+    )]
+    compaction_output_tokens: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -616,6 +622,85 @@ fn json_size<T: Serialize + ?Sized>(value: &T) -> usize {
     }
 }
 
+// Keep media sizing aligned with kodkod-core's tokenizer-free estimates. These
+// fixed item costs avoid mistaking inline base64 payload bytes for prompt tokens.
+const NATIVE_IMAGE_TOKEN_ESTIMATE: u64 = 2_000;
+const NATIVE_FILE_TOKEN_ESTIMATE: u64 = 8_000;
+
+fn native_window_token_estimate(window: &NativeContextWindow) -> u64 {
+    let generated_lower_bound = window.compaction_output_tokens.unwrap_or(0);
+    let readable_and_media = window.output.iter().fold(0_u64, |sum, value| {
+        sum.saturating_add(native_readable_and_media_tokens(value))
+    });
+    let opaque_envelope = if generated_lower_bound == 0 {
+        window.output.iter().fold(0_u64, |sum, value| {
+            sum.saturating_add(native_encrypted_content_bytes(value))
+        })
+    } else {
+        0
+    };
+
+    // `output_tokens` is generated usage, so it may omit retained user inputs.
+    // Plain text and media have bounded heuristics; encrypted bytes are counted
+    // separately as a conservative envelope only when usage is unavailable.
+    generated_lower_bound
+        .max(readable_and_media)
+        .max(opaque_envelope)
+}
+
+fn native_readable_and_media_tokens(value: &Value) -> u64 {
+    match value {
+        Value::Array(values) => values.iter().fold(0_u64, |sum, value| {
+            sum.saturating_add(native_readable_and_media_tokens(value))
+        }),
+        Value::Object(fields) => {
+            let item_type = fields.get("type").and_then(Value::as_str);
+            let media_tokens = match item_type {
+                Some("input_image") => NATIVE_IMAGE_TOKEN_ESTIMATE,
+                Some("input_file") => NATIVE_FILE_TOKEN_ESTIMATE,
+                _ => 0,
+            };
+            fields.iter().fold(media_tokens, |sum, (key, value)| {
+                if matches!(
+                    key.as_str(),
+                    "type" | "encrypted_content" | "image_url" | "file_data" | "data"
+                ) {
+                    return sum;
+                }
+                let child_tokens = if matches!(
+                    key.as_str(),
+                    "text" | "arguments" | "name" | "call_id" | "filename" | "refusal"
+                ) {
+                    value
+                        .as_str()
+                        .map_or(0, |text| text.len().div_ceil(3) as u64)
+                } else {
+                    native_readable_and_media_tokens(value)
+                };
+                sum.saturating_add(child_tokens)
+            })
+        }
+        _ => 0,
+    }
+}
+
+fn native_encrypted_content_bytes(value: &Value) -> u64 {
+    match value {
+        Value::Array(values) => values.iter().fold(0_u64, |sum, value| {
+            sum.saturating_add(native_encrypted_content_bytes(value))
+        }),
+        Value::Object(fields) => fields.iter().fold(0_u64, |sum, (key, value)| {
+            let bytes = if key == "encrypted_content" {
+                value.as_str().map_or(0, |text| text.len() as u64)
+            } else {
+                native_encrypted_content_bytes(value)
+            };
+            sum.saturating_add(bytes)
+        }),
+        _ => 0,
+    }
+}
+
 impl<M> OpenAiResponsesProvider<M>
 where
     M: OpenAiModel,
@@ -808,7 +893,7 @@ where
                     profile: self.profile,
                     endpoint: self.responses_url.clone(),
                     output,
-                    output_tokens: request_usage.token_usage.output_tokens,
+                    compaction_output_tokens: request_usage.token_usage.output_tokens,
                 }),
             },
             usage: request_usage.token_usage,
@@ -843,8 +928,7 @@ where
 
     fn estimate_continuation_tokens(continuation: &Self::Continuation) -> u64 {
         // Readable reasoning summaries are lower-bound estimates. Native compact
-        // outputs use reported output tokens when available, otherwise their serialized
-        // byte length is a conservative one-byte-per-token envelope, not a token count.
+        // usage counts generated tokens, not necessarily every retained replay item.
         let mut estimate = 0_u64;
         for item in continuation
             .checkpoints
@@ -866,11 +950,7 @@ where
             }
         }
         if let Some(window) = &continuation.native_window {
-            let native_estimate = window
-                .output_tokens
-                .filter(|tokens| *tokens > 0)
-                .unwrap_or_else(|| json_size(&window.output) as u64);
-            estimate = estimate.saturating_add(native_estimate);
+            estimate = estimate.saturating_add(native_window_token_estimate(window));
         }
         estimate
     }
@@ -2727,7 +2807,8 @@ mod tests {
             <OpenAiResponsesProvider<OptionsModel> as Provider>::estimate_continuation_tokens(
                 &compacted.continuation
             ),
-            10
+            10_010,
+            "retained user text and media contribute to the replay-window heuristic"
         );
         assert!(Provider::has_opaque_context(
             &provider,
@@ -2746,8 +2827,8 @@ mod tests {
             <OpenAiResponsesProvider<OptionsModel> as Provider>::estimate_continuation_tokens(
                 &restored
             ),
-            10,
-            "native checkpoint restore must retain the measured compact-output baseline"
+            10_010,
+            "native checkpoint restore must retain usage and retained-media estimates"
         );
         let mut next = compacted.conversation.clone();
         next.push_user_message(UserMessage::new("new turn"));
@@ -3028,16 +3109,83 @@ mod tests {
                 profile: ResponsesRequestProfile::OpenAiCompatible,
                 endpoint: "https://example.test/v1/responses".into(),
                 output: vec![json!({"type":"message", "content":[]})],
-                output_tokens: None,
+                compaction_output_tokens: None,
+            }),
+        };
+        assert!(Provider::validate_context(&provider, &TestModel, &continuation).is_err());
+    }
+
+    #[test]
+    fn native_window_estimate_counts_media_without_counting_base64_payload_bytes() {
+        let image_url = format!("data:image/png;base64,{}", "A".repeat(250_000));
+        let file_data = format!("data:application/pdf;base64,{}", "B".repeat(500_000));
+        let continuation = ResponsesContinuation {
+            checkpoints: Vec::new(),
+            native_window: Some(NativeContextWindow {
+                model: "gpt-test".into(),
+                profile: ResponsesRequestProfile::OpenAiCompatible,
+                endpoint: "https://example.test/v1/responses".into(),
+                output: vec![
+                    json!({"type":"compaction", "encrypted_content":"opaque-compaction"}),
+                    json!({"role":"user", "content":[
+                        {"type":"input_text", "text":"abc"},
+                        {"type":"input_image", "image_url":image_url},
+                        {"type":"input_file", "filename":"f.pdf", "file_data":file_data}
+                    ]}),
+                ],
+                compaction_output_tokens: Some(10),
             }),
         };
 
-        assert!(
+        assert_eq!(
             <OpenAiResponsesProvider<TestModel> as Provider>::estimate_continuation_tokens(
                 &continuation
-            ) > 0
+            ),
+            10_003
         );
-        assert!(Provider::validate_context(&provider, &TestModel, &continuation).is_err());
+    }
+
+    #[test]
+    fn native_window_without_usage_uses_opaque_and_readable_fallbacks() {
+        let opaque_only = ResponsesContinuation {
+            checkpoints: Vec::new(),
+            native_window: Some(NativeContextWindow {
+                model: "gpt-test".into(),
+                profile: ResponsesRequestProfile::OpenAiCompatible,
+                endpoint: "https://example.test/v1/responses".into(),
+                output: vec![json!({
+                    "type":"compaction",
+                    "encrypted_content":"opaque-compaction"
+                })],
+                compaction_output_tokens: None,
+            }),
+        };
+        let retained_media = ResponsesContinuation {
+            checkpoints: Vec::new(),
+            native_window: Some(NativeContextWindow {
+                model: "gpt-test".into(),
+                profile: ResponsesRequestProfile::OpenAiCompatible,
+                endpoint: "https://example.test/v1/responses".into(),
+                output: vec![json!({
+                    "role":"user",
+                    "content":[{"type":"input_image", "image_url":"data:image/png;base64,AAAA"}]
+                })],
+                compaction_output_tokens: None,
+            }),
+        };
+
+        assert_eq!(
+            <OpenAiResponsesProvider<TestModel> as Provider>::estimate_continuation_tokens(
+                &opaque_only
+            ),
+            "opaque-compaction".len() as u64
+        );
+        assert_eq!(
+            <OpenAiResponsesProvider<TestModel> as Provider>::estimate_continuation_tokens(
+                &retained_media
+            ),
+            NATIVE_IMAGE_TOKEN_ESTIMATE
+        );
     }
 
     #[tokio::test]

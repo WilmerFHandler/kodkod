@@ -566,8 +566,23 @@ where
                                     Err(AgentError::ContextMaintenance("Compaction made no room; reduce the input or use a larger context window".into()))?;
                                 }
                                 if let Some(t) = tracker.as_mut() {
+                                    // Native compaction returns an opaque replay window whose
+                                    // measured post-compaction size may be unknown. Use the
+                                    // actual pre-compaction input count as a temporary growth
+                                    // baseline so the next measured round does not immediately
+                                    // retrigger soft maintenance.
+                                    let maintenance_baseline = if self
+                                        .provider
+                                        .has_opaque_context(&continuation)
+                                    {
+                                        estimate
+                                            .max(next_estimate)
+                                            .max(usage.input_tokens.unwrap_or(0))
+                                    } else {
+                                        next_estimate
+                                    };
                                     t.maintenance_state.soft_compaction_after_tokens = Some(
-                                        next_estimate.saturating_add(
+                                        maintenance_baseline.saturating_add(
                                             policy.maintenance_growth_tokens.max(1),
                                         ),
                                     );

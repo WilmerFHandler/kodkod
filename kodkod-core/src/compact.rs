@@ -88,8 +88,8 @@ pub(crate) async fn run_with_usage<P: Provider + ?Sized>(
         || conversation.clone(),
         |keep| conversation.retain_recent_tool_image_observations(keep),
     );
-    let kept = match plan(projected.messages(), options.keep_tail_tokens) {
-        Some(kept) => kept,
+    let plan = match plan_with_tail(projected.messages(), options.keep_tail_tokens) {
+        Some(plan) => plan,
         None if projected != *conversation => {
             return Ok(CompactionResult {
                 conversation: projected,
@@ -98,21 +98,12 @@ pub(crate) async fn run_with_usage<P: Provider + ?Sized>(
         }
         None => return Err(CompactError::NothingToCompact),
     };
-    let request = summarizer_conversation(
-        &projected,
-        tail_starts_at(&kept, projected.messages().len()),
-    );
+    let summary_input = summarizer_messages(&projected, plan.tail_start, &plan.kept);
+    let request = summarizer_conversation(&summary_input);
     let tools = [summarize_tool()];
     let budget = provider.context_budget(model).map(|b| b.max_input_tokens);
     let (summary, usage) = if budget.is_some_and(|limit| request.estimate_tokens(&tools) >= limit) {
-        summarize_bounded(
-            provider,
-            model,
-            &projected.messages()[..tail_starts_at(&kept, projected.messages().len())],
-            budget.unwrap(),
-            &tools,
-        )
-        .await?
+        summarize_bounded(provider, model, &summary_input, budget.unwrap(), &tools).await?
     } else {
         let completion = provider
             .complete_once_with_usage(model, &request, &tools)
@@ -121,7 +112,7 @@ pub(crate) async fn run_with_usage<P: Provider + ?Sized>(
         (summary_from_reply(&completion.message)?, completion.usage)
     };
     Ok(CompactionResult {
-        conversation: splice(&projected, &kept, AssistantMessage::new(summary)),
+        conversation: splice(&projected, &plan.kept, AssistantMessage::new(summary)),
         usage,
     })
 }
@@ -195,7 +186,17 @@ async fn summarize_bounded<P: Provider + ?Sized>(
     Ok((summary, usage))
 }
 
+struct CompactionPlan {
+    kept: Vec<usize>,
+    tail_start: usize,
+}
+
+#[cfg(test)]
 fn plan(messages: &[Message], keep_tail_tokens: u64) -> Option<Vec<usize>> {
+    plan_with_tail(messages, keep_tail_tokens).map(|plan| plan.kept)
+}
+
+fn plan_with_tail(messages: &[Message], keep_tail_tokens: u64) -> Option<CompactionPlan> {
     if messages.is_empty() {
         return None;
     }
@@ -220,7 +221,10 @@ fn plan(messages: &[Message], keep_tail_tokens: u64) -> Option<Vec<usize>> {
     if kept.len() == messages.len() {
         None
     } else {
-        Some(kept)
+        Some(CompactionPlan {
+            kept,
+            tail_start: tail_starts_at,
+        })
     }
 }
 
@@ -287,18 +291,6 @@ fn first_protocol_violation(messages: &[Message], start: usize) -> Option<usize>
     None
 }
 
-fn tail_starts_at(kept: &[usize], message_count: usize) -> usize {
-    let mut start = message_count;
-    for &index in kept.iter().rev() {
-        if index + 1 == start {
-            start = index;
-        } else {
-            break;
-        }
-    }
-    start
-}
-
 fn splice(conversation: &Conversation, kept: &[usize], summary: AssistantMessage) -> Conversation {
     let mut compacted = match conversation.system_prompt() {
         Some(prompt) => Conversation::new().with_system_prompt(prompt),
@@ -329,9 +321,40 @@ fn splice_messages(
     out
 }
 
-fn summarizer_conversation(conversation: &Conversation, tail_starts_at: usize) -> Conversation {
+fn summarizer_messages(
+    conversation: &Conversation,
+    tail_start: usize,
+    kept: &[usize],
+) -> Vec<Message> {
+    let messages = conversation.messages();
+    let latest_system = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| matches!(message, Message::System(_)))
+        .map(|(index, message)| (index, (*message).clone()));
+    let mut summary_messages =
+        Vec::with_capacity(tail_start + usize::from(latest_system.is_some()));
+    for (index, message) in messages.iter().take(tail_start).enumerate() {
+        if kept.binary_search(&index).is_err()
+            || latest_system
+                .as_ref()
+                .is_some_and(|(system_index, _)| *system_index == index)
+        {
+            summary_messages.push((*message).clone());
+        }
+    }
+    if let Some((index, system)) = latest_system
+        && index >= tail_start
+    {
+        summary_messages.push(system);
+    }
+    summary_messages
+}
+
+fn summarizer_conversation(messages: &[Message]) -> Conversation {
     let mut request = Conversation::new().with_system_prompt(COMPACTION_SYSTEM.trim());
-    for message in &conversation.messages()[..tail_starts_at] {
+    for message in messages {
         request.push_message(message.clone());
     }
     request.push_user_message(UserMessage::new(COMPACTION_USER));
