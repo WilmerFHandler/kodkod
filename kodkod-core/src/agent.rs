@@ -448,10 +448,26 @@ where
             options,
         )
         .await?;
+        let has_opaque_context = self.provider.has_opaque_context(&replacement.continuation);
+        let prior_estimate = context
+            .conversation
+            .estimate_tokens(&[])
+            .saturating_add(P::estimate_continuation_tokens(&context.continuation));
+        let replacement_estimate = replacement
+            .conversation
+            .estimate_tokens(&[])
+            .saturating_add(P::estimate_continuation_tokens(&replacement.continuation));
+        let maintenance_baseline = prior_estimate
+            .max(replacement_estimate)
+            .max(replacement.usage.input_tokens.unwrap_or(0));
         context.conversation = replacement.conversation;
         context.continuation = Arc::new(replacement.continuation);
         context.measurement = None;
-        context.maintenance_state.soft_compaction_after_tokens = None;
+        context.maintenance_state.soft_compaction_after_tokens = has_opaque_context.then(|| {
+            maintenance_baseline
+                .saturating_add(CompactionPolicy::default().maintenance_growth_tokens.max(1))
+        });
+        context.maintenance_state.awaiting_native_measurement = has_opaque_context;
         Ok(replacement.usage)
     }
 
@@ -559,8 +575,10 @@ where
                                 let next_estimate = replacement
                                     .estimate_tokens(&tool_specs)
                                     .saturating_add(P::estimate_continuation_tokens(&continuation));
+                                let has_opaque_context =
+                                    self.provider.has_opaque_context(&continuation);
                                 let ineffective = next_estimate >= estimate
-                                    && !self.provider.has_opaque_context(&continuation);
+                                    && !has_opaque_context;
                                 if (hard_due || force_compaction) && ineffective {
                                     turn_usage.add_round(usage);
                                     Err(AgentError::ContextMaintenance("Compaction made no room; reduce the input or use a larger context window".into()))?;
@@ -571,10 +589,7 @@ where
                                     // actual pre-compaction input count as a temporary growth
                                     // baseline so the next measured round does not immediately
                                     // retrigger soft maintenance.
-                                    let maintenance_baseline = if self
-                                        .provider
-                                        .has_opaque_context(&continuation)
-                                    {
+                                    let maintenance_baseline = if has_opaque_context {
                                         estimate
                                             .max(next_estimate)
                                             .max(usage.input_tokens.unwrap_or(0))
@@ -586,6 +601,8 @@ where
                                             policy.maintenance_growth_tokens.max(1),
                                         ),
                                     );
+                                    t.maintenance_state.awaiting_native_measurement =
+                                        has_opaque_context;
                                 }
                                 turn_usage.add_round(usage);
                                 if soft_due
@@ -875,10 +892,21 @@ where
                             context.as_ref().expect("context exists").continuation(),
                         ),
                     );
+                    let measured_tokens = input.saturating_add(round_usage.output_tokens.unwrap_or(0));
                     *t.measurement = Some(ContextMeasurement {
-                        tokens: input.saturating_add(round_usage.output_tokens.unwrap_or(0)),
+                        tokens: measured_tokens,
                         estimated_tokens,
                     });
+                    if t.maintenance_state.awaiting_native_measurement
+                        && let Some(policy) = policy
+                    {
+                        t.maintenance_state.soft_compaction_after_tokens = Some(
+                            measured_tokens.saturating_add(
+                                policy.maintenance_growth_tokens.max(1),
+                            ),
+                        );
+                        t.maintenance_state.awaiting_native_measurement = false;
+                    }
                 }
                 yield update(
                     AgentEvent::AssistantReply(message.clone(), round_usage),

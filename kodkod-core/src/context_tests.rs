@@ -26,7 +26,7 @@ struct Fixture {
     no_progress: bool,
     opaque_compaction: bool,
     compact_input_tokens: Option<u64>,
-    measured_input_tokens: Option<u64>,
+    measured_input_tokens: Mutex<Option<u64>>,
     steer: Option<TaskControl>,
     reject: bool,
 }
@@ -107,16 +107,16 @@ impl Provider for Backend {
         tools: &[ToolSpec],
     ) -> Result<ProviderCompletion<State>, io::Error> {
         let (message, next) = self.complete(continuation, model, history, tools).await?;
-        let usage = self
-            .0
-            .measured_input_tokens
-            .map_or_else(TokenUsage::unknown, |input_tokens| TokenUsage {
+        let usage = (*self.0.measured_input_tokens.lock().unwrap()).map_or_else(
+            TokenUsage::unknown,
+            |input_tokens| TokenUsage {
                 input_tokens: Some(input_tokens),
                 cached_input_tokens: None,
                 output_tokens: Some(1),
                 reasoning_output_tokens: None,
                 total_tokens: Some(input_tokens.saturating_add(1)),
-            });
+            },
+        );
         Ok(ProviderCompletion::new(message, next, usage))
     }
     async fn compact_context(
@@ -223,6 +223,22 @@ fn appended_system_context_is_checkpointed_without_advancing_transcript_cursor()
     let legacy: ContextCheckpoint<State> = serde_json::from_value(legacy).unwrap();
     assert_eq!(legacy.maintenance_state, ContextMaintenanceState::default());
 
+    let mut legacy = encoded.clone();
+    legacy
+        .get_mut("maintenance_state")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("awaiting_native_measurement");
+    let legacy: ContextCheckpoint<State> = serde_json::from_value(legacy).unwrap();
+    assert_eq!(
+        legacy.maintenance_state,
+        ContextMaintenanceState {
+            soft_compaction_after_tokens: Some(900),
+            awaiting_native_measurement: false,
+        }
+    );
+
     let checkpoint: ContextCheckpoint<State> = serde_json::from_value(encoded).unwrap();
     let restored = agent
         .restore_context(&(), "fixture", &transcript, checkpoint)
@@ -313,7 +329,7 @@ async fn opaque_maintenance_uses_measured_input_as_growth_baseline_after_restore
     let fixture = Arc::new(Fixture {
         opaque_compaction: true,
         compact_input_tokens: Some(500_000),
-        measured_input_tokens: Some(500_000),
+        measured_input_tokens: Mutex::new(Some(500_000)),
         ..Default::default()
     });
     let agent = Agent::new(Backend(fixture.clone()));
@@ -351,7 +367,7 @@ async fn opaque_maintenance_uses_measured_input_as_growth_baseline_after_restore
     let checkpoint = saved.unwrap();
     assert_eq!(
         checkpoint.maintenance_state.soft_compaction_after_tokens,
-        Some(532_000)
+        Some(532_001)
     );
     let checkpoint = serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
     let mut restored = agent
@@ -371,6 +387,145 @@ async fn opaque_maintenance_uses_measured_input_as_growth_baseline_after_restore
 
     assert!(second_updates.iter().all(Result::is_ok));
     assert_eq!(fixture.compactions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn opaque_maintenance_rebases_from_first_measurement_then_triggers_at_soft_limit() {
+    let fixture = Arc::new(Fixture {
+        opaque_compaction: true,
+        compact_input_tokens: Some(500_000),
+        measured_input_tokens: Mutex::new(None),
+        ..Default::default()
+    });
+    let agent = Agent::new(Backend(fixture.clone()));
+    let mut transcript = Conversation::new();
+    transcript.push_user_message(UserMessage::new("old ".repeat(140_000)));
+    let mut context = agent.context_from_history(&(), "fixture", &transcript);
+    let policy = CompactionPolicy {
+        maintenance_trigger_tokens: Some(128_000),
+        maintenance_growth_tokens: 32_000,
+        keep_tail_tokens: 10,
+        ..CompactionPolicy::default()
+    };
+    let first_user = UserMessage::new("first");
+    let first_control = TaskControl::new();
+    let mut first_task = agent.run_turn_context(
+        &mut context,
+        &(),
+        first_user.clone(),
+        &first_control,
+        Some(policy),
+    );
+    let mut saved = None;
+    while let Some(update) = first_task.next().await {
+        let update = update.unwrap();
+        if let AgentEvent::AssistantReply(message, _) = &update.event {
+            transcript.push_message(Message::User(first_user.clone()));
+            transcript.push_message(Message::Assistant(message.clone()));
+        }
+        if let Some(checkpoint) = update.checkpoint {
+            saved = Some(checkpoint);
+        }
+    }
+    drop(first_task);
+    assert_eq!(fixture.compactions.load(Ordering::SeqCst), 1);
+
+    let checkpoint = saved.unwrap();
+    assert!(checkpoint.maintenance_state.awaiting_native_measurement);
+    assert_eq!(
+        checkpoint.maintenance_state.soft_compaction_after_tokens,
+        Some(532_000)
+    );
+    let checkpoint = serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    let mut restored = agent
+        .restore_context(&(), "fixture", &transcript, checkpoint)
+        .unwrap();
+
+    *fixture.measured_input_tokens.lock().unwrap() = Some(50_000);
+    let second_control = TaskControl::new();
+    let second_updates = agent
+        .run_turn_context(
+            &mut restored,
+            &(),
+            UserMessage::new("small next turn"),
+            &second_control,
+            Some(policy),
+        )
+        .collect::<Vec<_>>()
+        .await;
+    assert!(second_updates.iter().all(Result::is_ok));
+    assert_eq!(fixture.compactions.load(Ordering::SeqCst), 1);
+    let remeasured = restored.checkpoint().unwrap();
+    assert!(!remeasured.maintenance_state.awaiting_native_measurement);
+    assert_eq!(
+        remeasured.maintenance_state.soft_compaction_after_tokens,
+        Some(82_001)
+    );
+
+    let third_control = TaskControl::new();
+    let third_updates = agent
+        .run_turn_context(
+            &mut restored,
+            &(),
+            UserMessage::new("x".repeat(300_000)),
+            &third_control,
+            Some(policy),
+        )
+        .collect::<Vec<_>>()
+        .await;
+    assert!(third_updates.iter().all(Result::is_ok));
+    assert_eq!(fixture.compactions.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn manual_opaque_compaction_waits_for_the_first_measured_response() {
+    let fixture = Arc::new(Fixture {
+        opaque_compaction: true,
+        compact_input_tokens: Some(500_000),
+        measured_input_tokens: Mutex::new(None),
+        ..Default::default()
+    });
+    let agent = Agent::new(Backend(fixture.clone()));
+    let transcript = history();
+    let mut context = agent.context_from_history(&(), "fixture", &transcript);
+
+    agent
+        .compact_context(&mut context, &(), CompactOptions::default())
+        .await
+        .unwrap();
+    let checkpoint = context.checkpoint().unwrap();
+    assert!(checkpoint.maintenance_state.awaiting_native_measurement);
+    assert_eq!(
+        checkpoint.maintenance_state.soft_compaction_after_tokens,
+        Some(532_000)
+    );
+
+    *fixture.measured_input_tokens.lock().unwrap() = Some(50_000);
+    let policy = CompactionPolicy {
+        maintenance_trigger_tokens: Some(128_000),
+        maintenance_growth_tokens: 32_000,
+        keep_tail_tokens: 10,
+        ..CompactionPolicy::default()
+    };
+    let control = TaskControl::new();
+    let updates = agent
+        .run_turn_context(
+            &mut context,
+            &(),
+            UserMessage::new("small after manual compaction"),
+            &control,
+            Some(policy),
+        )
+        .collect::<Vec<_>>()
+        .await;
+    assert!(updates.iter().all(Result::is_ok));
+    assert_eq!(fixture.compactions.load(Ordering::SeqCst), 1);
+    let checkpoint = context.checkpoint().unwrap();
+    assert!(!checkpoint.maintenance_state.awaiting_native_measurement);
+    assert_eq!(
+        checkpoint.maintenance_state.soft_compaction_after_tokens,
+        Some(82_001)
+    );
 }
 
 #[tokio::test]

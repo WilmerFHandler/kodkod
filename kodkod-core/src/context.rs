@@ -116,6 +116,9 @@ pub struct ContextMeasurement {
 pub struct ContextMaintenanceState {
     /// Estimated context size at which optional maintenance may run again.
     pub soft_compaction_after_tokens: Option<u64>,
+    /// Native compaction's replayed size is opaque until a response reports input usage.
+    #[serde(default)]
+    pub awaiting_native_measurement: bool,
 }
 
 /// A provider's explicit compaction result, including authoritative native replay state.
