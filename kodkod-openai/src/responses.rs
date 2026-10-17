@@ -66,6 +66,8 @@ struct NativeContextWindow {
     profile: ResponsesRequestProfile,
     endpoint: String,
     output: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_tokens: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -623,12 +625,16 @@ where
         continuation: &ResponsesContinuation,
         model: &M,
         conversation: &Conversation,
+        options: CompactOptions,
     ) -> Result<ContextCompaction<ResponsesContinuation>, CompactError<OpenAiError>> {
-        validate_documents(conversation, model.supports_vision())
-            .map_err(CompactError::Provider)?;
+        let projected = options.retain_recent_tool_image_observations.map_or_else(
+            || conversation.clone(),
+            |keep| conversation.retain_recent_tool_image_observations(keep),
+        );
+        validate_documents(&projected, model.supports_vision()).map_err(CompactError::Provider)?;
         let input = build_input_for_endpoint(
             model.id(),
-            conversation,
+            &projected,
             continuation,
             self.profile,
             &self.responses_url,
@@ -670,7 +676,7 @@ where
                     observer,
                     model,
                     self.profile,
-                    conversation,
+                    &projected,
                     &[],
                     continuation,
                     &request,
@@ -802,6 +808,7 @@ where
                     profile: self.profile,
                     endpoint: self.responses_url.clone(),
                     output,
+                    output_tokens: request_usage.token_usage.output_tokens,
                 }),
             },
             usage: request_usage.token_usage,
@@ -835,8 +842,9 @@ where
     }
 
     fn estimate_continuation_tokens(continuation: &Self::Continuation) -> u64 {
-        // This is a lower-bound heuristic for readable reasoning summaries;
-        // encrypted reasoning bytes are opaque and must not be treated as text.
+        // Readable reasoning summaries are lower-bound estimates. Native compact
+        // outputs use reported output tokens when available, otherwise their serialized
+        // byte length is a conservative one-byte-per-token envelope, not a token count.
         let mut estimate = 0_u64;
         for item in continuation
             .checkpoints
@@ -856,6 +864,13 @@ where
                     estimate = estimate.saturating_add(text.len().div_ceil(4) as u64);
                 }
             }
+        }
+        if let Some(window) = &continuation.native_window {
+            let native_estimate = window
+                .output_tokens
+                .filter(|tokens| *tokens > 0)
+                .unwrap_or_else(|| json_size(&window.output) as u64);
+            estimate = estimate.saturating_add(native_estimate);
         }
         estimate
     }
@@ -906,7 +921,8 @@ where
             });
         }
 
-        self.compact_native(continuation, model, conversation).await
+        self.compact_native(continuation, model, conversation, options)
+            .await
     }
 
     async fn complete(
@@ -2698,6 +2714,7 @@ mod tests {
                 &original,
                 CompactOptions {
                     keep_tail_tokens: 0,
+                    ..CompactOptions::default()
                 },
             )
             .await
@@ -2710,7 +2727,7 @@ mod tests {
             <OpenAiResponsesProvider<OptionsModel> as Provider>::estimate_continuation_tokens(
                 &compacted.continuation
             ),
-            0
+            10
         );
         assert!(Provider::has_opaque_context(
             &provider,
@@ -2725,6 +2742,13 @@ mod tests {
             "the compact endpoint output must be retained without normalizing opaque fields"
         );
         let restored: ResponsesContinuation = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            <OpenAiResponsesProvider<OptionsModel> as Provider>::estimate_continuation_tokens(
+                &restored
+            ),
+            10,
+            "native checkpoint restore must retain the measured compact-output baseline"
+        );
         let mut next = compacted.conversation.clone();
         next.push_user_message(UserMessage::new("new turn"));
         let completion = provider
@@ -3004,9 +3028,15 @@ mod tests {
                 profile: ResponsesRequestProfile::OpenAiCompatible,
                 endpoint: "https://example.test/v1/responses".into(),
                 output: vec![json!({"type":"message", "content":[]})],
+                output_tokens: None,
             }),
         };
 
+        assert!(
+            <OpenAiResponsesProvider<TestModel> as Provider>::estimate_continuation_tokens(
+                &continuation
+            ) > 0
+        );
         assert!(Provider::validate_context(&provider, &TestModel, &continuation).is_err());
     }
 

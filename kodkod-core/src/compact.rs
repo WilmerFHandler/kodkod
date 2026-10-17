@@ -16,6 +16,8 @@ const SUMMARIZE_TOOL: &str = "summarize";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactOptions {
     pub keep_tail_tokens: u64,
+    /// Preserve only the newest image-bearing tool results while compacting.
+    pub retain_recent_tool_image_observations: Option<usize>,
 }
 
 /// Per-turn compaction settings. The model may differ from the turn model.
@@ -29,6 +31,7 @@ impl Default for CompactOptions {
     fn default() -> Self {
         Self {
             keep_tail_tokens: DEFAULT_KEEP_TAIL_TOKENS,
+            retain_recent_tool_image_observations: None,
         }
     }
 }
@@ -81,11 +84,23 @@ pub(crate) async fn run_with_usage<P: Provider + ?Sized>(
     conversation: &Conversation,
     options: CompactOptions,
 ) -> Result<CompactionResult, CompactError<P::Error>> {
-    let kept = plan(conversation.messages(), options.keep_tail_tokens)
-        .ok_or(CompactError::NothingToCompact)?;
+    let projected = options.retain_recent_tool_image_observations.map_or_else(
+        || conversation.clone(),
+        |keep| conversation.retain_recent_tool_image_observations(keep),
+    );
+    let kept = match plan(projected.messages(), options.keep_tail_tokens) {
+        Some(kept) => kept,
+        None if projected != *conversation => {
+            return Ok(CompactionResult {
+                conversation: projected,
+                usage: TokenUsage::zero(),
+            });
+        }
+        None => return Err(CompactError::NothingToCompact),
+    };
     let request = summarizer_conversation(
-        conversation,
-        tail_starts_at(&kept, conversation.messages().len()),
+        &projected,
+        tail_starts_at(&kept, projected.messages().len()),
     );
     let tools = [summarize_tool()];
     let budget = provider.context_budget(model).map(|b| b.max_input_tokens);
@@ -93,7 +108,7 @@ pub(crate) async fn run_with_usage<P: Provider + ?Sized>(
         summarize_bounded(
             provider,
             model,
-            &conversation.messages()[..tail_starts_at(&kept, conversation.messages().len())],
+            &projected.messages()[..tail_starts_at(&kept, projected.messages().len())],
             budget.unwrap(),
             &tools,
         )
@@ -106,7 +121,7 @@ pub(crate) async fn run_with_usage<P: Provider + ?Sized>(
         (summary_from_reply(&completion.message)?, completion.usage)
     };
     Ok(CompactionResult {
-        conversation: splice(conversation, &kept, AssistantMessage::new(summary)),
+        conversation: splice(&projected, &kept, AssistantMessage::new(summary)),
         usage,
     })
 }
@@ -210,22 +225,28 @@ fn plan(messages: &[Message], keep_tail_tokens: u64) -> Option<Vec<usize>> {
 }
 
 fn pinned_indices(messages: &[Message]) -> Vec<usize> {
-    let Some(latest_user) = messages
+    let latest_user = messages
         .iter()
-        .rposition(|message| matches!(message, Message::User(user) if !user.steered()))
-    else {
-        return Vec::new();
-    };
-
-    messages
+        .rposition(|message| matches!(message, Message::User(user) if !user.steered()));
+    let latest_system = messages
         .iter()
         .enumerate()
-        .skip(latest_user)
-        .filter_map(|(index, message)| match message {
-            Message::User(user) if index == latest_user || user.steered() => Some(index),
-            _ => None,
-        })
-        .collect()
+        .rposition(|(_, message)| matches!(message, Message::System(_)));
+    let mut pinned = Vec::new();
+    if let Some(latest_user) = latest_user {
+        pinned.extend(messages.iter().enumerate().skip(latest_user).filter_map(
+            |(index, message)| match message {
+                Message::User(user) if index == latest_user || user.steered() => Some(index),
+                _ => None,
+            },
+        ));
+    }
+    if let Some(latest_system) = latest_system {
+        pinned.push(latest_system);
+    }
+    pinned.sort_unstable();
+    pinned.dedup();
+    pinned
 }
 
 fn protocol_safe_tail_start(messages: &[Message], mut start: usize) -> usize {
@@ -354,7 +375,7 @@ fn summary_from_reply<E>(message: &AssistantMessage) -> Result<String, CompactEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Provider, ToolCall, ToolResult, ToolSpec};
+    use crate::{Provider, SystemMessage, ToolCall, ToolResult, ToolSpec};
     use serde_json::json;
     use std::error::Error;
     use std::future::{Future, ready};
@@ -593,12 +614,14 @@ mod tests {
     fn tiny_tail() -> CompactOptions {
         CompactOptions {
             keep_tail_tokens: 1,
+            ..CompactOptions::default()
         }
     }
 
     fn last_message_tail(conversation: &Conversation) -> CompactOptions {
         CompactOptions {
             keep_tail_tokens: conversation.messages().last().unwrap().estimate_tokens(),
+            ..CompactOptions::default()
         }
     }
 
@@ -664,6 +687,32 @@ mod tests {
                 .iter()
                 .any(|message| matches!(message, Message::User(u) if u.content() == "old task"))
         );
+    }
+
+    #[tokio::test]
+    async fn portable_compaction_keeps_latest_inline_system_context_verbatim() {
+        let provider = FakeProvider::with_summary("SUM");
+        let mut conversation = Conversation::new().with_system_prompt("stable instructions");
+        conversation.push_user_message(UserMessage::new("old task"));
+        conversation.push_message(Message::Assistant(AssistantMessage::new("x".repeat(300))));
+        conversation.push_message(Message::System(SystemMessage::new(
+            "latest host snapshot: preserve these current notes and references",
+        )));
+        conversation.push_user_message(UserMessage::new("latest task"));
+        conversation.push_message(Message::Assistant(AssistantMessage::new("recent answer")));
+
+        let compacted = provider
+            .compact(&(), &conversation, last_message_tail(&conversation))
+            .await
+            .unwrap();
+
+        let seen = provider.seen.lock().unwrap();
+        assert!(seen[0].1.messages().iter().any(
+            |message| matches!(message, Message::System(system) if system.content().starts_with("latest host snapshot:"))
+        ));
+        assert!(compacted.messages().iter().any(
+            |message| matches!(message, Message::System(system) if system.content() == "latest host snapshot: preserve these current notes and references")
+        ));
     }
 
     #[tokio::test]

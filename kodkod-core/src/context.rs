@@ -13,15 +13,26 @@ pub struct ContextBudget {
 
 /// Automatic maintenance policy. Unknown model budgets do not invent a window size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CompactionPolicy {
+    /// Hard input capacity. When omitted, the provider's declared capacity is used.
     pub budget: Option<ContextBudget>,
     pub keep_tail_tokens: u64,
+    /// Optional economic working-context trigger, separate from provider capacity.
+    pub maintenance_trigger_tokens: Option<u64>,
+    /// Minimum growth after maintenance before soft maintenance runs again.
+    pub maintenance_growth_tokens: u64,
+    /// Keep this many recent image-bearing tool results at compaction boundaries.
+    pub retain_recent_tool_image_observations: Option<usize>,
 }
 impl Default for CompactionPolicy {
     fn default() -> Self {
         Self {
             budget: None,
             keep_tail_tokens: crate::DEFAULT_KEEP_TAIL_TOKENS,
+            maintenance_trigger_tokens: None,
+            maintenance_growth_tokens: 32_000,
+            retain_recent_tool_image_observations: None,
         }
     }
 }
@@ -29,6 +40,7 @@ impl CompactionPolicy {
     pub fn options(self) -> CompactOptions {
         CompactOptions {
             keep_tail_tokens: self.keep_tail_tokens,
+            retain_recent_tool_image_observations: self.retain_recent_tool_image_observations,
         }
     }
 }
@@ -67,6 +79,8 @@ pub struct ContextCheckpoint<C> {
     pub continuation: Arc<C>,
     #[serde(default)]
     pub measurement: Option<ContextMeasurement>,
+    #[serde(default)]
+    pub maintenance_state: ContextMaintenanceState,
 }
 impl<C> Clone for ContextCheckpoint<C> {
     fn clone(&self) -> Self {
@@ -77,6 +91,7 @@ impl<C> Clone for ContextCheckpoint<C> {
             conversation: self.conversation.clone(),
             continuation: self.continuation.clone(),
             measurement: self.measurement,
+            maintenance_state: self.maintenance_state,
         }
     }
 }
@@ -94,6 +109,13 @@ impl<C> fmt::Debug for ContextCheckpoint<C> {
 pub struct ContextMeasurement {
     pub tokens: u64,
     pub estimated_tokens: u64,
+}
+
+/// Persistent soft-maintenance hysteresis. Hard capacity and forced compaction always bypass it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextMaintenanceState {
+    /// Estimated context size at which optional maintenance may run again.
+    pub soft_compaction_after_tokens: Option<u64>,
 }
 
 /// A provider's explicit compaction result, including authoritative native replay state.
@@ -119,6 +141,7 @@ pub struct AgentContext<P: Provider> {
     pub(crate) cursor: ContextCursor,
     pub(crate) binding: String,
     pub(crate) measurement: Option<ContextMeasurement>,
+    pub(crate) maintenance_state: ContextMaintenanceState,
     pub(crate) managed: bool,
 }
 impl<P: Provider> AgentContext<P> {
@@ -128,6 +151,11 @@ impl<P: Provider> AgentContext<P> {
     /// Update current instructions without replacing accepted messages or native history.
     pub fn set_system_prompt(&mut self, prompt: Option<&str>) {
         self.conversation.set_system_prompt(prompt);
+    }
+    /// Append host-controlled context to active inference history without moving the
+    /// original-transcript cursor. Call between turns before appending the next user message.
+    pub fn append_system_context(&mut self, message: crate::SystemMessage) {
+        self.conversation.push_message(Message::System(message));
     }
     pub fn checkpoint(&self) -> Result<ContextCheckpoint<P::Continuation>, String> {
         if !self.managed {
@@ -142,6 +170,7 @@ impl<P: Provider> AgentContext<P> {
             conversation: self.conversation.clone(),
             continuation: self.continuation.clone(),
             measurement: self.measurement,
+            maintenance_state: self.maintenance_state,
         })
     }
     pub fn estimated_continuation_tokens(&self) -> u64 {

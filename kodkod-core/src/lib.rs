@@ -25,7 +25,7 @@ pub use compact::{
 };
 pub use context::{
     AgentContext, AgentUpdate, CompactionPolicy, ContextBudget, ContextCheckpoint,
-    ContextCompaction, ContextCursor, ContextMeasurement, ContextTask,
+    ContextCompaction, ContextCursor, ContextMaintenanceState, ContextMeasurement, ContextTask,
 };
 pub use conversation::Conversation;
 pub use message::{

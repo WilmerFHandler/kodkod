@@ -151,7 +151,114 @@ fn policy(limit: u64) -> CompactionPolicy {
             max_input_tokens: limit,
         }),
         keep_tail_tokens: 10,
+        ..CompactionPolicy::default()
     }
+}
+
+#[test]
+fn appended_system_context_is_checkpointed_without_advancing_transcript_cursor() {
+    let agent = Agent::new(Backend(Arc::new(Fixture::default())));
+    let transcript = history();
+    let mut context = agent.context_from_history(&(), "fixture", &transcript);
+    let original_cursor = context.checkpoint().unwrap().cursor;
+    context.append_system_context(SystemMessage::new("latest host snapshot"));
+    context.maintenance_state.soft_compaction_after_tokens = Some(900);
+
+    let checkpoint = context.checkpoint().unwrap();
+    assert_eq!(checkpoint.cursor, original_cursor);
+    assert!(matches!(
+        checkpoint.conversation.messages().last(),
+        Some(Message::System(message)) if message.content() == "latest host snapshot"
+    ));
+    let encoded = serde_json::to_value(&checkpoint).unwrap();
+    let mut legacy = encoded.clone();
+    legacy.as_object_mut().unwrap().remove("maintenance_state");
+    let legacy: ContextCheckpoint<State> = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.maintenance_state, ContextMaintenanceState::default());
+
+    let checkpoint: ContextCheckpoint<State> = serde_json::from_value(encoded).unwrap();
+    let restored = agent
+        .restore_context(&(), "fixture", &transcript, checkpoint)
+        .unwrap();
+    assert_eq!(restored.checkpoint().unwrap().cursor, original_cursor);
+    assert_eq!(
+        restored.maintenance_state.soft_compaction_after_tokens,
+        Some(900)
+    );
+    assert!(matches!(
+        restored.conversation().messages().last(),
+        Some(Message::System(message)) if message.content() == "latest host snapshot"
+    ));
+}
+
+#[tokio::test]
+async fn failed_soft_maintenance_waits_for_growth_across_checkpoint_restore() {
+    let fixture = Arc::new(Fixture {
+        no_progress: true,
+        ..Default::default()
+    });
+    let agent = Agent::new(Backend(fixture.clone()));
+    let mut transcript = history();
+    let mut context = agent.context_from_history(&(), "fixture", &transcript);
+    let policy = CompactionPolicy {
+        maintenance_trigger_tokens: Some(100),
+        maintenance_growth_tokens: 100_000,
+        keep_tail_tokens: 10,
+        ..CompactionPolicy::default()
+    };
+    let first_user = UserMessage::new("first");
+    let first_control = TaskControl::new();
+    let mut task = agent.run_turn_context(
+        &mut context,
+        &(),
+        first_user.clone(),
+        &first_control,
+        Some(policy),
+    );
+    let mut saved = None;
+    let mut saw_failed_soft_maintenance = false;
+    while let Some(update) = task.next().await {
+        let update = update.unwrap();
+        if matches!(update.event, AgentEvent::CompactionFailed(_)) {
+            saw_failed_soft_maintenance = true;
+        }
+        if let AgentEvent::AssistantReply(message, _) = &update.event {
+            transcript.push_message(Message::User(first_user.clone()));
+            transcript.push_message(Message::Assistant(message.clone()));
+        }
+        if let Some(checkpoint) = update.checkpoint {
+            saved = Some(checkpoint);
+        }
+    }
+    drop(task);
+    assert!(saw_failed_soft_maintenance);
+    assert_eq!(fixture.compactions.load(Ordering::SeqCst), 1);
+    let checkpoint = saved.unwrap();
+    assert!(
+        checkpoint
+            .maintenance_state
+            .soft_compaction_after_tokens
+            .is_some()
+    );
+    let encoded = serde_json::to_vec(&checkpoint).unwrap();
+    let checkpoint = serde_json::from_slice(&encoded).unwrap();
+    let mut restored = agent
+        .restore_context(&(), "fixture", &transcript, checkpoint)
+        .unwrap();
+
+    let second_control = TaskControl::new();
+    let updates = agent
+        .run_turn_context(
+            &mut restored,
+            &(),
+            UserMessage::new("second"),
+            &second_control,
+            Some(policy),
+        )
+        .collect::<Vec<_>>()
+        .await;
+    assert!(updates.iter().all(Result::is_ok));
+    assert_eq!(fixture.compactions.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -488,6 +595,7 @@ async fn a_long_rebased_transcript_is_summarized_in_bounded_chunks_without_omitt
             &history,
             CompactOptions {
                 keep_tail_tokens: 5,
+                ..CompactOptions::default()
             },
         )
         .await
@@ -498,4 +606,162 @@ async fn a_long_rebased_transcript_is_summarized_in_bounded_chunks_without_omitt
     for index in 0..19 {
         assert!(calls.iter().any(|c|c.messages().iter().any(|m|matches!(m,Message::User(u) if u.content().contains(&format!("unique-source-{index} "))))),"old input {index} must be summarized, not dropped");
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct RequestTotals {
+    requests: usize,
+    heuristic_input_tokens: u64,
+    serialized_input_bytes: usize,
+}
+
+#[derive(Default)]
+struct BenchmarkFixture {
+    totals: Mutex<RequestTotals>,
+    screenshot_id: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct BenchmarkProvider(Arc<BenchmarkFixture>);
+
+impl Provider for BenchmarkProvider {
+    type Model = ();
+    type Error = io::Error;
+    type Continuation = usize;
+
+    fn supports_vision(&self, _: &()) -> bool {
+        true
+    }
+
+    fn context_budget(&self, _: &()) -> Option<ContextBudget> {
+        Some(ContextBudget {
+            max_input_tokens: 1_000_000,
+        })
+    }
+
+    fn create_continuation(&self, _: &()) -> usize {
+        0
+    }
+
+    async fn complete(
+        &self,
+        continuation: &usize,
+        _: &(),
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> Result<(AssistantMessage, usize), io::Error> {
+        let serialized = serde_json::to_vec(&(conversation, tools)).unwrap();
+        let mut totals = self.0.totals.lock().unwrap();
+        totals.requests += 1;
+        totals.heuristic_input_tokens = totals
+            .heuristic_input_tokens
+            .saturating_add(conversation.estimate_tokens(tools));
+        totals.serialized_input_bytes = totals
+            .serialized_input_bytes
+            .saturating_add(serialized.len());
+        drop(totals);
+
+        let message = if tools.iter().any(|tool| tool.name() == "summarize") {
+            AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+                "summary",
+                "summarize",
+                serde_json::json!({
+                    "summary": "Deterministic summary of prior screenshot observations."
+                }),
+            )])
+        } else if matches!(conversation.messages().last(), Some(Message::User(_))) {
+            let id = self.0.screenshot_id.fetch_add(1, Ordering::SeqCst);
+            AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+                format!("screenshot-{id}"),
+                "screenshot",
+                serde_json::json!({"step": id}),
+            )])
+        } else {
+            AssistantMessage::new("Screenshot recorded.")
+        };
+        Ok((message, continuation.saturating_add(1)))
+    }
+}
+
+struct BenchmarkScreenshotTool;
+
+impl Tool for BenchmarkScreenshotTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "screenshot",
+            "Capture the current synthetic application state.",
+            serde_json::json!({"type":"object", "properties":{"step":{"type":"integer"}}}),
+        )
+    }
+
+    fn execute<'a>(&'a self, arguments: &'a serde_json::Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let _ = self;
+            let step = arguments["step"].as_u64().unwrap_or_default();
+            let images = (0..4)
+                .map(|index| Image::new("image/png", vec![step.wrapping_add(index) as u8; 2048]))
+                .collect();
+            Ok(ToolOutput::new(serde_json::json!({
+                "step": step,
+                "caption": "synthetic app state"
+            }))
+            .with_images(images))
+        })
+    }
+}
+
+async fn run_screenshot_benchmark(policy: CompactionPolicy) -> RequestTotals {
+    let fixture = Arc::new(BenchmarkFixture::default());
+    let agent =
+        Agent::new(BenchmarkProvider(fixture.clone())).with_tool(Arc::new(BenchmarkScreenshotTool));
+    let mut context = agent.context_from_history(&(), "fixture", &Conversation::new());
+    for round in 0..32 {
+        let control = TaskControl::new();
+        let updates = agent
+            .run_turn_context(
+                &mut context,
+                &(),
+                UserMessage::new(format!("inspect synthetic screen {round}")),
+                &control,
+                Some(policy),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(updates.iter().all(Result::is_ok));
+    }
+    *fixture.totals.lock().unwrap()
+}
+
+#[tokio::test]
+async fn thirty_two_turn_screenshot_simulation_reduces_provider_input_size() {
+    let baseline = run_screenshot_benchmark(CompactionPolicy {
+        budget: Some(ContextBudget {
+            max_input_tokens: 1_000_000,
+        }),
+        keep_tail_tokens: 24_000,
+        ..CompactionPolicy::default()
+    })
+    .await;
+    let maintained = run_screenshot_benchmark(CompactionPolicy {
+        budget: Some(ContextBudget {
+            max_input_tokens: 1_000_000,
+        }),
+        keep_tail_tokens: 2_000,
+        maintenance_trigger_tokens: Some(32_000),
+        maintenance_growth_tokens: 16_000,
+        retain_recent_tool_image_observations: Some(2),
+    })
+    .await;
+
+    eprintln!(
+        "32 synthetic screenshot turns: heuristic input tokens {} -> {}, serialized provider input bytes {} -> {}, provider calls {} -> {}",
+        baseline.heuristic_input_tokens,
+        maintained.heuristic_input_tokens,
+        baseline.serialized_input_bytes,
+        maintained.serialized_input_bytes,
+        baseline.requests,
+        maintained.requests,
+    );
+    assert!(maintained.heuristic_input_tokens < baseline.heuristic_input_tokens);
+    assert!(maintained.serialized_input_bytes < baseline.serialized_input_bytes);
 }

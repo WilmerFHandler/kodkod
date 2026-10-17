@@ -48,7 +48,7 @@ pub struct Agent<P> {
 pub use crate::context::AgentContext;
 use crate::{
     AgentUpdate, CompactionPolicy, ContextCheckpoint, ContextCompaction, ContextCursor,
-    ContextMeasurement, ContextTask,
+    ContextMaintenanceState, ContextMeasurement, ContextTask,
 };
 
 enum ContextSlot<'a, P: Provider> {
@@ -79,6 +79,7 @@ struct ContextTracker<'a> {
     cursor: &'a mut ContextCursor,
     binding: &'a str,
     measurement: &'a mut Option<ContextMeasurement>,
+    maintenance_state: &'a mut ContextMaintenanceState,
 }
 fn update<P: Provider>(
     event: AgentEvent,
@@ -92,6 +93,7 @@ fn update<P: Provider>(
             | AgentEvent::AssistantReply(..)
             | AgentEvent::ToolFinished(_)
             | AgentEvent::Compacted(_)
+            | AgentEvent::CompactionFailed(_)
     );
     let checkpoint = if accepted {
         tracker
@@ -104,6 +106,7 @@ fn update<P: Provider>(
                 conversation: conversation.clone(),
                 continuation: c.shared(),
                 measurement: *t.measurement,
+                maintenance_state: *t.maintenance_state,
             })
     } else {
         None
@@ -215,6 +218,7 @@ where
             cursor: ContextCursor::default(),
             binding: String::new(),
             measurement: None,
+            maintenance_state: ContextMaintenanceState::default(),
             managed: true,
         }
     }
@@ -321,6 +325,7 @@ where
             cursor: ContextCursor::for_history(history),
             binding: binding.into(),
             measurement: None,
+            maintenance_state: ContextMaintenanceState::default(),
             managed: true,
         }
     }
@@ -357,6 +362,7 @@ where
             cursor: checkpoint.cursor,
             binding: checkpoint.binding,
             measurement: checkpoint.measurement,
+            maintenance_state: checkpoint.maintenance_state,
             managed: true,
         };
         for message in &history.messages()[active.cursor.position..] {
@@ -402,6 +408,7 @@ where
             cursor: &mut context.cursor,
             binding: &context.binding,
             measurement: &mut context.measurement,
+            maintenance_state: &mut context.maintenance_state,
         };
         self.run_opened(
             &mut context.conversation,
@@ -444,6 +451,7 @@ where
         context.conversation = replacement.conversation;
         context.continuation = Arc::new(replacement.continuation);
         context.measurement = None;
+        context.maintenance_state.soft_compaction_after_tokens = None;
         Ok(replacement.usage)
     }
 
@@ -511,9 +519,16 @@ where
                     let budget = policy
                         .budget
                         .or_else(|| self.provider.context_budget(model));
-                    let due = budget.is_some_and(|b| estimate >= b.max_input_tokens);
+                    let hard_due = budget.is_some_and(|b| estimate >= b.max_input_tokens);
+                    let soft_due = policy
+                        .maintenance_trigger_tokens
+                        .is_some_and(|trigger| estimate >= trigger)
+                        && tracker
+                            .as_ref()
+                            .and_then(|t| t.maintenance_state.soft_compaction_after_tokens)
+                            .is_none_or(|after| estimate >= after);
                     let manual = control.take_compact_request();
-                    if force_compaction || due || manual {
+                    if force_compaction || hard_due || soft_due || manual {
                         yield update(
                             AgentEvent::CompactionStarted,
                             conversation,
@@ -544,37 +559,89 @@ where
                                 let next_estimate = replacement
                                     .estimate_tokens(&tool_specs)
                                     .saturating_add(P::estimate_continuation_tokens(&continuation));
-                                if (due || force_compaction)
-                                    && next_estimate >= raw_estimate
-                                    && !self.provider.has_opaque_context(&continuation)
-                                {
+                                let ineffective = next_estimate >= estimate
+                                    && !self.provider.has_opaque_context(&continuation);
+                                if (hard_due || force_compaction) && ineffective {
+                                    turn_usage.add_round(usage);
                                     Err(AgentError::ContextMaintenance("Compaction made no room; reduce the input or use a larger context window".into()))?;
                                 }
-                                *conversation = replacement;
-                                context
-                                    .as_mut()
-                                    .expect("context exists")
-                                    .checkpoint(continuation);
                                 if let Some(t) = tracker.as_mut() {
-                                    *t.measurement = None;
+                                    t.maintenance_state.soft_compaction_after_tokens = Some(
+                                        next_estimate.saturating_add(
+                                            policy.maintenance_growth_tokens.max(1),
+                                        ),
+                                    );
                                 }
                                 turn_usage.add_round(usage);
-                                yield update(
-                                    AgentEvent::Compacted(conversation.clone()),
-                                    conversation,
-                                    context.as_ref(),
-                                    &tracker,
-                                );
+                                if soft_due
+                                    && ineffective
+                                    && !hard_due
+                                    && !force_compaction
+                                    && !manual
+                                {
+                                    yield update(
+                                        AgentEvent::CompactionFailed(
+                                            "Soft maintenance made no room; it will retry after context grows".into(),
+                                        ),
+                                        conversation,
+                                        context.as_ref(),
+                                        &tracker,
+                                    );
+                                } else {
+                                    *conversation = replacement;
+                                    context
+                                        .as_mut()
+                                        .expect("context exists")
+                                        .checkpoint(continuation);
+                                    if let Some(t) = tracker.as_mut() {
+                                        *t.measurement = None;
+                                    }
+                                    yield update(
+                                        AgentEvent::Compacted(conversation.clone()),
+                                        conversation,
+                                        context.as_ref(),
+                                        &tracker,
+                                    );
+                                }
                             }
-                            Err(CompactError::NothingToCompact) if !due && !force_compaction => {}
+                            Err(CompactError::NothingToCompact)
+                                if !hard_due && !force_compaction && !manual =>
+                            {
+                                if soft_due {
+                                    if let Some(t) = tracker.as_mut() {
+                                        t.maintenance_state.soft_compaction_after_tokens = Some(
+                                            estimate.saturating_add(
+                                                policy.maintenance_growth_tokens.max(1),
+                                            ),
+                                        );
+                                    }
+                                    yield update(
+                                        AgentEvent::CompactionFailed(
+                                            "Soft maintenance had nothing to compact; it will retry after context grows".into(),
+                                        ),
+                                        conversation,
+                                        context.as_ref(),
+                                        &tracker,
+                                    );
+                                }
+                            }
                             Err(error) => {
+                                if soft_due && !hard_due && !force_compaction {
+                                    if let Some(t) = tracker.as_mut() {
+                                        t.maintenance_state.soft_compaction_after_tokens = Some(
+                                            estimate.saturating_add(
+                                                policy.maintenance_growth_tokens.max(1),
+                                            ),
+                                        );
+                                    }
+                                }
                                 yield update(
                                     AgentEvent::CompactionFailed(error.to_string()),
                                     conversation,
                                     context.as_ref(),
                                     &tracker,
                                 );
-                                if due || force_compaction {
+                                if hard_due || force_compaction {
                                     Err(AgentError::ContextMaintenance(error.to_string()))?;
                                 }
                             }

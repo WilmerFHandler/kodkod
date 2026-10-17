@@ -1678,6 +1678,7 @@ fn history_needing_compact() -> Conversation {
 fn tiny_tail() -> CompactOptions {
     CompactOptions {
         keep_tail_tokens: 1,
+        ..CompactOptions::default()
     }
 }
 
