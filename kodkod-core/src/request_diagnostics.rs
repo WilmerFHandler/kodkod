@@ -106,9 +106,13 @@ pub struct RequestMetadata {
     pub message_count: usize,
     pub tool_definition_count: usize,
     pub image_count: usize,
-    pub image_bytes: usize,
+    /// Decoded bytes from actual `input_image` items; unknown if a retained
+    /// item does not expose a parseable inline data URL.
+    pub image_bytes: Option<usize>,
     pub document_count: usize,
-    pub document_bytes: usize,
+    /// Decoded bytes from actual `input_file` items; unknown if bytes are not
+    /// present as a parseable inline data URL.
+    pub document_bytes: Option<usize>,
     /// Compact JSON byte count for the outbound request body.
     pub serialized_request_bytes: usize,
     /// Compact JSON bytes of opaque continuation output replayed into the input.
