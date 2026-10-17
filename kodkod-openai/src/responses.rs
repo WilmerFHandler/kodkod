@@ -632,20 +632,11 @@ fn native_window_token_estimate(window: &NativeContextWindow) -> u64 {
     let readable_and_media = window.output.iter().fold(0_u64, |sum, value| {
         sum.saturating_add(native_readable_and_media_tokens(value))
     });
-    let opaque_envelope = if generated_lower_bound == 0 {
-        window.output.iter().fold(0_u64, |sum, value| {
-            sum.saturating_add(native_encrypted_content_bytes(value))
-        })
-    } else {
-        0
-    };
 
     // `output_tokens` is generated usage, so it may omit retained user inputs.
-    // Plain text and media have bounded heuristics; encrypted bytes are counted
-    // separately as a conservative envelope only when usage is unavailable.
-    generated_lower_bound
-        .max(readable_and_media)
-        .max(opaque_envelope)
+    // Plain text and media have bounded heuristics. Opaque ciphertext size is
+    // recorded as bytes in diagnostics, never converted into estimated tokens.
+    generated_lower_bound.max(readable_and_media)
 }
 
 fn native_readable_and_media_tokens(value: &Value) -> u64 {
@@ -680,23 +671,6 @@ fn native_readable_and_media_tokens(value: &Value) -> u64 {
                 sum.saturating_add(child_tokens)
             })
         }
-        _ => 0,
-    }
-}
-
-fn native_encrypted_content_bytes(value: &Value) -> u64 {
-    match value {
-        Value::Array(values) => values.iter().fold(0_u64, |sum, value| {
-            sum.saturating_add(native_encrypted_content_bytes(value))
-        }),
-        Value::Object(fields) => fields.iter().fold(0_u64, |sum, (key, value)| {
-            let bytes = if key == "encrypted_content" {
-                value.as_str().map_or(0, |text| text.len() as u64)
-            } else {
-                native_encrypted_content_bytes(value)
-            };
-            sum.saturating_add(bytes)
-        }),
         _ => 0,
     }
 }
@@ -3146,7 +3120,7 @@ mod tests {
     }
 
     #[test]
-    fn native_window_without_usage_uses_opaque_and_readable_fallbacks() {
+    fn native_window_without_usage_uses_visible_lower_bounds_not_ciphertext_bytes() {
         let opaque_only = ResponsesContinuation {
             checkpoints: Vec::new(),
             native_window: Some(NativeContextWindow {
@@ -3178,7 +3152,7 @@ mod tests {
             <OpenAiResponsesProvider<TestModel> as Provider>::estimate_continuation_tokens(
                 &opaque_only
             ),
-            "opaque-compaction".len() as u64
+            0
         );
         assert_eq!(
             <OpenAiResponsesProvider<TestModel> as Provider>::estimate_continuation_tokens(
@@ -3186,6 +3160,31 @@ mod tests {
             ),
             NATIVE_IMAGE_TOKEN_ESTIMATE
         );
+    }
+
+    #[test]
+    fn missing_usage_ciphertext_does_not_trigger_a_false_hard_capacity_overflow() {
+        let continuation = ResponsesContinuation {
+            checkpoints: Vec::new(),
+            native_window: Some(NativeContextWindow {
+                model: "gpt-test".into(),
+                profile: ResponsesRequestProfile::OpenAiCompatible,
+                endpoint: "https://example.test/v1/responses".into(),
+                output: vec![json!({
+                    "type":"compaction",
+                    "encrypted_content":"x".repeat(1_048_576)
+                })],
+                compaction_output_tokens: None,
+            }),
+        };
+        let estimate =
+            <OpenAiResponsesProvider<TestModel> as Provider>::estimate_continuation_tokens(
+                &continuation,
+            );
+        let budget = 829_800;
+
+        assert_eq!(estimate, 0);
+        assert!(estimate < budget);
     }
 
     #[tokio::test]
