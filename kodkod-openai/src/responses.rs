@@ -764,6 +764,7 @@ where
             attempt.headers(status.as_u16(), response_request_id(&response));
         }
         if !status.is_success() {
+            let retry_after = OpenAiError::retry_after_from_response(status.as_u16(), &response);
             let body = match read_limited_body(response, MAX_ERROR_BODY_BYTES).await {
                 Ok(body) => body,
                 Err(error) => {
@@ -815,6 +816,7 @@ where
                 status: status.as_u16(),
                 code,
                 message,
+                retry_after,
             }));
         }
 
@@ -1076,6 +1078,7 @@ where
                 attempt.headers(status.as_u16(), response_request_id(&response));
             }
             if !status.is_success() {
+                let retry_after = OpenAiError::retry_after_from_response(status.as_u16(), &response);
                 let body = match read_limited_body(response, MAX_ERROR_BODY_BYTES).await {
                     Ok(body) => body,
                     Err(error) => {
@@ -1109,6 +1112,7 @@ where
                     status: status.as_u16(),
                     code,
                     message,
+                    retry_after,
                 })?;
                 unreachable!("error propagation exits the stream");
             }

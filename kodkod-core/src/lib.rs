@@ -39,7 +39,7 @@ pub use request_diagnostics::{
     RequestOptionClass, RequestProfile, RequestPromptFingerprints, RequestServiceTier,
     RequestUsage,
 };
-pub use retry::{RetryPolicy, RetryProvider, Retryable};
+pub use retry::{RetryAfter, RetryPolicy, RetryProvider, Retryable};
 pub use tool::{
     Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolOutput, ToolResult,
     ToolResultOutcome, ToolSpec,

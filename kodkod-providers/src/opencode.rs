@@ -494,6 +494,33 @@ impl Retryable for ProviderError {
             Self::Google(error) => error.is_retryable(),
         }
     }
+
+    fn retry_after(&self) -> Option<kodkod_core::RetryAfter> {
+        match self {
+            Self::Configuration(_) => None,
+            Self::OpenAi(error) => error.retry_after(),
+            Self::Anthropic(error) => error.retry_after(),
+            Self::Google(error) => error.retry_after(),
+        }
+    }
+
+    fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::Configuration(_) => None,
+            Self::OpenAi(error) => error.http_status(),
+            Self::Anthropic(error) => error.http_status(),
+            Self::Google(error) => error.http_status(),
+        }
+    }
+
+    fn api_code(&self) -> Option<&str> {
+        match self {
+            Self::Configuration(_) => None,
+            Self::OpenAi(error) => error.api_code(),
+            Self::Anthropic(error) => error.api_code(),
+            Self::Google(error) => error.api_code(),
+        }
+    }
 }
 
 impl From<ProviderConfigError> for ProviderError {

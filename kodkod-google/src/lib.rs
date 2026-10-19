@@ -12,8 +12,8 @@ use kodkod_core::{
     Message, Provider, ProviderCompletion, ProviderEvent, ProviderStream, RequestDiagnostic,
     RequestDiagnosticEvent, RequestFailureKind, RequestFingerprint, RequestIdentity,
     RequestInputPrefixFingerprint, RequestMetadata, RequestObserver, RequestOperation,
-    RequestOptionClass, RequestProfile, RequestPromptFingerprints, RequestUsage, Retryable,
-    TokenUsage, ToolCall, ToolExecutorError, ToolResult, ToolResultOutcome, ToolSpec,
+    RequestOptionClass, RequestProfile, RequestPromptFingerprints, RequestUsage, RetryAfter,
+    Retryable, TokenUsage, ToolCall, ToolExecutorError, ToolResult, ToolResultOutcome, ToolSpec,
 };
 use kodkod_http::SseDecoder;
 pub use kodkod_http::{
@@ -1205,6 +1205,11 @@ async fn api_error_from_response(
     status: u16,
     response: reqwest::Response,
 ) -> Result<GoogleError, GoogleError> {
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| RetryAfter::from_header(status, value, std::time::SystemTime::now()));
     let body = read_limited_body(response, MAX_ERROR_BODY_BYTES).await?;
     let parsed = serde_json::from_slice::<Value>(&body).ok();
     let error = parsed
@@ -1212,6 +1217,13 @@ async fn api_error_from_response(
         .and_then(|value| value.get("error"))
         .unwrap_or_else(|| parsed.as_ref().unwrap_or(&Value::Null));
     let mut result = api_error_from_value(status, error);
+    if let GoogleError::Api {
+        retry_after: api_retry_after,
+        ..
+    } = &mut result
+    {
+        *api_retry_after = retry_after;
+    }
     if let GoogleError::Api { message, .. } = &mut result
         && message.is_empty()
     {
@@ -1606,6 +1618,7 @@ fn api_error_from_value(status: u16, error: &Value) -> GoogleError {
         status,
         code,
         message,
+        retry_after: None,
     }
 }
 
@@ -1628,6 +1641,7 @@ pub enum GoogleError {
         status: u16,
         code: Option<String>,
         message: String,
+        retry_after: Option<RetryAfter>,
     },
     EmptyResponse,
     Incomplete {
@@ -1643,6 +1657,7 @@ impl GoogleError {
                 status: 400,
                 code,
                 message,
+                ..
             } => {
                 code.as_deref() == Some("context_length_exceeded") || {
                     let message = message.to_ascii_lowercase();
@@ -1683,6 +1698,7 @@ impl fmt::Display for GoogleError {
                 status,
                 code,
                 message,
+                ..
             } => match code {
                 Some(code) => write!(f, "api error ({status}, {code}): {message}"),
                 None => write!(f, "api error ({status}): {message}"),
@@ -1725,6 +1741,31 @@ impl Retryable for GoogleError {
             Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
             Self::Api { status, .. } => matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529),
             _ => false,
+        }
+    }
+
+    fn retry_after(&self) -> Option<RetryAfter> {
+        match self {
+            Self::Api {
+                status: 429 | 503,
+                retry_after,
+                ..
+            } => *retry_after,
+            _ => None,
+        }
+    }
+
+    fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::Api { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    fn api_code(&self) -> Option<&str> {
+        match self {
+            Self::Api { code, .. } => code.as_deref(),
+            _ => None,
         }
     }
 }
@@ -2177,6 +2218,7 @@ mod tests {
                 status: 429,
                 code: None,
                 message: "rate limited".into(),
+                retry_after: None,
             }
             .is_retryable()
         );
@@ -2185,6 +2227,7 @@ mod tests {
                 status: 403,
                 code: None,
                 message: "forbidden".into(),
+                retry_after: None,
             }
             .is_retryable()
         );
@@ -2193,6 +2236,7 @@ mod tests {
                 status: 400,
                 code: Some("INVALID_ARGUMENT".into()),
                 message: "input token count exceeds maximum".into(),
+                retry_after: None,
             }
             .is_context_overflow()
         );
@@ -2201,6 +2245,7 @@ mod tests {
                 status: 400,
                 code: Some("INVALID_ARGUMENT".into()),
                 message: "context length is too long to describe".into(),
+                retry_after: None,
             }
             .is_context_overflow()
         );

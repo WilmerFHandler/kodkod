@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use kodkod_core::Retryable;
+use kodkod_core::{RetryAfter, Retryable};
 
 use crate::CredentialError;
 
@@ -12,6 +12,7 @@ pub enum OpenAiError {
         status: u16,
         code: Option<String>,
         message: String,
+        retry_after: Option<RetryAfter>,
     },
     ResponseFailed {
         code: Option<String>,
@@ -35,6 +36,18 @@ pub enum OpenAiError {
 }
 
 impl OpenAiError {
+    pub(crate) fn retry_after_from_response(
+        status: u16,
+        response: &reqwest::Response,
+    ) -> Option<RetryAfter> {
+        let value = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?;
+        RetryAfter::from_header(status, value, std::time::SystemTime::now())
+    }
+
     pub(crate) fn is_context_overflow(&self) -> bool {
         match self {
             Self::Api {
@@ -58,6 +71,7 @@ impl fmt::Display for OpenAiError {
                 status,
                 code,
                 message,
+                ..
             } => match code {
                 Some(code) => write!(f, "api error ({status}, {code}): {message}"),
                 None => write!(f, "api error ({status}): {message}"),
@@ -124,7 +138,7 @@ impl Retryable for OpenAiError {
         match self {
             Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
             Self::Api { status, code, .. } => {
-                !is_subscription_sharing_error(code.as_deref())
+                !is_subscription_sharing_quota_limit(code.as_deref())
                     && matches!(*status, 429 | 500 | 502 | 503 | 504)
             }
             Self::ResponseFailed { code, message } => {
@@ -137,6 +151,31 @@ impl Retryable for OpenAiError {
             | Self::DocumentLimitExceeded { .. }
             | Self::Incomplete { .. }
             | Self::Protocol(_) => false,
+        }
+    }
+
+    fn retry_after(&self) -> Option<RetryAfter> {
+        match self {
+            Self::Api {
+                status: 429 | 503,
+                retry_after,
+                ..
+            } => *retry_after,
+            _ => None,
+        }
+    }
+
+    fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::Api { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    fn api_code(&self) -> Option<&str> {
+        match self {
+            Self::Api { code, .. } | Self::ResponseFailed { code, .. } => code.as_deref(),
+            _ => None,
         }
     }
 }
@@ -152,13 +191,8 @@ fn is_retryable_response_failure(code: Option<&str>, message: &str) -> bool {
     }
 }
 
-fn is_subscription_sharing_error(code: Option<&str>) -> bool {
-    matches!(
-        code,
-        Some(
-            "subscription_sharing_usage_limit_exceeded" | "subscription_sharing_usage_unavailable"
-        )
-    )
+fn is_subscription_sharing_quota_limit(code: Option<&str>) -> bool {
+    code == Some("subscription_sharing_usage_limit_exceeded")
 }
 
 #[cfg(test)]
@@ -172,6 +206,7 @@ mod tests {
                 status: 429,
                 code: None,
                 message: "rate limited".into(),
+                retry_after: None,
             }
             .is_retryable()
         );
@@ -180,6 +215,7 @@ mod tests {
                 status: 503,
                 code: None,
                 message: "unavailable".into(),
+                retry_after: None,
             }
             .is_retryable()
         );
@@ -188,6 +224,7 @@ mod tests {
                 status: 401,
                 code: None,
                 message: "unauthorized".into(),
+                retry_after: None,
             }
             .is_retryable()
         );
@@ -249,6 +286,7 @@ mod tests {
                 status: 400,
                 code: Some("context_length_exceeded".into()),
                 message: "input exceeded the model context".into(),
+                retry_after: None,
             }
             .is_context_overflow()
         );
@@ -264,6 +302,7 @@ mod tests {
                 status: 400,
                 code: Some("invalid_api_key".into()),
                 message: "unauthorized".into(),
+                retry_after: None,
             }
             .is_context_overflow()
         );
@@ -272,22 +311,22 @@ mod tests {
                 status: 413,
                 code: Some("context_length_exceeded".into()),
                 message: "too large".into(),
+                retry_after: None,
             }
             .is_context_overflow()
         );
     }
 
     #[test]
-    fn subscription_sharing_codes_override_http_retry_statuses() {
-        for code in [
-            "subscription_sharing_usage_limit_exceeded",
-            "subscription_sharing_usage_unavailable",
-        ] {
+    fn subscription_quota_limit_overrides_http_retry_statuses() {
+        let code = "subscription_sharing_usage_limit_exceeded";
+        {
             assert!(
                 !OpenAiError::Api {
                     status: 429,
                     code: Some(code.into()),
                     message: "plan limit".into(),
+                    retry_after: None,
                 }
                 .is_retryable()
             );
@@ -296,6 +335,7 @@ mod tests {
                     status: 503,
                     code: Some(code.into()),
                     message: "sharing unavailable".into(),
+                    retry_after: None,
                 }
                 .is_retryable()
             );
@@ -307,5 +347,37 @@ mod tests {
                 .is_retryable()
             );
         }
+
+        assert!(
+            OpenAiError::Api {
+                status: 503,
+                code: Some("subscription_sharing_usage_unavailable".into()),
+                message: "usage unavailable".into(),
+                retry_after: None,
+            }
+            .is_retryable()
+        );
+    }
+
+    #[test]
+    fn retry_after_is_exposed_as_typed_error_metadata() {
+        let retry_after = RetryAfter::Delay(std::time::Duration::from_secs(90));
+        let error = OpenAiError::Api {
+            status: 429,
+            code: Some("rate_limit_exceeded".into()),
+            message: "slow down".into(),
+            retry_after: Some(retry_after),
+        };
+        assert_eq!(error.retry_after(), Some(retry_after));
+        assert_eq!(
+            OpenAiError::Api {
+                status: 401,
+                code: None,
+                message: "unauthorized".into(),
+                retry_after: Some(retry_after),
+            }
+            .retry_after(),
+            None
+        );
     }
 }

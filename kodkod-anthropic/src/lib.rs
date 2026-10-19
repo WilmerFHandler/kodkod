@@ -6,7 +6,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use kodkod_core::{
     AssistantMessage, Conversation, Message, Provider, ProviderCompletion, ProviderEvent,
-    ProviderStream, Retryable, TokenUsage, ToolCall, ToolExecutorError, ToolResult,
+    ProviderStream, RetryAfter, Retryable, TokenUsage, ToolCall, ToolExecutorError, ToolResult,
     ToolResultOutcome, ToolSpec,
 };
 use kodkod_http::SseDecoder;
@@ -207,6 +207,7 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
         let response = http_request.send().await?;
         let status = response.status();
         if !status.is_success() {
+            let retry_after = retry_after_from_response(status.as_u16(), &response);
             let body = read_limited_body(response, MAX_ERROR_BODY_BYTES).await?;
             let message = serde_json::from_slice::<Value>(&body)
                 .ok()
@@ -221,6 +222,7 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
             return Err(AnthropicError::Api {
                 status: status.as_u16(),
                 message,
+                retry_after,
             });
         }
         let body: Value = response.json().await?;
@@ -270,11 +272,12 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
             let response = self.client.post(&self.messages_url).headers(headers).json(&request).send().await?;
             let status = response.status();
             if !status.is_success() {
+                let retry_after = retry_after_from_response(status.as_u16(), &response);
                 let body = read_limited_body(response, MAX_ERROR_BODY_BYTES).await?;
                 let message = serde_json::from_slice::<Value>(&body).ok()
                     .and_then(|value| value.pointer("/error/message")?.as_str().map(str::to_owned))
                     .unwrap_or_else(|| if body.is_empty() { status.to_string() } else { String::from_utf8_lossy(&body).into_owned() });
-                Err(AnthropicError::Api { status: status.as_u16(), message })?;
+                Err(AnthropicError::Api { status: status.as_u16(), message, retry_after })?;
                 unreachable!("error propagation exits the stream");
             }
             if response.headers().get(reqwest::header::CONTENT_TYPE)
@@ -956,16 +959,37 @@ fn required(value: &Value, field: &str) -> Result<String, AnthropicError> {
         .ok_or_else(|| AnthropicError::Protocol(format!("tool use missing {field}")))
 }
 
+fn retry_after_from_response(status: u16, response: &reqwest::Response) -> Option<RetryAfter> {
+    let value = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
+    RetryAfter::from_header(status, value, std::time::SystemTime::now())
+}
+
 #[derive(Debug)]
 pub enum AnthropicError {
     Http(reqwest::Error),
     Json(serde_json::Error),
     Credentials(CredentialError),
-    UnsupportedDocument { mime: String },
-    InvalidDocumentText { filename: String },
-    RequestLimitExceeded { limit_bytes: usize },
-    Api { status: u16, message: String },
-    Incomplete { reason: String },
+    UnsupportedDocument {
+        mime: String,
+    },
+    InvalidDocumentText {
+        filename: String,
+    },
+    RequestLimitExceeded {
+        limit_bytes: usize,
+    },
+    Api {
+        status: u16,
+        message: String,
+        retry_after: Option<RetryAfter>,
+    },
+    Incomplete {
+        reason: String,
+    },
     Protocol(String),
 }
 
@@ -990,7 +1014,9 @@ impl fmt::Display for AnthropicError {
                     "Anthropic Messages request exceeds the {limit_bytes}-byte limit"
                 )
             }
-            Self::Api { status, message } => write!(f, "api error ({status}): {message}"),
+            Self::Api {
+                status, message, ..
+            } => write!(f, "api error ({status}): {message}"),
             Self::Incomplete { reason } => write!(f, "message incomplete: {reason}"),
             Self::Protocol(message) => write!(f, "messages protocol error: {message}"),
         }
@@ -1027,6 +1053,24 @@ impl Retryable for AnthropicError {
             Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
             Self::Api { status, .. } => matches!(status, 429 | 500 | 502 | 503 | 504 | 529),
             _ => false,
+        }
+    }
+
+    fn retry_after(&self) -> Option<RetryAfter> {
+        match self {
+            Self::Api {
+                status: 429 | 503,
+                retry_after,
+                ..
+            } => *retry_after,
+            _ => None,
+        }
+    }
+
+    fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::Api { status, .. } => Some(*status),
+            _ => None,
         }
     }
 }

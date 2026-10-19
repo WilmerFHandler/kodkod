@@ -128,7 +128,9 @@ where
                 .await
             {
                 Ok(completion) => return Ok(completion),
-                Err(error) if error.is_retryable() && attempt < max => {
+                Err(error)
+                    if error.retry_after().is_none() && error.is_retryable() && attempt < max =>
+                {
                     futures_timer::Delay::new(self.policy.backoff_after_attempt(attempt)).await;
                 }
                 Err(error) => return Err(error),
@@ -167,7 +169,10 @@ where
                             return;
                         }
                         Err(error)
-                            if !emitted_text && error.is_retryable() && attempt < max =>
+                            if !emitted_text
+                                && error.retry_after().is_none()
+                                && error.is_retryable()
+                                && attempt < max =>
                         {
                             retry = true;
                             break;
@@ -200,6 +205,7 @@ mod tests {
     struct RetryTestError {
         retryable: bool,
         status_code: Option<u16>,
+        retry_after: Option<crate::RetryAfter>,
     }
 
     impl RetryTestError {
@@ -207,6 +213,15 @@ mod tests {
             Self {
                 retryable,
                 status_code: Some(status_code),
+                retry_after: None,
+            }
+        }
+
+        fn with_retry_after(status_code: u16, retry_after: crate::RetryAfter) -> Self {
+            Self {
+                retryable: true,
+                status_code: Some(status_code),
+                retry_after: Some(retry_after),
             }
         }
     }
@@ -222,6 +237,14 @@ mod tests {
     impl Retryable for RetryTestError {
         fn is_retryable(&self) -> bool {
             self.retryable
+        }
+
+        fn retry_after(&self) -> Option<crate::RetryAfter> {
+            self.retry_after
+        }
+
+        fn http_status(&self) -> Option<u16> {
+            self.status_code
         }
     }
 
@@ -333,6 +356,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_after_bypasses_short_inner_retries() {
+        struct RetryAfterProvider(Arc<AtomicU32>);
+        impl Provider for RetryAfterProvider {
+            type Model = TestModel;
+            type Error = RetryTestError;
+            type Continuation = ();
+
+            fn create_continuation(&self, _: &TestModel) {}
+            fn supports_vision(&self, model: &TestModel) -> bool {
+                model.vision()
+            }
+            async fn complete(
+                &self,
+                _: &(),
+                _: &TestModel,
+                _: &Conversation,
+                _: &[ToolSpec],
+            ) -> Result<(AssistantMessage, ()), RetryTestError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(RetryTestError::with_retry_after(
+                    429,
+                    crate::RetryAfter::Delay(Duration::from_secs(60 * 60)),
+                ))
+            }
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let provider = RetryProvider::with_policy(
+            RetryAfterProvider(Arc::clone(&calls)),
+            RetryPolicy {
+                max_attempts: 5,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+                backoff_multiplier: 1.0,
+            },
+        );
+        let error = provider
+            .complete_once(&TestModel, &Conversation::new(), &[])
+            .await
+            .unwrap_err();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            error.retry_after().unwrap().delay(),
+            Some(Duration::from_secs(3600))
+        );
+    }
+
+    #[tokio::test]
     async fn dropping_completion_during_backoff_stops_retries() {
         let calls = Arc::new(AtomicU32::new(0));
         let provider = RetryProvider::with_policy(
@@ -364,6 +436,7 @@ mod tests {
     struct StreamingFailure {
         calls: Arc<AtomicU32>,
         fail_after_delta: bool,
+        retry_after: bool,
     }
 
     impl Provider for StreamingFailure {
@@ -395,12 +468,21 @@ mod tests {
         ) -> ProviderStream<'a, (), RetryTestError> {
             let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
             let fail_after_delta = self.fail_after_delta;
+            let retry_after = self.retry_after;
             Box::pin(async_stream::try_stream! {
                 if fail_after_delta {
                     yield ProviderEvent::TextDelta("once".into());
                     Err(RetryTestError::http(503, true))?;
                 } else if attempt == 0 {
-                    Err(RetryTestError::http(503, true))?;
+                    let error = if retry_after {
+                        RetryTestError::with_retry_after(
+                            429,
+                            crate::RetryAfter::Delay(Duration::from_secs(60 * 60)),
+                        )
+                    } else {
+                        RetryTestError::http(503, true)
+                    };
+                    Err(error)?;
                 } else {
                     yield ProviderEvent::Completed(ProviderCompletion::new(
                         AssistantMessage::new("ok"),
@@ -425,6 +507,7 @@ mod tests {
             StreamingFailure {
                 calls: Arc::clone(&calls),
                 fail_after_delta: false,
+                retry_after: false,
             },
             policy.clone(),
         );
@@ -440,6 +523,7 @@ mod tests {
             StreamingFailure {
                 calls: Arc::clone(&calls),
                 fail_after_delta: true,
+                retry_after: false,
             },
             policy,
         );
@@ -449,6 +533,39 @@ mod tests {
         );
         assert!(stream.next().await.unwrap().is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_retry_after_bypasses_short_inner_retries() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let provider = RetryProvider::with_policy(
+            StreamingFailure {
+                calls: Arc::clone(&calls),
+                fail_after_delta: false,
+                retry_after: true,
+            },
+            RetryPolicy {
+                max_attempts: 4,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+                backoff_multiplier: 1.0,
+            },
+        );
+        let model = TestModel;
+        let conversation = Conversation::new();
+        let mut stream = provider.complete_stream(&(), &model, &conversation, &[]);
+
+        let event = stream.next().await.unwrap();
+        assert!(event.is_err());
+        let error = event
+            .err()
+            .expect("the first stream item should be the retry error");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(error.http_status(), Some(429));
+        assert_eq!(
+            error.retry_after().unwrap().delay(),
+            Some(Duration::from_secs(3600))
+        );
     }
 }
 

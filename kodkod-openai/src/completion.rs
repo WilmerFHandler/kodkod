@@ -121,6 +121,7 @@ pub(crate) async fn complete_with_request_options(
     let status = response.status();
 
     if !status.is_success() {
+        let retry_after = OpenAiError::retry_after_from_response(status.as_u16(), &response);
         let (code, message) = match response.json::<ApiErrorResponse>().await {
             Ok(body) => (body.error.code, body.error.message),
             Err(_) => (None, status.to_string()),
@@ -129,6 +130,7 @@ pub(crate) async fn complete_with_request_options(
             status: status.as_u16(),
             code,
             message,
+            retry_after,
         });
     }
 
@@ -165,11 +167,12 @@ pub(crate) fn stream_with_request_options<'a>(
         let response = http_request.send().await?;
         let status = response.status();
         if !status.is_success() {
+            let retry_after = OpenAiError::retry_after_from_response(status.as_u16(), &response);
             let (code, message) = match response.json::<ApiErrorResponse>().await {
                 Ok(body) => (body.error.code, body.error.message),
                 Err(_) => (None, status.to_string()),
             };
-            Err(OpenAiError::Api { status: status.as_u16(), code, message })?;
+            Err(OpenAiError::Api { status: status.as_u16(), code, message, retry_after })?;
             unreachable!("error propagation exits the stream");
         }
 

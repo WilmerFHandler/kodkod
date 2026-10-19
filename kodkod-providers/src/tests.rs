@@ -1,10 +1,12 @@
 use super::*;
 use futures_util::StreamExt;
+use kodkod_anthropic::AnthropicError;
 use kodkod_core::{
     AssistantMessage, CompactOptions, ContextBudget, Conversation, Document, Message, Provider,
-    ProviderEvent, RetryPolicy, RetryProvider, Retryable, SystemMessage, TokenUsage, ToolOutput,
-    ToolResult, ToolSpec, UserMessage,
+    ProviderEvent, RetryAfter, RetryPolicy, RetryProvider, Retryable, SystemMessage, TokenUsage,
+    ToolOutput, ToolResult, ToolSpec, UserMessage,
 };
+use kodkod_google::GoogleError;
 use kodkod_http::{RequestCredentials, StaticCredentials};
 use kodkod_openai::{OpenAiError, OpenAiResponsesProvider};
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -14,6 +16,48 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[test]
+fn opencode_errors_preserve_retry_after_across_go_protocols() {
+    let retry_after = RetryAfter::BeyondMaximum;
+    let errors = [
+        (
+            ProviderError::OpenAi(OpenAiError::Api {
+                status: 429,
+                code: Some("rate_limit_exceeded".into()),
+                message: "slow down".into(),
+                retry_after: Some(retry_after),
+            }),
+            Some(429),
+            Some("rate_limit_exceeded"),
+        ),
+        (
+            ProviderError::Anthropic(AnthropicError::Api {
+                status: 429,
+                message: "rate limited".into(),
+                retry_after: Some(retry_after),
+            }),
+            Some(429),
+            None,
+        ),
+        (
+            ProviderError::Google(GoogleError::Api {
+                status: 503,
+                code: Some("UNAVAILABLE".into()),
+                message: "try again".into(),
+                retry_after: Some(retry_after),
+            }),
+            Some(503),
+            Some("UNAVAILABLE"),
+        ),
+    ];
+
+    for (error, status, api_code) in errors {
+        assert_eq!(error.retry_after(), Some(retry_after));
+        assert_eq!(error.http_status(), status);
+        assert_eq!(error.api_code(), api_code);
+    }
+}
 
 struct FreshCodexAccess(AtomicUsize);
 
@@ -1067,6 +1111,99 @@ async fn open_code_routes_messages_with_native_api_key_header() {
         .await
         .unwrap();
     assert_eq!(message.content(), "message");
+}
+
+#[tokio::test]
+async fn open_code_go_adapters_preserve_retry_after_and_structured_status() {
+    let server = MockServer::start().await;
+    let retry_after = "120";
+    let openai_error = json!({
+        "error": {
+            "code": "subscription_sharing_usage_limit_exceeded",
+            "message": "plan usage limit"
+        }
+    });
+    for route in ["/openai/v1/responses", "/openai/v1/chat/completions"] {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", retry_after)
+                    .set_body_json(openai_error.clone()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/anthropic/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", retry_after)
+                .set_body_json(json!({
+                    "type": "error",
+                    "error": {"type": "rate_limit_error", "message": "plan usage limit"}
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/google/v1beta/models/gemini-4-argon-contributor:generateContent",
+        ))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", retry_after)
+                .set_body_json(json!({
+                    "error": {
+                        "code": 429,
+                        "status": "RESOURCE_EXHAUSTED",
+                        "message": "plan usage limit"
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider =
+        OpenCodeProvider::with_api_key(OpenCodeService::Go, "secret", "session", "Lynx/1")
+            .unwrap()
+            .with_test_endpoint(server.uri());
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("hello"));
+    let cases = [
+        (
+            open_code_model(OpenCodeService::Go, "gpt-5.6-luna").unwrap(),
+            Some("subscription_sharing_usage_limit_exceeded"),
+        ),
+        (
+            open_code_model(OpenCodeService::Go, "deepseek-v4.1-flash").unwrap(),
+            Some("subscription_sharing_usage_limit_exceeded"),
+        ),
+        (
+            open_code_model(OpenCodeService::Go, "minimax-m2.7").unwrap(),
+            None,
+        ),
+        (
+            open_code_model(OpenCodeService::Go, "gemini-4-argon-contributor").unwrap(),
+            Some("RESOURCE_EXHAUSTED"),
+        ),
+    ];
+    for (model, api_code) in cases {
+        let error = provider
+            .complete_once(model, &conversation, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.http_status(), Some(429));
+        assert_eq!(error.api_code(), api_code);
+        assert_eq!(
+            error.retry_after(),
+            Some(RetryAfter::Delay(std::time::Duration::from_secs(120)))
+        );
+    }
+    server.verify().await;
 }
 
 #[tokio::test]
