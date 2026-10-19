@@ -1210,7 +1210,17 @@ async fn api_error_from_response(
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| RetryAfter::from_header(status, value, std::time::SystemTime::now()));
-    let body = read_limited_body(response, MAX_ERROR_BODY_BYTES).await?;
+    let body = match read_limited_body(response, MAX_ERROR_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return Ok(GoogleError::Api {
+                status,
+                code: None,
+                message: status.to_string(),
+                retry_after,
+            });
+        }
+    };
     let parsed = serde_json::from_slice::<Value>(&body).ok();
     let error = parsed
         .as_ref()

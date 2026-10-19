@@ -208,7 +208,16 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
         let status = response.status();
         if !status.is_success() {
             let retry_after = retry_after_from_response(status.as_u16(), &response);
-            let body = read_limited_body(response, MAX_ERROR_BODY_BYTES).await?;
+            let body = match read_limited_body(response, MAX_ERROR_BODY_BYTES).await {
+                Ok(body) => body,
+                Err(_) => {
+                    return Err(AnthropicError::Api {
+                        status: status.as_u16(),
+                        message: status.to_string(),
+                        retry_after,
+                    });
+                }
+            };
             let message = serde_json::from_slice::<Value>(&body)
                 .ok()
                 .and_then(|value| value.pointer("/error/message")?.as_str().map(str::to_owned))
@@ -273,7 +282,17 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
             let status = response.status();
             if !status.is_success() {
                 let retry_after = retry_after_from_response(status.as_u16(), &response);
-                let body = read_limited_body(response, MAX_ERROR_BODY_BYTES).await?;
+                let body = match read_limited_body(response, MAX_ERROR_BODY_BYTES).await {
+                    Ok(body) => body,
+                    Err(_) => {
+                        Err(AnthropicError::Api {
+                            status: status.as_u16(),
+                            message: status.to_string(),
+                            retry_after,
+                        })?;
+                        unreachable!("error propagation exits the stream");
+                    }
+                };
                 let message = serde_json::from_slice::<Value>(&body).ok()
                     .and_then(|value| value.pointer("/error/message")?.as_str().map(str::to_owned))
                     .unwrap_or_else(|| if body.is_empty() { status.to_string() } else { String::from_utf8_lossy(&body).into_owned() });

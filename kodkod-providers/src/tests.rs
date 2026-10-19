@@ -1207,6 +1207,84 @@ async fn open_code_go_adapters_preserve_retry_after_and_structured_status() {
 }
 
 #[tokio::test]
+async fn open_code_go_truncated_error_bodies_preserve_retry_after_and_status() {
+    let server = MockServer::start().await;
+    let response = || {
+        ResponseTemplate::new(429)
+            .insert_header("retry-after", "86400")
+            .insert_header("content-length", "512")
+            .set_body_raw(b"{\"error\":".to_vec(), "application/json")
+    };
+    for route in ["/openai/v1/responses", "/anthropic/v1/messages"] {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(response())
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path(
+            "/google/v1beta/models/gemini-4-argon-contributor:generateContent",
+        ))
+        .respond_with(response())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider =
+        OpenCodeProvider::with_api_key(OpenCodeService::Go, "secret", "session", "Lynx/1")
+            .unwrap()
+            .with_test_endpoint(server.uri());
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("hello"));
+    for model in [
+        open_code_model(OpenCodeService::Go, "gpt-5.6-luna").unwrap(),
+        open_code_model(OpenCodeService::Go, "minimax-m2.7").unwrap(),
+        open_code_model(OpenCodeService::Go, "gemini-4-argon-contributor").unwrap(),
+    ] {
+        let error = provider
+            .complete_once(model, &conversation, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.http_status(), Some(429));
+        assert_eq!(
+            error.retry_after(),
+            Some(RetryAfter::Delay(std::time::Duration::from_secs(86_400)))
+        );
+    }
+    server.verify().await;
+
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .insert_header("retry-after", "86400")
+                .insert_header("content-length", "512")
+                .set_body_raw(b"{\"error\":".to_vec(), "application/json"),
+        )
+        .expect(1)
+        .mount(&auth_server)
+        .await;
+    let auth_provider =
+        OpenCodeProvider::with_api_key(OpenCodeService::Go, "secret", "session", "Lynx/1")
+            .unwrap()
+            .with_test_endpoint(auth_server.uri());
+    let auth_error = auth_provider
+        .complete_once(
+            open_code_model(OpenCodeService::Go, "gpt-5.6-luna").unwrap(),
+            &conversation,
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(auth_error.http_status(), Some(401));
+    assert_eq!(auth_error.retry_after(), None);
+    auth_server.verify().await;
+}
+
+#[tokio::test]
 async fn open_code_rejects_a_model_from_the_other_service_before_http() {
     let provider =
         OpenCodeProvider::with_api_key(OpenCodeService::Go, "secret", "session-1", "Lynx/1")

@@ -767,7 +767,13 @@ where
             let retry_after = OpenAiError::retry_after_from_response(status.as_u16(), &response);
             let body = match read_limited_body(response, MAX_ERROR_BODY_BYTES).await {
                 Ok(body) => body,
-                Err(error) => {
+                Err(_error) => {
+                    let error = OpenAiError::Api {
+                        status: status.as_u16(),
+                        code: None,
+                        message: status.to_string(),
+                        retry_after,
+                    };
                     if let Some(attempt) = &mut attempt {
                         attempt.finish(
                             Some(RequestFailureKind::HttpStatus(status.as_u16())),
@@ -1081,7 +1087,13 @@ where
                 let retry_after = OpenAiError::retry_after_from_response(status.as_u16(), &response);
                 let body = match read_limited_body(response, MAX_ERROR_BODY_BYTES).await {
                     Ok(body) => body,
-                    Err(error) => {
+                    Err(_error) => {
+                        let error = OpenAiError::Api {
+                            status: status.as_u16(),
+                            code: None,
+                            message: status.to_string(),
+                            retry_after,
+                        };
                         if let Some(attempt) = &mut attempt {
                             attempt.finish(
                                 Some(RequestFailureKind::HttpStatus(status.as_u16())),
