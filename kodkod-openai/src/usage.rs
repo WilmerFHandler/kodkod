@@ -12,7 +12,8 @@ pub(crate) fn parse_usage(value: &Value) -> TokenUsage {
             usage,
             &["input_tokens_details", "prompt_tokens_details"],
             "cached_tokens",
-        ),
+        )
+        .or_else(|| first_u64(usage, &["prompt_cache_hit_tokens"])),
         output_tokens: first_u64(usage, &["output_tokens", "completion_tokens"]),
         reasoning_output_tokens: nested_u64(
             usage,
@@ -134,6 +135,20 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(6));
         assert_eq!(usage.reasoning_output_tokens, Some(2));
         assert_eq!(usage.total_tokens, Some(16));
+    }
+
+    #[test]
+    fn parses_deepseek_cache_hit_usage_without_nested_details() {
+        let usage = parse_usage(&json!({
+            "prompt_tokens": 10,
+            "prompt_cache_hit_tokens": 4,
+            "completion_tokens": 6,
+            "completion_tokens_details": {"reasoning_tokens": 2},
+            "total_tokens": 16
+        }));
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.cached_input_tokens, Some(4));
+        assert_eq!(usage.reasoning_output_tokens, Some(2));
     }
 
     #[test]

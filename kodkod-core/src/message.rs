@@ -340,6 +340,8 @@ impl UserMessage {
 pub struct AssistantMessage {
     content: String,
     tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 impl AssistantMessage {
@@ -347,6 +349,7 @@ impl AssistantMessage {
         Self {
             content: content.into(),
             tool_calls: Vec::new(),
+            reasoning_content: None,
         }
     }
 
@@ -358,8 +361,20 @@ impl AssistantMessage {
         &self.tool_calls
     }
 
+    /// Provider-supplied assistant reasoning that must be replayed by some APIs.
+    /// This is separate from user-visible assistant content.
+    pub fn reasoning_content(&self) -> Option<&str> {
+        self.reasoning_content.as_deref()
+    }
+
     pub fn with_tool_calls(mut self, tool_calls: Vec<ToolCall>) -> Self {
         self.tool_calls = tool_calls;
+        self
+    }
+
+    /// Preserve provider-private reasoning needed to replay this assistant turn.
+    pub fn with_reasoning_content(mut self, reasoning_content: impl Into<String>) -> Self {
+        self.reasoning_content = Some(reasoning_content.into());
         self
     }
 }
@@ -504,6 +519,22 @@ fn is_false(value: &bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assistant_reasoning_content_round_trips_and_old_messages_still_load() {
+        let assistant = AssistantMessage::new("answer").with_reasoning_content("reasoning");
+        let encoded = serde_json::to_value(&assistant).unwrap();
+        assert_eq!(encoded["reasoning_content"], "reasoning");
+        assert_eq!(
+            serde_json::from_value::<AssistantMessage>(encoded).unwrap(),
+            assistant
+        );
+        let old = serde_json::json!({"content":"answer", "tool_calls":[]});
+        assert_eq!(
+            serde_json::from_value::<AssistantMessage>(old).unwrap(),
+            AssistantMessage::new("answer")
+        );
+    }
 
     #[test]
     fn image_clones_share_the_immutable_payload() {

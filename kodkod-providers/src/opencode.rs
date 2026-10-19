@@ -7,19 +7,21 @@ use kodkod_anthropic::{
     AnthropicContinuation, AnthropicError, AnthropicMessagesProvider, AnthropicModel,
 };
 use kodkod_core::{
-    AssistantMessage, Conversation, Message, Provider, ProviderCompletion, ProviderEvent,
-    ProviderStream, Retryable, ToolSpec,
+    AssistantMessage, ContextBudget, Conversation, Message, Provider, ProviderCompletion,
+    ProviderEvent, ProviderStream, Retryable, ToolSpec,
 };
 use kodkod_http::{CredentialSource, RequestCredentials, StaticCredentials};
 use kodkod_openai::{
-    OpenAiCompatibleProvider, OpenAiError, OpenAiModel, OpenAiResponsesProvider,
-    ResponsesContinuation,
+    OpenAiCompatibleProvider, OpenAiError, OpenAiModel, OpenAiRequestOptions,
+    OpenAiResponsesProvider, ResponsesContinuation,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 
 use crate::{Protocol, ProviderConfigError, fixed_endpoint_client, header_value};
-pub const OPEN_CODE_GO_ENDPOINT: &str = "https://opencode.ai/zen/go/v1";
+pub const OPEN_CODE_GO_ENDPOINT: &str = "https://opencode.ai/inference/go";
+pub const OPEN_CODE_GO_OPENAI_ENDPOINT: &str = "https://opencode.ai/inference/go/openai/v1";
+pub const OPEN_CODE_GO_ANTHROPIC_ENDPOINT: &str = "https://opencode.ai/inference/go/anthropic/v1";
 pub const OPEN_CODE_ZEN_ENDPOINT: &str = "https://opencode.ai/zen/v1";
 
 /// An OpenCode service with a fixed base endpoint.
@@ -48,6 +50,11 @@ pub struct OpenCodeModel {
     protocol: Protocol,
     vision: bool,
     pdf: bool,
+    context_window_tokens: Option<u64>,
+    max_output_tokens: Option<u64>,
+    reasoning_efforts: Vec<String>,
+    default_reasoning_effort: Option<String>,
+    selected_reasoning_effort: Option<String>,
 }
 
 impl OpenCodeModel {
@@ -74,6 +81,61 @@ impl OpenCodeModel {
     pub const fn supports_pdf(&self) -> bool {
         self.pdf
     }
+
+    pub fn supports_reasoning(&self) -> bool {
+        !self.reasoning_efforts.is_empty()
+    }
+
+    pub fn reasoning_efforts(&self) -> &[String] {
+        &self.reasoning_efforts
+    }
+
+    pub fn default_reasoning_effort(&self) -> Option<&str> {
+        self.default_reasoning_effort.as_deref()
+    }
+
+    pub fn selected_reasoning_effort(&self) -> Option<&str> {
+        self.selected_reasoning_effort.as_deref()
+    }
+
+    pub const fn context_window_tokens(&self) -> Option<u64> {
+        self.context_window_tokens
+    }
+
+    pub const fn max_output_tokens(&self) -> Option<u64> {
+        self.max_output_tokens
+    }
+
+    pub fn context_budget(&self) -> Option<ContextBudget> {
+        self.context_window_tokens
+            .map(|context_window_tokens| ContextBudget {
+                max_input_tokens: context_window_tokens
+                    .saturating_sub(self.max_output_tokens.unwrap_or_default()),
+            })
+    }
+
+    /// Return a per-request model value with a validated reasoning effort.
+    pub fn with_reasoning_effort(mut self, effort: &str) -> Result<Self, ProviderConfigError> {
+        if !self
+            .reasoning_efforts
+            .iter()
+            .any(|supported| supported == effort)
+        {
+            return Err(ProviderConfigError::new(format!(
+                "OpenCode model {} does not support reasoning effort {effort}",
+                self.id
+            )));
+        }
+        self.selected_reasoning_effort = Some(effort.to_owned());
+        Ok(self)
+    }
+
+    pub fn request_options(&self) -> OpenAiRequestOptions {
+        OpenAiRequestOptions {
+            reasoning_effort: self.selected_reasoning_effort.clone(),
+            service_tier: None,
+        }
+    }
 }
 
 impl OpenAiModel for OpenCodeModel {
@@ -83,6 +145,14 @@ impl OpenAiModel for OpenCodeModel {
 
     fn supports_vision(&self) -> bool {
         self.supports_vision()
+    }
+
+    fn request_options(&self) -> OpenAiRequestOptions {
+        OpenCodeModel::request_options(self)
+    }
+
+    fn context_budget(&self) -> Option<ContextBudget> {
+        OpenCodeModel::context_budget(self)
     }
 }
 
@@ -100,6 +170,8 @@ impl AnthropicModel for OpenCodeModel {
 ///
 /// PDF capability is a frozen 2026-09-08 snapshot of
 /// <https://models.dev/api.json>; it is independent of vision capability.
+/// DeepSeek V4.1 Flash metadata matches the upstream catalog at
+/// <https://api-docs.deepseek.com/api/list-models/>.
 pub fn open_code_catalog() -> &'static [OpenCodeModel] {
     #[derive(Deserialize)]
     struct CatalogEntry {
@@ -109,6 +181,14 @@ pub fn open_code_catalog() -> &'static [OpenCodeModel] {
         protocol: Protocol,
         vision: bool,
         pdf: bool,
+        #[serde(default)]
+        context_window_tokens: Option<u64>,
+        #[serde(default)]
+        max_output_tokens: Option<u64>,
+        #[serde(default)]
+        reasoning_efforts: Vec<String>,
+        #[serde(default)]
+        default_reasoning_effort: Option<String>,
     }
 
     static MODELS: OnceLock<Vec<OpenCodeModel>> = OnceLock::new();
@@ -123,6 +203,11 @@ pub fn open_code_catalog() -> &'static [OpenCodeModel] {
                 protocol: entry.protocol,
                 vision: entry.vision,
                 pdf: entry.pdf,
+                context_window_tokens: entry.context_window_tokens,
+                max_output_tokens: entry.max_output_tokens,
+                reasoning_efforts: entry.reasoning_efforts,
+                selected_reasoning_effort: entry.default_reasoning_effort.clone(),
+                default_reasoning_effort: entry.default_reasoning_effort,
             })
             .collect()
     })
@@ -262,11 +347,53 @@ impl OpenCodeProvider {
         Ok(())
     }
 
+    fn endpoint_for_protocol(&self, protocol: Protocol) -> String {
+        if self.service != OpenCodeService::Go {
+            return self.endpoint.clone();
+        }
+        let endpoint = match protocol {
+            Protocol::Responses | Protocol::ChatCompletions => "openai/v1",
+            Protocol::Messages => "anthropic/v1",
+        };
+        format!("{}/{endpoint}", self.endpoint.trim_end_matches('/'))
+    }
+
     #[cfg(test)]
     pub(crate) fn with_test_endpoint(mut self, endpoint: String) -> Self {
         self.endpoint = endpoint;
         self
     }
+}
+
+fn ensure_reasoning_content(model: &OpenCodeModel, message: AssistantMessage) -> AssistantMessage {
+    if model.supports_reasoning() && message.reasoning_content().is_none() {
+        message.with_reasoning_content("")
+    } else {
+        message
+    }
+}
+
+fn prepare_reasoning_replay(
+    model: &OpenCodeModel,
+    conversation: &Conversation,
+    tools: &[ToolSpec],
+) -> Conversation {
+    let mut request = conversation.clone();
+    if model.supports_reasoning() && !tools.is_empty() {
+        request.replace_messages(
+            conversation
+                .messages()
+                .iter()
+                .map(|message| match message {
+                    Message::Assistant(assistant) if assistant.reasoning_content().is_none() => {
+                        Message::Assistant(assistant.clone().with_reasoning_content(""))
+                    }
+                    _ => message.clone(),
+                })
+                .collect(),
+        );
+    }
+    request
 }
 
 struct OpenCodeHttpCredentials {
@@ -358,7 +485,7 @@ impl Provider for OpenCodeProvider {
     type Continuation = OpenCodeContinuation;
 
     fn supports_vision(&self, model: &OpenCodeModel) -> bool {
-        model.supports_vision()
+        model.service == self.service && model.supports_vision()
     }
 
     fn supports_document(&self, model: &OpenCodeModel, mime: &str) -> bool {
@@ -366,6 +493,26 @@ impl Provider for OpenCodeProvider {
             && model.supports_pdf()
             && model.supports_vision()
             && mime == "application/pdf"
+    }
+
+    fn context_budget(&self, model: &OpenCodeModel) -> Option<ContextBudget> {
+        (model.service == self.service)
+            .then(|| model.context_budget())
+            .flatten()
+    }
+
+    fn is_context_overflow(&self, error: &Self::Error) -> bool {
+        match error {
+            ProviderError::OpenAi(OpenAiError::Api {
+                status: 400,
+                code: Some(code),
+                ..
+            })
+            | ProviderError::OpenAi(OpenAiError::ResponseFailed {
+                code: Some(code), ..
+            }) => code == "context_length_exceeded",
+            _ => false,
+        }
     }
 
     fn create_continuation(&self, model: &OpenCodeModel) -> Self::Continuation {
@@ -415,7 +562,8 @@ impl Provider for OpenCodeProvider {
         self.validate_documents(model, conversation)?;
         match (model.protocol, continuation) {
             (Protocol::Responses, OpenCodeContinuation::Responses(continuation)) => {
-                let provider = OpenAiResponsesProvider::new(&self.endpoint)
+                let endpoint = self.endpoint_for_protocol(Protocol::Responses);
+                let provider = OpenAiResponsesProvider::new(endpoint)
                     .with_credentials(self.credentials(Protocol::Responses))
                     .with_client(self.client.clone());
                 let completion = provider
@@ -428,21 +576,24 @@ impl Provider for OpenCodeProvider {
                 ))
             }
             (Protocol::ChatCompletions, OpenCodeContinuation::ChatCompletions) => {
-                let provider = OpenAiCompatibleProvider::new(&self.endpoint)
+                let endpoint = self.endpoint_for_protocol(Protocol::ChatCompletions);
+                let request_conversation = prepare_reasoning_replay(model, conversation, tools);
+                let provider = OpenAiCompatibleProvider::new(endpoint)
                     .with_pdf_inputs(model.supports_pdf())
                     .with_credentials(self.credentials(Protocol::ChatCompletions))
                     .with_client(self.client.clone());
                 let completion = provider
-                    .complete_with_usage(&(), model, conversation, tools)
+                    .complete_with_usage(&(), model, &request_conversation, tools)
                     .await?;
                 Ok(ProviderCompletion::new(
-                    completion.message,
+                    ensure_reasoning_content(model, completion.message),
                     OpenCodeContinuation::ChatCompletions,
                     completion.usage,
                 ))
             }
             (Protocol::Messages, OpenCodeContinuation::Messages(continuation)) => {
-                let provider = AnthropicMessagesProvider::new(&self.endpoint)
+                let endpoint = self.endpoint_for_protocol(Protocol::Messages);
+                let provider = AnthropicMessagesProvider::new(endpoint)
                     .with_credentials(self.credentials(Protocol::Messages))
                     .with_client(self.client.clone());
                 let completion = provider
@@ -473,7 +624,8 @@ impl Provider for OpenCodeProvider {
             self.validate_documents(model, conversation)?;
             match (model.protocol, continuation) {
                 (Protocol::Responses, OpenCodeContinuation::Responses(continuation)) => {
-                    let provider = OpenAiResponsesProvider::new(&self.endpoint)
+                    let endpoint = self.endpoint_for_protocol(Protocol::Responses);
+                    let provider = OpenAiResponsesProvider::new(endpoint)
                         .with_credentials(self.credentials(Protocol::Responses))
                         .with_client(self.client.clone());
                     let mut stream = provider.complete_stream(continuation, model, conversation, tools);
@@ -492,17 +644,21 @@ impl Provider for OpenCodeProvider {
                     }
                 }
                 (Protocol::ChatCompletions, OpenCodeContinuation::ChatCompletions) => {
-                    let provider = OpenAiCompatibleProvider::new(&self.endpoint)
+                    let endpoint = self.endpoint_for_protocol(Protocol::ChatCompletions);
+                    let request_conversation = prepare_reasoning_replay(model, conversation, tools);
+                    let provider = OpenAiCompatibleProvider::new(endpoint)
                         .with_pdf_inputs(model.supports_pdf())
                         .with_credentials(self.credentials(Protocol::ChatCompletions))
                         .with_client(self.client.clone());
-                    let mut stream = provider.complete_stream(&(), model, conversation, tools);
+                    let mut stream = provider.complete_stream(
+                        &(), model, &request_conversation, tools,
+                    );
                     while let Some(event) = stream.next().await {
                         match event? {
                             ProviderEvent::TextDelta(delta) => yield ProviderEvent::TextDelta(delta),
                             ProviderEvent::Completed(completion) => {
                                 yield ProviderEvent::Completed(ProviderCompletion::new(
-                                    completion.message,
+                                    ensure_reasoning_content(model, completion.message),
                                     OpenCodeContinuation::ChatCompletions,
                                     completion.usage,
                                 ));
@@ -512,7 +668,8 @@ impl Provider for OpenCodeProvider {
                     }
                 }
                 (Protocol::Messages, OpenCodeContinuation::Messages(continuation)) => {
-                    let provider = AnthropicMessagesProvider::new(&self.endpoint)
+                    let endpoint = self.endpoint_for_protocol(Protocol::Messages);
+                    let provider = AnthropicMessagesProvider::new(endpoint)
                         .with_credentials(self.credentials(Protocol::Messages))
                         .with_client(self.client.clone());
                     let mut stream = provider.complete_stream(continuation, model, conversation, tools);

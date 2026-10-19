@@ -10,12 +10,30 @@ use super::api::{
     WireToolCall,
 };
 use super::error::OpenAiError;
+use super::model::OpenAiRequestOptions;
 
+#[cfg(test)]
 pub(crate) fn build_request(
     model_id: &str,
     conversation: &Conversation,
     tools: &[ToolSpec],
     pdf_allowed: bool,
+) -> Result<ChatCompletionRequest, OpenAiError> {
+    build_request_with_options(
+        model_id,
+        conversation,
+        tools,
+        pdf_allowed,
+        &OpenAiRequestOptions::default(),
+    )
+}
+
+pub(crate) fn build_request_with_options(
+    model_id: &str,
+    conversation: &Conversation,
+    tools: &[ToolSpec],
+    pdf_allowed: bool,
+    options: &OpenAiRequestOptions,
 ) -> Result<ChatCompletionRequest, OpenAiError> {
     validate_documents(conversation, pdf_allowed)?;
     let mut messages = Vec::new();
@@ -70,6 +88,8 @@ pub(crate) fn build_request(
         model: model_id.to_owned(),
         messages,
         tools: tools.iter().map(convert_tool_spec).collect(),
+        reasoning_effort: options.reasoning_effort.clone(),
+        service_tier: options.service_tier.clone(),
     })
 }
 
@@ -84,6 +104,7 @@ pub(crate) fn parse_assistant_message(
         .message;
 
     let content = message.content.or(message.refusal).unwrap_or_default();
+    let reasoning_content = message.reasoning_content;
 
     let mut tool_calls: Vec<ToolCall> = message
         .tool_calls
@@ -97,7 +118,11 @@ pub(crate) fn parse_assistant_message(
         tool_calls.push(parse_legacy_function_call(function_call)?);
     }
 
-    Ok(AssistantMessage::new(content).with_tool_calls(tool_calls))
+    let assistant = AssistantMessage::new(content).with_tool_calls(tool_calls);
+    Ok(match reasoning_content {
+        Some(reasoning_content) => assistant.with_reasoning_content(reasoning_content),
+        None => assistant,
+    })
 }
 
 fn convert_message(message: &Message) -> RequestMessage {
@@ -136,6 +161,7 @@ fn convert_message(message: &Message) -> RequestMessage {
             } else {
                 Some(assistant.content().to_owned())
             },
+            reasoning_content: assistant.reasoning_content().map(str::to_owned),
             tool_calls: assistant
                 .tool_calls()
                 .iter()
@@ -247,11 +273,13 @@ mod tests {
         let mut conversation = Conversation::new().with_system_prompt("You are helpful.");
         conversation.push_user_message(UserMessage::new("hi"));
         conversation.push_message(Message::Assistant(
-            AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
-                "call_1",
-                "lookup",
-                json!({"q": "weather"}),
-            )]),
+            AssistantMessage::new("")
+                .with_tool_calls(vec![ToolCall::new(
+                    "call_1",
+                    "lookup",
+                    json!({"q": "weather"}),
+                )])
+                .with_reasoning_content("private reasoning"),
         ));
         conversation.push_message(Message::ToolResult(ToolResult::success(
             "call_1",
@@ -273,6 +301,7 @@ mod tests {
             assistant_message["tool_calls"][0]["function"]["arguments"],
             r#"{"q":"weather"}"#
         );
+        assert_eq!(assistant_message["reasoning_content"], "private reasoning");
     }
 
     #[test]

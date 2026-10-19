@@ -1,9 +1,9 @@
 use super::*;
 use futures_util::StreamExt;
 use kodkod_core::{
-    CompactOptions, ContextBudget, Conversation, Document, Message, Provider, ProviderEvent,
-    RetryPolicy, RetryProvider, Retryable, SystemMessage, TokenUsage, ToolOutput, ToolResult,
-    ToolSpec, UserMessage,
+    AssistantMessage, CompactOptions, ContextBudget, Conversation, Document, Message, Provider,
+    ProviderEvent, RetryPolicy, RetryProvider, Retryable, SystemMessage, TokenUsage, ToolOutput,
+    ToolResult, ToolSpec, UserMessage,
 };
 use kodkod_http::{RequestCredentials, StaticCredentials};
 use kodkod_openai::{OpenAiError, OpenAiResponsesProvider};
@@ -610,6 +610,39 @@ fn catalog_routes_models_by_service_and_protocol() {
             .protocol(),
         Protocol::ChatCompletions
     );
+    let deepseek = open_code_model(OpenCodeService::Go, "deepseek-v4.1-flash").unwrap();
+    assert_eq!(deepseek.name(), "DeepSeek V4.1 Flash");
+    assert_eq!(deepseek.protocol(), Protocol::ChatCompletions);
+    assert!(deepseek.supports_vision());
+    assert!(deepseek.supports_reasoning());
+    assert_eq!(
+        deepseek
+            .reasoning_efforts()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["low", "high", "max"]
+    );
+    assert_eq!(deepseek.default_reasoning_effort(), Some("high"));
+    assert_eq!(deepseek.context_window_tokens(), Some(1_048_576));
+    assert_eq!(deepseek.max_output_tokens(), Some(393_216));
+    assert_eq!(
+        deepseek.context_budget(),
+        Some(ContextBudget {
+            max_input_tokens: 655_360,
+        })
+    );
+    assert_eq!(
+        deepseek.request_options().reasoning_effort.as_deref(),
+        Some("high")
+    );
+    assert_eq!(deepseek.request_options().service_tier, None);
+    let selected = (*deepseek).clone().with_reasoning_effort("low").unwrap();
+    assert_eq!(
+        selected.request_options().reasoning_effort.as_deref(),
+        Some("low")
+    );
+    assert!((*deepseek).clone().with_reasoning_effort("medium").is_err());
     let mut seen = HashSet::new();
     for model in open_code_catalog() {
         assert!(seen.insert((model.service(), model.id())));
@@ -640,6 +673,279 @@ fn catalog_routes_models_by_service_and_protocol() {
             .unwrap()
             .supports_pdf()
     );
+}
+
+#[tokio::test]
+async fn open_code_go_deepseek_replays_reasoning_and_tool_calls() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/chat/completions"))
+        .and(header("authorization", "Bearer secret"))
+        .and(header("x-opencode-session", "deepseek-session"))
+        .and(header("user-agent", "Lynx/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "content": "Looking that up.",
+                    "reasoning_content": "I should query the tool.",
+                    "tool_calls": [{
+                        "id": "call_lookup",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 123,
+                "prompt_tokens_details": {"cached_tokens": 17},
+                "prompt_cache_hit_tokens": 17,
+                "prompt_cache_miss_tokens": 106,
+                "completion_tokens": 20,
+                "completion_tokens_details": {"reasoning_tokens": 12},
+                "total_tokens": 143
+            }
+        })))
+        .expect(1)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/chat/completions"))
+        .and(header("x-opencode-session", "deepseek-session"))
+        .and(header("user-agent", "Lynx/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "content": "Found it.",
+                    "reasoning_content": "The tool returned the answer.",
+                    "tool_calls": []
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 150,
+                "prompt_tokens_details": {"cached_tokens": 30},
+                "completion_tokens": 8,
+                "completion_tokens_details": {"reasoning_tokens": 5},
+                "total_tokens": 158
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider =
+        OpenCodeProvider::with_api_key(OpenCodeService::Go, "secret", "deepseek-session", "Lynx/1")
+            .unwrap()
+            .with_test_endpoint(server.uri());
+    let model = (*open_code_model(OpenCodeService::Go, "deepseek-v4.1-flash").unwrap())
+        .clone()
+        .with_reasoning_effort("low")
+        .unwrap();
+    let tools = [ToolSpec::new(
+        "lookup",
+        "Look up a value.",
+        json!({"type":"object", "properties":{}}),
+    )];
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("Find the value."));
+    let continuation = provider.create_continuation(&model);
+    let first = provider
+        .complete_with_usage(&continuation, &model, &conversation, &tools)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.message.reasoning_content(),
+        Some("I should query the tool.")
+    );
+    assert_eq!(first.usage.cached_input_tokens, Some(17));
+    assert_eq!(first.usage.reasoning_output_tokens, Some(12));
+    conversation.push_message(Message::Assistant(first.message));
+    conversation.push_message(Message::ToolResult(ToolResult::success(
+        "call_lookup",
+        ToolOutput::new(json!({"value": "found"})),
+    )));
+
+    let second = provider
+        .complete_with_usage(&first.continuation, &model, &conversation, &tools)
+        .await
+        .unwrap();
+    assert_eq!(second.message.content(), "Found it.");
+    assert_eq!(second.usage.cached_input_tokens, Some(30));
+    assert_eq!(second.usage.reasoning_output_tokens, Some(5));
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(request.url.path(), "/openai/v1/chat/completions");
+        assert_eq!(
+            request.headers.get("x-opencode-session").unwrap(),
+            "deepseek-session"
+        );
+        assert_eq!(request.headers.get("user-agent").unwrap(), "Lynx/1");
+    }
+    let first_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(first_body["model"], "deepseek-v4.1-flash");
+    assert_eq!(first_body["reasoning_effort"], "low");
+    assert!(first_body.get("service_tier").is_none());
+    let second_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(
+        second_body["messages"][1]["reasoning_content"],
+        "I should query the tool."
+    );
+    assert_eq!(
+        second_body["messages"][1]["tool_calls"][0]["id"],
+        "call_lookup"
+    );
+    assert_eq!(second_body["messages"][2]["tool_call_id"], "call_lookup");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn open_code_go_deepseek_replays_empty_reasoning_for_tool_only_turns() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {
+                "content": "",
+                "tool_calls": [{"id":"call_1", "type":"function", "function":{"name":"lookup", "arguments":"{}"}}]
+            }}]
+        })))
+        .expect(1)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "done", "tool_calls": []}}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = OpenCodeProvider::with_api_key(
+        OpenCodeService::Go,
+        "secret",
+        "empty-reasoning-session",
+        "Lynx/1",
+    )
+    .unwrap()
+    .with_test_endpoint(server.uri());
+    let model = open_code_model(OpenCodeService::Go, "deepseek-v4.1-flash").unwrap();
+    let tools = [ToolSpec::new("lookup", "Lookup", json!({"type":"object"}))];
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("lookup"));
+    let continuation = provider.create_continuation(model);
+    let first = provider
+        .complete_with_usage(&continuation, model, &conversation, &tools)
+        .await
+        .unwrap();
+    assert_eq!(first.message.reasoning_content(), Some(""));
+    conversation.push_message(Message::Assistant(first.message));
+    conversation.push_message(Message::ToolResult(ToolResult::success(
+        "call_1",
+        ToolOutput::new(json!({"ok": true})),
+    )));
+    provider
+        .complete_with_usage(&first.continuation, model, &conversation, &tools)
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let second_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(second_body["messages"][1]["reasoning_content"], "");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn open_code_go_deepseek_uses_generic_summary_compaction() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_summary",
+                    "type": "function",
+                    "function": {"name": "summarize", "arguments": "{\"summary\":\"Kept facts.\"}"}
+                }]
+            }}],
+            "usage": {
+                "prompt_tokens": 45,
+                "prompt_tokens_details": {"cached_tokens": 8},
+                "completion_tokens": 9,
+                "total_tokens": 54
+            }
+        })))
+        .expect(1)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "Continued", "tool_calls": []}}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider =
+        OpenCodeProvider::with_api_key(OpenCodeService::Go, "secret", "compact-session", "Lynx/1")
+            .unwrap()
+            .with_test_endpoint(server.uri());
+    let model = open_code_model(OpenCodeService::Go, "deepseek-v4.1-flash").unwrap();
+    assert_eq!(provider.context_budget(model), model.context_budget());
+    let continuation = provider.create_continuation(model);
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("Old question"));
+    conversation.push_message(Message::Assistant(
+        AssistantMessage::new("Old answer").with_reasoning_content("old private reasoning"),
+    ));
+    conversation.push_user_message(UserMessage::new("Keep this question"));
+
+    let compacted = provider
+        .compact_context(
+            &continuation,
+            model,
+            &conversation,
+            CompactOptions {
+                keep_tail_tokens: 0,
+                ..CompactOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!Provider::has_opaque_context(
+        &provider,
+        &compacted.continuation
+    ));
+    assert_eq!(compacted.usage.input_tokens, Some(45));
+    assert_eq!(compacted.usage.cached_input_tokens, Some(8));
+    assert!(compacted.conversation.messages().iter().any(|message| {
+        matches!(message, Message::Assistant(assistant) if assistant.content() == "Kept facts.")
+    }));
+    let tools = [ToolSpec::new("lookup", "Lookup", json!({"type":"object"}))];
+    provider
+        .complete_with_usage(
+            &compacted.continuation,
+            model,
+            &compacted.conversation,
+            &tools,
+        )
+        .await
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].url.path(), "/openai/v1/chat/completions");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["tools"][0]["function"]["name"], "summarize");
+    assert!(body.get("service_tier").is_none());
+    let next_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(next_body["messages"][0]["content"], "Kept facts.");
+    assert_eq!(next_body["messages"][0]["reasoning_content"], "");
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -688,7 +994,7 @@ async fn open_code_routes_chat_and_owns_required_headers() {
 async fn open_code_routes_responses_with_bearer_key() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/openai/v1/responses"))
         .and(header("authorization", "Bearer secret"))
         .and(header("x-opencode-session", "session-2"))
         .and(header("user-agent", "Lynx/1"))
@@ -713,7 +1019,7 @@ async fn open_code_routes_responses_with_bearer_key() {
 async fn open_code_routes_messages_with_native_api_key_header() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/messages"))
+        .and(path("/anthropic/v1/messages"))
         .and(header("x-api-key", "secret"))
         .and(header("x-opencode-session", "session-3"))
         .and(header("user-agent", "Lynx/1"))
@@ -754,7 +1060,7 @@ async fn open_code_rejects_a_model_from_the_other_service_before_http() {
 async fn open_code_rejects_documents_before_http() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/openai/v1/responses"))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&server)
@@ -791,7 +1097,7 @@ async fn open_code_rejects_documents_before_http() {
 async fn open_code_routes_pdf_to_the_responses_protocol() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/openai/v1/responses"))
         .respond_with(ResponseTemplate::new(200).set_body_string(completed("done")))
         .mount(&server)
         .await;
@@ -818,7 +1124,7 @@ async fn open_code_routes_pdf_to_the_responses_protocol() {
 async fn open_code_routes_pdf_to_the_chat_completions_protocol() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/openai/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "choices": [{ "message": { "content": "done" } }]
         })))
@@ -936,6 +1242,14 @@ fn named_endpoints_and_protocol_serialization_are_stable() {
         CODEX_ENDPOINT
     );
     assert_eq!(OpenCodeService::Go.endpoint(), OPEN_CODE_GO_ENDPOINT);
+    assert_eq!(
+        OPEN_CODE_GO_OPENAI_ENDPOINT,
+        "https://opencode.ai/inference/go/openai/v1"
+    );
+    assert_eq!(
+        OPEN_CODE_GO_ANTHROPIC_ENDPOINT,
+        "https://opencode.ai/inference/go/anthropic/v1"
+    );
     assert_eq!(OpenCodeService::Zen.endpoint(), OPEN_CODE_ZEN_ENDPOINT);
     assert_eq!(
         serde_json::to_string(&Protocol::ChatCompletions).unwrap(),

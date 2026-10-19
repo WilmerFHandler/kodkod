@@ -7,6 +7,10 @@ pub(crate) struct ChatCompletionRequest {
     pub messages: Vec<RequestMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDefinition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -21,6 +25,8 @@ pub(crate) enum RequestMessage {
     Assistant {
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<WireToolCall>,
     },
@@ -114,6 +120,8 @@ pub(crate) struct ResponseMessage {
     pub content: Option<String>,
     #[serde(default)]
     pub refusal: Option<String>,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<WireToolCall>,
     #[serde(default)]

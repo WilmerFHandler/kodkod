@@ -8,8 +8,9 @@ use kodkod_core::{
 use serde_json::{Value, json};
 
 use super::api::{ApiErrorResponse, ChatCompletionResponse};
-use super::convert::{build_request, parse_assistant_message};
+use super::convert::{build_request_with_options, parse_assistant_message};
 use super::error::OpenAiError;
+use super::model::OpenAiRequestOptions;
 use super::usage::parse_usage;
 use crate::RequestCredentials;
 use kodkod_http::SseDecoder;
@@ -74,7 +75,30 @@ pub(crate) async fn complete_with_document_support(
     tools: &[ToolSpec],
     pdf_allowed: bool,
 ) -> Result<(AssistantMessage, TokenUsage), OpenAiError> {
-    let request = build_request(model_id, conversation, tools, pdf_allowed)?;
+    complete_with_request_options(
+        client,
+        chat_completions_url,
+        credentials,
+        model_id,
+        conversation,
+        tools,
+        pdf_allowed,
+        &OpenAiRequestOptions::default(),
+    )
+    .await
+}
+
+pub(crate) async fn complete_with_request_options(
+    client: &reqwest::Client,
+    chat_completions_url: &str,
+    credentials: Option<&RequestCredentials>,
+    model_id: &str,
+    conversation: &Conversation,
+    tools: &[ToolSpec],
+    pdf_allowed: bool,
+    options: &OpenAiRequestOptions,
+) -> Result<(AssistantMessage, TokenUsage), OpenAiError> {
+    let request = build_request_with_options(model_id, conversation, tools, pdf_allowed, options)?;
     let mut http_request = client.post(chat_completions_url).json(&request);
 
     if let Some(credentials) = credentials {
@@ -105,7 +129,7 @@ pub(crate) async fn complete_with_document_support(
     Ok((parse_assistant_message(body)?, usage))
 }
 
-pub(crate) fn stream_with_document_support<'a>(
+pub(crate) fn stream_with_request_options<'a>(
     client: &'a reqwest::Client,
     chat_completions_url: &'a str,
     credentials: Option<&'a RequestCredentials>,
@@ -113,13 +137,15 @@ pub(crate) fn stream_with_document_support<'a>(
     conversation: &'a Conversation,
     tools: &'a [ToolSpec],
     pdf_allowed: bool,
+    options: OpenAiRequestOptions,
 ) -> ProviderStream<'a, (), OpenAiError> {
     Box::pin(async_stream::try_stream! {
-        let mut request = serde_json::to_value(build_request(
+        let mut request = serde_json::to_value(build_request_with_options(
             model_id,
             conversation,
             tools,
             pdf_allowed,
+            &options,
         )?)?;
         request["stream"] = Value::Bool(true);
         let mut http_request = client.post(chat_completions_url).json(&request);
@@ -180,6 +206,7 @@ pub(crate) fn stream_with_document_support<'a>(
 #[derive(Default)]
 struct ChatStreamAccumulator {
     text: String,
+    reasoning_content: Option<String>,
     calls: BTreeMap<usize, PartialToolCall>,
     legacy_call: Option<PartialToolCall>,
     finish_reason: Option<String>,
@@ -241,6 +268,11 @@ impl ChatStreamAccumulator {
             .or_else(|| delta.get("refusal").and_then(Value::as_str))
             .filter(|text| !text.is_empty())
             .map(str::to_owned);
+        if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+            self.reasoning_content
+                .get_or_insert_with(String::new)
+                .push_str(reasoning);
+        }
         if let Some(text) = &text {
             self.text.push_str(text);
         }
@@ -336,10 +368,12 @@ impl ChatStreamAccumulator {
         if self.text.is_empty() && calls.is_empty() {
             return Err(OpenAiError::EmptyResponse);
         }
-        Ok((
-            AssistantMessage::new(self.text).with_tool_calls(calls),
-            self.usage,
-        ))
+        let assistant = AssistantMessage::new(self.text).with_tool_calls(calls);
+        let assistant = match self.reasoning_content {
+            Some(reasoning) => assistant.with_reasoning_content(reasoning),
+            None => assistant,
+        };
+        Ok((assistant, self.usage))
     }
 }
 

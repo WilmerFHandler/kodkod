@@ -105,6 +105,22 @@
   },
   {
     "service": "go",
+    "id": "deepseek-v4.1-flash",
+    "name": "DeepSeek V4.1 Flash",
+    "protocol": "chat_completions",
+    "vision": true,
+    "pdf": false,
+    "context_window_tokens": 1048576,
+    "max_output_tokens": 393216,
+    "reasoning_efforts": [
+      "low",
+      "high",
+      "max"
+    ],
+    "default_reasoning_effort": "high"
+  },
+  {
+    "service": "go",
     "id": "mimo-v2.5",
     "name": "MiMo-V2.5",
     "protocol": "chat_completions",

@@ -30,6 +30,9 @@ pub(crate) fn estimate_message(message: &Message) -> u64 {
         }
         Message::Assistant(message) => {
             tokens = tokens.saturating_add(text_tokens(message.content().len()));
+            if let Some(reasoning) = message.reasoning_content() {
+                tokens = tokens.saturating_add(text_tokens(reasoning.len()));
+            }
             for call in message.tool_calls() {
                 tokens = tokens.saturating_add(text_tokens(
                     call.id().len().saturating_add(call.name().len()),
@@ -148,6 +151,16 @@ mod tests {
             )]),
         ));
         assert!(with_args.estimate_tokens(&[]) > without_args.estimate_tokens(&[]));
+    }
+
+    #[test]
+    fn assistant_reasoning_content_contributes_to_the_estimate() {
+        let without = Message::Assistant(AssistantMessage::new("answer"));
+        let with = Message::Assistant(
+            AssistantMessage::new("answer")
+                .with_reasoning_content("a long internal reasoning trace"),
+        );
+        assert!(estimate_message(&with) > estimate_message(&without));
     }
 
     #[test]

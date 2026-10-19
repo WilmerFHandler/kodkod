@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use kodkod_core::{
-    AssistantMessage, Conversation, Provider, ProviderCompletion, ProviderEvent, ProviderStream,
-    ToolSpec,
+    AssistantMessage, ContextBudget, Conversation, Provider, ProviderCompletion, ProviderEvent,
+    ProviderStream, ToolSpec,
 };
 
 use super::completion;
@@ -89,6 +89,14 @@ where
         self.supports_pdf_inputs && model.supports_vision() && mime == "application/pdf"
     }
 
+    fn context_budget(&self, model: &M) -> Option<ContextBudget> {
+        model.context_budget()
+    }
+
+    fn is_context_overflow(&self, error: &Self::Error) -> bool {
+        error.is_context_overflow()
+    }
+
     async fn complete(
         &self,
         continuation: &Self::Continuation,
@@ -114,7 +122,8 @@ where
             Some(source) => Some(source.credentials().await?),
             None => None,
         };
-        let (message, usage) = completion::complete_with_document_support(
+        let options = model.request_options();
+        let (message, usage) = completion::complete_with_request_options(
             &self.client,
             &self.chat_completions_url,
             credentials.as_ref(),
@@ -122,6 +131,7 @@ where
             conversation,
             tools,
             pdf_allowed,
+            &options,
         )
         .await?;
         Ok(ProviderCompletion::new(message, (), usage))
@@ -141,7 +151,7 @@ where
                 Some(source) => Some(source.credentials().await?),
                 None => None,
             };
-            let mut stream = completion::stream_with_document_support(
+            let mut stream = completion::stream_with_request_options(
                 &self.client,
                 &self.chat_completions_url,
                 credentials.as_ref(),
@@ -149,6 +159,7 @@ where
                 conversation,
                 tools,
                 pdf_allowed,
+                model.request_options(),
             );
             while let Some(event) = stream.next().await {
                 match event? {
@@ -226,6 +237,7 @@ mod tests {
                 "choices": [{
                     "message": {
                         "content": "world",
+                        "reasoning_content": "private reasoning",
                         "tool_calls": []
                     }
                 }],
@@ -254,6 +266,10 @@ mod tests {
             .expect("completion should succeed");
 
         assert_eq!(completion.message.content(), "world");
+        assert_eq!(
+            completion.message.reasoning_content(),
+            Some("private reasoning")
+        );
         assert!(completion.message.tool_calls().is_empty());
         assert_eq!(
             completion.usage,
@@ -271,6 +287,8 @@ mod tests {
     async fn streams_chat_text_and_requires_done_before_completion() {
         let server = MockServer::start().await;
         let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"think\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"ing\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
@@ -300,7 +318,7 @@ mod tests {
             matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::TextDelta(text) if text == "lo")
         );
         assert!(
-            matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::Completed(completion) if completion.message.content() == "hello" && completion.usage.total_tokens == Some(14))
+            matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::Completed(completion) if completion.message.content() == "hello" && completion.message.reasoning_content() == Some("thinking") && completion.usage.total_tokens == Some(14))
         );
     }
 
