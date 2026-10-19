@@ -1208,34 +1208,48 @@ async fn open_code_go_adapters_preserve_retry_after_and_structured_status() {
 
 #[tokio::test]
 async fn open_code_go_truncated_error_bodies_preserve_retry_after_and_status() {
-    let server = MockServer::start().await;
-    let response = || {
-        ResponseTemplate::new(429)
-            .insert_header("retry-after", "86400")
-            .insert_header("content-length", "512")
-            .set_body_raw(b"{\"error\":".to_vec(), "application/json")
-    };
-    for route in ["/openai/v1/responses", "/anthropic/v1/messages"] {
-        Mock::given(method("POST"))
-            .and(path(route))
-            .respond_with(response())
-            .expect(1)
-            .mount(&server)
-            .await;
-    }
-    Mock::given(method("POST"))
-        .and(path(
-            "/google/v1beta/models/gemini-4-argon-contributor:generateContent",
-        ))
-        .respond_with(response())
-        .expect(1)
-        .mount(&server)
-        .await;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let response_server = tokio::spawn(async move {
+        for status in [429, 429, 429, 401] {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut header_end = None;
+            let mut buffer = [0_u8; 4096];
+            while header_end.is_none() {
+                let count = connection.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0, "client closed before completing request headers");
+                request.extend_from_slice(&buffer[..count]);
+                header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4);
+                assert!(
+                    request.len() <= 64 * 1024,
+                    "request headers exceeded the test bound"
+                );
+            }
+
+            let reason = if status == 401 {
+                "Unauthorized"
+            } else {
+                "Too Many Requests"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nRetry-After: 86400\r\nContent-Length: 512\r\nConnection: close\r\n\r\n{{\"error\":"
+            );
+            connection.write_all(response.as_bytes()).await.unwrap();
+            connection.shutdown().await.unwrap();
+        }
+    });
 
     let provider =
         OpenCodeProvider::with_api_key(OpenCodeService::Go, "secret", "session", "Lynx/1")
             .unwrap()
-            .with_test_endpoint(server.uri());
+            .with_test_endpoint(format!("http://{address}"));
     let mut conversation = Conversation::new();
     conversation.push_user_message(UserMessage::new("hello"));
     for model in [
@@ -1253,25 +1267,7 @@ async fn open_code_go_truncated_error_bodies_preserve_retry_after_and_status() {
             Some(RetryAfter::Delay(std::time::Duration::from_secs(86_400)))
         );
     }
-    server.verify().await;
-
-    let auth_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/openai/v1/responses"))
-        .respond_with(
-            ResponseTemplate::new(401)
-                .insert_header("retry-after", "86400")
-                .insert_header("content-length", "512")
-                .set_body_raw(b"{\"error\":".to_vec(), "application/json"),
-        )
-        .expect(1)
-        .mount(&auth_server)
-        .await;
-    let auth_provider =
-        OpenCodeProvider::with_api_key(OpenCodeService::Go, "secret", "session", "Lynx/1")
-            .unwrap()
-            .with_test_endpoint(auth_server.uri());
-    let auth_error = auth_provider
+    let auth_error = provider
         .complete_once(
             open_code_model(OpenCodeService::Go, "gpt-5.6-luna").unwrap(),
             &conversation,
@@ -1281,7 +1277,7 @@ async fn open_code_go_truncated_error_bodies_preserve_retry_after_and_status() {
         .unwrap_err();
     assert_eq!(auth_error.http_status(), Some(401));
     assert_eq!(auth_error.retry_after(), None);
-    auth_server.verify().await;
+    response_server.await.unwrap();
 }
 
 #[tokio::test]
