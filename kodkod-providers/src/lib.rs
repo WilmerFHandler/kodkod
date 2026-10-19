@@ -20,9 +20,9 @@ pub use codex::{
     CODEX_ENDPOINT, CodexAccess, CodexAccessFuture, CodexCredentialSource, CodexProvider,
 };
 pub use opencode::{
-    OPEN_CODE_GO_ANTHROPIC_ENDPOINT, OPEN_CODE_GO_ENDPOINT, OPEN_CODE_GO_OPENAI_ENDPOINT,
-    OPEN_CODE_ZEN_ENDPOINT, OpenCodeContinuation, OpenCodeModel, OpenCodeProvider, OpenCodeService,
-    ProviderError, open_code_catalog, open_code_model,
+    OPEN_CODE_GO_ANTHROPIC_ENDPOINT, OPEN_CODE_GO_ENDPOINT, OPEN_CODE_GO_GOOGLE_ENDPOINT,
+    OPEN_CODE_GO_OPENAI_ENDPOINT, OPEN_CODE_ZEN_ENDPOINT, OpenCodeContinuation, OpenCodeModel,
+    OpenCodeProvider, OpenCodeService, ProviderError, open_code_catalog, open_code_model,
 };
 
 /// An HTTP model protocol, independent of the service hosting the model.
@@ -32,6 +32,7 @@ pub enum Protocol {
     Responses,
     ChatCompletions,
     Messages,
+    GenerateContent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

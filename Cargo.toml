@@ -6,5 +6,6 @@ members = [
     "kodkod-http",
     "kodkod-openai",
     "kodkod-anthropic",
+    "kodkod-google",
     "kodkod-providers",
 ]

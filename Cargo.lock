@@ -625,6 +625,7 @@ version = "0.1.0"
 dependencies = [
  "kodkod-anthropic",
  "kodkod-core",
+ "kodkod-google",
  "kodkod-http",
  "kodkod-openai",
  "kodkod-providers",
@@ -660,6 +661,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kodkod-google"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "futures-util",
+ "kodkod-core",
+ "kodkod-http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "kodkod-http"
 version = "0.1.0"
 dependencies = [
@@ -689,6 +705,7 @@ dependencies = [
  "futures-util",
  "kodkod-anthropic",
  "kodkod-core",
+ "kodkod-google",
  "kodkod-http",
  "kodkod-openai",
  "reqwest",

@@ -7,9 +7,11 @@ use kodkod_anthropic::{
     AnthropicContinuation, AnthropicError, AnthropicMessagesProvider, AnthropicModel,
 };
 use kodkod_core::{
-    AssistantMessage, ContextBudget, Conversation, Message, Provider, ProviderCompletion,
-    ProviderEvent, ProviderStream, Retryable, ToolSpec,
+    AssistantMessage, CompactError, CompactOptions, ContextBudget, ContextCompaction, Conversation,
+    Message, Provider, ProviderCompletion, ProviderEvent, ProviderStream, RequestObserver,
+    Retryable, ToolSpec,
 };
+use kodkod_google::{GoogleContinuation, GoogleError, GoogleGenerateContentProvider, GoogleModel};
 use kodkod_http::{CredentialSource, RequestCredentials, StaticCredentials};
 use kodkod_openai::{
     OpenAiCompatibleProvider, OpenAiError, OpenAiModel, OpenAiRequestOptions,
@@ -22,6 +24,7 @@ use crate::{Protocol, ProviderConfigError, fixed_endpoint_client, header_value};
 pub const OPEN_CODE_GO_ENDPOINT: &str = "https://opencode.ai/inference/go";
 pub const OPEN_CODE_GO_OPENAI_ENDPOINT: &str = "https://opencode.ai/inference/go/openai/v1";
 pub const OPEN_CODE_GO_ANTHROPIC_ENDPOINT: &str = "https://opencode.ai/inference/go/anthropic/v1";
+pub const OPEN_CODE_GO_GOOGLE_ENDPOINT: &str = "https://opencode.ai/inference/go/google/v1beta";
 pub const OPEN_CODE_ZEN_ENDPOINT: &str = "https://opencode.ai/zen/v1";
 
 /// An OpenCode service with a fixed base endpoint.
@@ -166,6 +169,24 @@ impl AnthropicModel for OpenCodeModel {
     }
 }
 
+impl GoogleModel for OpenCodeModel {
+    fn id(&self) -> &str {
+        self.id()
+    }
+
+    fn supports_vision(&self) -> bool {
+        self.supports_vision()
+    }
+
+    fn supports_document(&self, mime: &str) -> bool {
+        self.supports_pdf() && self.supports_vision() && mime == "application/pdf"
+    }
+
+    fn context_budget(&self) -> Option<ContextBudget> {
+        self.context_budget()
+    }
+}
+
 /// The reviewed OpenCode catalog bundled with this crate.
 ///
 /// PDF capability is a frozen 2026-09-08 snapshot of
@@ -237,6 +258,7 @@ pub struct OpenCodeProvider {
     user_agent: HeaderValue,
     client: reqwest::Client,
     endpoint: String,
+    request_observer: Option<Arc<dyn RequestObserver>>,
 }
 
 impl OpenCodeProvider {
@@ -302,6 +324,7 @@ impl OpenCodeProvider {
             user_agent: header_value("user agent", user_agent.as_ref())?,
             client: fixed_endpoint_client()?,
             endpoint: service.endpoint().to_owned(),
+            request_observer: None,
         })
     }
 
@@ -311,6 +334,12 @@ impl OpenCodeProvider {
     /// and default-header policy. Provider-owned headers are applied per request.
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.client = client;
+        self
+    }
+
+    /// Observe content-free request diagnostics from every routed provider.
+    pub fn with_request_observer(mut self, observer: Arc<dyn RequestObserver>) -> Self {
+        self.request_observer = Some(observer);
         self
     }
 
@@ -354,6 +383,7 @@ impl OpenCodeProvider {
         let endpoint = match protocol {
             Protocol::Responses | Protocol::ChatCompletions => "openai/v1",
             Protocol::Messages => "anthropic/v1",
+            Protocol::GenerateContent => "google/v1beta",
         };
         format!("{}/{endpoint}", self.endpoint.trim_end_matches('/'))
     }
@@ -422,6 +452,7 @@ pub enum OpenCodeContinuation {
     Responses(ResponsesContinuation),
     ChatCompletions,
     Messages(AnthropicContinuation),
+    GenerateContent(GoogleContinuation),
 }
 
 #[derive(Debug)]
@@ -429,6 +460,7 @@ pub enum ProviderError {
     Configuration(ProviderConfigError),
     OpenAi(OpenAiError),
     Anthropic(AnthropicError),
+    Google(GoogleError),
 }
 
 impl fmt::Display for ProviderError {
@@ -437,6 +469,7 @@ impl fmt::Display for ProviderError {
             Self::Configuration(error) => error.fmt(f),
             Self::OpenAi(error) => error.fmt(f),
             Self::Anthropic(error) => error.fmt(f),
+            Self::Google(error) => error.fmt(f),
         }
     }
 }
@@ -447,6 +480,7 @@ impl Error for ProviderError {
             Self::Configuration(error) => Some(error),
             Self::OpenAi(error) => Some(error),
             Self::Anthropic(error) => Some(error),
+            Self::Google(error) => Some(error),
         }
     }
 }
@@ -457,6 +491,7 @@ impl Retryable for ProviderError {
             Self::Configuration(_) => false,
             Self::OpenAi(error) => error.is_retryable(),
             Self::Anthropic(error) => error.is_retryable(),
+            Self::Google(error) => error.is_retryable(),
         }
     }
 }
@@ -479,10 +514,21 @@ impl From<AnthropicError> for ProviderError {
     }
 }
 
+impl From<GoogleError> for ProviderError {
+    fn from(error: GoogleError) -> Self {
+        Self::Google(error)
+    }
+}
+
 impl Provider for OpenCodeProvider {
     type Model = OpenCodeModel;
     type Error = ProviderError;
     type Continuation = OpenCodeContinuation;
+
+    fn with_request_observer(mut self, observer: Arc<dyn RequestObserver>) -> Self {
+        self.request_observer = Some(observer);
+        self
+    }
 
     fn supports_vision(&self, model: &OpenCodeModel) -> bool {
         model.service == self.service && model.supports_vision()
@@ -511,6 +557,7 @@ impl Provider for OpenCodeProvider {
             | ProviderError::OpenAi(OpenAiError::ResponseFailed {
                 code: Some(code), ..
             }) => code == "context_length_exceeded",
+            ProviderError::Google(error) => error.is_context_overflow(),
             _ => false,
         }
     }
@@ -520,6 +567,7 @@ impl Provider for OpenCodeProvider {
             Protocol::Responses => OpenCodeContinuation::Responses(Default::default()),
             Protocol::ChatCompletions => OpenCodeContinuation::ChatCompletions,
             Protocol::Messages => OpenCodeContinuation::Messages(Default::default()),
+            Protocol::GenerateContent => OpenCodeContinuation::GenerateContent(Default::default()),
         }
     }
 
@@ -536,6 +584,141 @@ impl Provider for OpenCodeProvider {
                     continuation,
                 )
             }
+            OpenCodeContinuation::GenerateContent(continuation) => <GoogleGenerateContentProvider<
+                OpenCodeModel,
+            > as Provider>::estimate_continuation_tokens(
+                continuation
+            ),
+        }
+    }
+
+    fn validate_context(
+        &self,
+        model: &OpenCodeModel,
+        continuation: &Self::Continuation,
+    ) -> Result<(), String> {
+        self.validate_model(model)
+            .map_err(|error| error.to_string())?;
+        match (model.protocol, continuation) {
+            (Protocol::Responses, OpenCodeContinuation::Responses(continuation)) => {
+                OpenAiResponsesProvider::new(self.endpoint_for_protocol(Protocol::Responses))
+                    .validate_context(model, continuation)
+            }
+            (Protocol::ChatCompletions, OpenCodeContinuation::ChatCompletions) => Ok(()),
+            (Protocol::Messages, OpenCodeContinuation::Messages(continuation)) => {
+                AnthropicMessagesProvider::new(self.endpoint_for_protocol(Protocol::Messages))
+                    .validate_context(model, continuation)
+            }
+            (Protocol::GenerateContent, OpenCodeContinuation::GenerateContent(continuation)) => {
+                GoogleGenerateContentProvider::<OpenCodeModel>::new(
+                    self.endpoint_for_protocol(Protocol::GenerateContent),
+                )
+                .validate_context(model, continuation)
+            }
+            _ => Err("OpenCode continuation protocol does not match the selected model".into()),
+        }
+    }
+
+    async fn compact_context(
+        &self,
+        continuation: &Self::Continuation,
+        model: &Self::Model,
+        conversation: &Conversation,
+        options: CompactOptions,
+    ) -> Result<ContextCompaction<Self::Continuation>, CompactError<Self::Error>> {
+        self.validate_model(model)
+            .map_err(|error| CompactError::Context(error.to_string()))?;
+        match (model.protocol, continuation) {
+            (Protocol::Responses, OpenCodeContinuation::Responses(continuation)) => {
+                let provider =
+                    OpenAiResponsesProvider::new(self.endpoint_for_protocol(Protocol::Responses))
+                        .with_credentials(self.credentials(Protocol::Responses))
+                        .with_client(self.client.clone());
+                let provider = match &self.request_observer {
+                    Some(observer) => provider.with_request_observer(observer.clone()),
+                    None => provider,
+                };
+                let compacted = provider
+                    .compact_context(continuation, model, conversation, options)
+                    .await
+                    .map_err(map_compact_error)?;
+                Ok(ContextCompaction {
+                    conversation: compacted.conversation,
+                    continuation: OpenCodeContinuation::Responses(compacted.continuation),
+                    usage: compacted.usage,
+                })
+            }
+            (Protocol::Messages, OpenCodeContinuation::Messages(continuation)) => {
+                let provider =
+                    AnthropicMessagesProvider::new(self.endpoint_for_protocol(Protocol::Messages))
+                        .with_credentials(self.credentials(Protocol::Messages))
+                        .with_client(self.client.clone());
+                let provider = match &self.request_observer {
+                    Some(observer) => provider.with_request_observer(observer.clone()),
+                    None => provider,
+                };
+                let compacted = provider
+                    .compact_context(continuation, model, conversation, options)
+                    .await
+                    .map_err(map_compact_error)?;
+                Ok(ContextCompaction {
+                    conversation: compacted.conversation,
+                    continuation: OpenCodeContinuation::Messages(compacted.continuation),
+                    usage: compacted.usage,
+                })
+            }
+            (Protocol::GenerateContent, OpenCodeContinuation::GenerateContent(continuation)) => {
+                let provider = GoogleGenerateContentProvider::new(
+                    self.endpoint_for_protocol(Protocol::GenerateContent),
+                )
+                .with_credentials(self.credentials(Protocol::GenerateContent))
+                .with_client(self.client.clone());
+                let provider = match &self.request_observer {
+                    Some(observer) => provider.with_request_observer(observer.clone()),
+                    None => provider,
+                };
+                let compacted = provider
+                    .compact_context(continuation, model, conversation, options)
+                    .await
+                    .map_err(map_compact_error)?;
+                Ok(ContextCompaction {
+                    conversation: compacted.conversation,
+                    continuation: OpenCodeContinuation::GenerateContent(compacted.continuation),
+                    usage: compacted.usage,
+                })
+            }
+            (Protocol::ChatCompletions, OpenCodeContinuation::ChatCompletions) => {
+                if self.has_opaque_context(continuation) {
+                    return Err(CompactError::Context(
+                        "Provider must implement contextual compaction for opaque history".into(),
+                    ));
+                }
+                let compacted = self
+                    .compact_with_usage(model, conversation, options)
+                    .await?;
+                Ok(ContextCompaction {
+                    conversation: compacted.conversation,
+                    continuation: OpenCodeContinuation::ChatCompletions,
+                    usage: compacted.usage,
+                })
+            }
+            _ => Err(CompactError::Context(
+                "OpenCode continuation protocol does not match the selected model".into(),
+            )),
+        }
+    }
+
+    fn has_opaque_context(&self, continuation: &Self::Continuation) -> bool {
+        match continuation {
+            OpenCodeContinuation::Responses(continuation) => {
+                OpenAiResponsesProvider::<OpenCodeModel>::new(
+                    self.endpoint_for_protocol(Protocol::Responses),
+                )
+                .has_opaque_context(continuation)
+            }
+            OpenCodeContinuation::ChatCompletions
+            | OpenCodeContinuation::Messages(_)
+            | OpenCodeContinuation::GenerateContent(_) => false,
         }
     }
 
@@ -566,6 +749,10 @@ impl Provider for OpenCodeProvider {
                 let provider = OpenAiResponsesProvider::new(endpoint)
                     .with_credentials(self.credentials(Protocol::Responses))
                     .with_client(self.client.clone());
+                let provider = match &self.request_observer {
+                    Some(observer) => provider.with_request_observer(observer.clone()),
+                    None => provider,
+                };
                 let completion = provider
                     .complete_with_usage(continuation, model, conversation, tools)
                     .await?;
@@ -605,6 +792,24 @@ impl Provider for OpenCodeProvider {
                     completion.usage,
                 ))
             }
+            (Protocol::GenerateContent, OpenCodeContinuation::GenerateContent(continuation)) => {
+                let endpoint = self.endpoint_for_protocol(Protocol::GenerateContent);
+                let provider = GoogleGenerateContentProvider::new(endpoint)
+                    .with_credentials(self.credentials(Protocol::GenerateContent))
+                    .with_client(self.client.clone());
+                let provider = match &self.request_observer {
+                    Some(observer) => provider.with_request_observer(observer.clone()),
+                    None => provider,
+                };
+                let completion = provider
+                    .complete_with_usage(continuation, model, conversation, tools)
+                    .await?;
+                Ok(ProviderCompletion::new(
+                    completion.message,
+                    OpenCodeContinuation::GenerateContent(completion.continuation),
+                    completion.usage,
+                ))
+            }
             _ => Err(ProviderConfigError::new(
                 "OpenCode continuation protocol does not match the selected model",
             )
@@ -628,6 +833,10 @@ impl Provider for OpenCodeProvider {
                     let provider = OpenAiResponsesProvider::new(endpoint)
                         .with_credentials(self.credentials(Protocol::Responses))
                         .with_client(self.client.clone());
+                    let provider = match &self.request_observer {
+                        Some(observer) => provider.with_request_observer(observer.clone()),
+                        None => provider,
+                    };
                     let mut stream = provider.complete_stream(continuation, model, conversation, tools);
                     while let Some(event) = stream.next().await {
                         match event? {
@@ -687,11 +896,48 @@ impl Provider for OpenCodeProvider {
                         }
                     }
                 }
+                (Protocol::GenerateContent, OpenCodeContinuation::GenerateContent(continuation)) => {
+                    let endpoint = self.endpoint_for_protocol(Protocol::GenerateContent);
+                    let provider = GoogleGenerateContentProvider::new(endpoint)
+                        .with_credentials(self.credentials(Protocol::GenerateContent))
+                        .with_client(self.client.clone());
+                    let provider = match &self.request_observer {
+                        Some(observer) => provider.with_request_observer(observer.clone()),
+                        None => provider,
+                    };
+                    let mut stream = provider.complete_stream(continuation, model, conversation, tools);
+                    while let Some(event) = stream.next().await {
+                        match event? {
+                            ProviderEvent::TextDelta(delta) => yield ProviderEvent::TextDelta(delta),
+                            ProviderEvent::Completed(completion) => {
+                                yield ProviderEvent::Completed(ProviderCompletion::new(
+                                    completion.message,
+                                    OpenCodeContinuation::GenerateContent(completion.continuation),
+                                    completion.usage,
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                }
                 _ => Err(ProviderConfigError::new(
                     "OpenCode continuation protocol does not match the selected model",
                 ))?,
             }
         })
+    }
+}
+
+fn map_compact_error<E: Into<ProviderError>>(
+    error: CompactError<E>,
+) -> CompactError<ProviderError> {
+    match error {
+        CompactError::NothingToCompact => CompactError::NothingToCompact,
+        CompactError::Unsupported(message) => CompactError::Unsupported(message),
+        CompactError::Context(message) => CompactError::Context(message),
+        CompactError::EmptySummary => CompactError::EmptySummary,
+        CompactError::MissingSummary => CompactError::MissingSummary,
+        CompactError::Provider(error) => CompactError::Provider(error.into()),
     }
 }
 

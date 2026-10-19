@@ -624,12 +624,12 @@ fn catalog_routes_models_by_service_and_protocol() {
         ["low", "high", "max"]
     );
     assert_eq!(deepseek.default_reasoning_effort(), Some("high"));
-    assert_eq!(deepseek.context_window_tokens(), Some(1_048_576));
-    assert_eq!(deepseek.max_output_tokens(), Some(393_216));
+    assert_eq!(deepseek.context_window_tokens(), Some(1_000_000));
+    assert_eq!(deepseek.max_output_tokens(), Some(384_000));
     assert_eq!(
         deepseek.context_budget(),
         Some(ContextBudget {
-            max_input_tokens: 655_360,
+            max_input_tokens: 616_000,
         })
     );
     assert_eq!(
@@ -654,10 +654,36 @@ fn catalog_routes_models_by_service_and_protocol() {
             .supports_pdf()
     );
     assert!(
-        open_code_model(OpenCodeService::Go, "glm-5.3-flash")
+        !open_code_model(OpenCodeService::Go, "glm-5.3-flash")
+            .unwrap()
+            .supports_vision()
+    );
+    assert!(
+        !open_code_model(OpenCodeService::Go, "glm-5.3-flash")
             .unwrap()
             .supports_pdf()
     );
+    let gemini = open_code_model(OpenCodeService::Go, "gemini-4-argon-contributor").unwrap();
+    assert_eq!(gemini.protocol(), Protocol::GenerateContent);
+    assert!(gemini.supports_vision());
+    assert!(gemini.supports_pdf());
+    assert_eq!(gemini.context_window_tokens(), Some(1_048_576));
+    assert_eq!(gemini.max_output_tokens(), Some(65_536));
+    let luna = open_code_model(OpenCodeService::Go, "gpt-6-luna").unwrap();
+    assert_eq!(luna.protocol(), Protocol::Responses);
+    assert!(luna.supports_vision());
+    assert_eq!(luna.context_window_tokens(), Some(1_050_000));
+    assert_eq!(luna.max_output_tokens(), Some(128_000));
+    let muse = open_code_model(OpenCodeService::Go, "muse-spark-1.3-contributor").unwrap();
+    assert_eq!(muse.protocol(), Protocol::Responses);
+    assert!(muse.supports_vision());
+    assert!(muse.supports_pdf());
+    assert_eq!(muse.context_window_tokens(), None);
+    assert_eq!(muse.max_output_tokens(), None);
+    let glm = open_code_model(OpenCodeService::Go, "glm-5.3-flash").unwrap();
+    assert_eq!(glm.protocol(), Protocol::ChatCompletions);
+    assert_eq!(glm.context_window_tokens(), Some(1_000_000));
+    assert_eq!(glm.max_output_tokens(), Some(131_072));
     assert!(
         open_code_model(OpenCodeService::Zen, "claude-sonnet-5")
             .unwrap()
@@ -1121,13 +1147,12 @@ async fn open_code_routes_pdf_to_the_responses_protocol() {
 }
 
 #[tokio::test]
-async fn open_code_routes_pdf_to_the_chat_completions_protocol() {
+async fn open_code_rejects_pdf_for_text_only_chat_completions_model() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/openai/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{ "message": { "content": "done" } }]
-        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
         .mount(&server)
         .await;
     let provider =
@@ -1140,13 +1165,17 @@ async fn open_code_routes_pdf_to_the_chat_completions_protocol() {
         Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
     ]));
 
-    provider
+    let error = provider
         .complete_once(model, &conversation, &[])
         .await
-        .unwrap();
-    let requests = server.received_requests().await.unwrap();
-    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(body["messages"][0]["content"][1]["type"], "file");
+        .unwrap_err();
+    assert!(matches!(&error, ProviderError::Configuration(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("does not support inline documents")
+    );
+    server.verify().await;
 }
 
 #[tokio::test]

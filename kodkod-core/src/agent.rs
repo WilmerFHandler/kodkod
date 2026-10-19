@@ -754,6 +754,7 @@ where
                             let crate::CompactionResult {
                                 conversation: compacted,
                                 usage,
+                                ..
                             } = compacted;
                             turn_usage.add_round(usage);
                             // Conversation and continuation are one checkpoint.

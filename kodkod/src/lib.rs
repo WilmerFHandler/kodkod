@@ -1,4 +1,4 @@
-//! Facade crate for [`kodkod-core`] and optional OpenAI-compatible providers.
+//! Facade crate for [`kodkod-core`] and optional model providers.
 
 pub use kodkod_core::*;
 
@@ -10,6 +10,9 @@ pub use kodkod_openai as openai;
 
 #[cfg(feature = "anthropic")]
 pub use kodkod_anthropic as anthropic;
+
+#[cfg(feature = "google")]
+pub use kodkod_google as google;
 
 #[cfg(feature = "providers")]
 pub use kodkod_providers as providers;

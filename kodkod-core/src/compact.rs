@@ -51,6 +51,9 @@ pub enum CompactError<E> {
 pub struct CompactionResult {
     pub conversation: Conversation,
     pub usage: TokenUsage,
+    /// Indices of retained messages as `(original_index, compacted_index)` pairs.
+    /// Provider adapters use this to rebase metadata attached to portable messages.
+    pub retained_message_indices: Vec<(usize, usize)>,
 }
 
 impl<E: fmt::Display> fmt::Display for CompactError<E> {
@@ -94,6 +97,9 @@ pub(crate) async fn run_with_usage<P: Provider + ?Sized>(
             return Ok(CompactionResult {
                 conversation: projected,
                 usage: TokenUsage::zero(),
+                retained_message_indices: (0..conversation.messages().len())
+                    .map(|index| (index, index))
+                    .collect(),
             });
         }
         None => return Err(CompactError::NothingToCompact),
@@ -111,10 +117,28 @@ pub(crate) async fn run_with_usage<P: Provider + ?Sized>(
             .map_err(CompactError::Provider)?;
         (summary_from_reply(&completion.message)?, completion.usage)
     };
+    let retained_message_indices = retained_message_indices(projected.messages().len(), &plan.kept);
     Ok(CompactionResult {
         conversation: splice(&projected, &plan.kept, AssistantMessage::new(summary)),
         usage,
+        retained_message_indices,
     })
+}
+
+fn retained_message_indices(message_count: usize, kept: &[usize]) -> Vec<(usize, usize)> {
+    let first_dropped = (0..message_count).find(|index| kept.binary_search(index).is_err());
+    let mut compacted_index = 0;
+    let mut retained = Vec::with_capacity(kept.len());
+    for original_index in 0..message_count {
+        if Some(original_index) == first_dropped {
+            compacted_index += 1;
+        }
+        if kept.binary_search(&original_index).is_ok() {
+            retained.push((original_index, compacted_index));
+            compacted_index += 1;
+        }
+    }
+    retained
 }
 
 /// Rebase long transcripts without silently dropping old exchanges. Tool batches stay
@@ -509,6 +533,18 @@ mod tests {
         assert!(matches!(&spliced[0], Message::Assistant(a) if a.content() == "SUM"));
         assert!(matches!(&spliced[1], Message::User(u) if u.content() == "new"));
         assert_eq!(spliced.len(), 2);
+    }
+
+    #[test]
+    fn retained_message_indices_account_for_inserted_summary() {
+        assert_eq!(
+            retained_message_indices(6, &[0, 2, 4, 5]),
+            vec![(0, 0), (2, 2), (4, 3), (5, 4)]
+        );
+        assert_eq!(
+            retained_message_indices(6, &[2, 4, 5]),
+            vec![(2, 1), (4, 2), (5, 3)]
+        );
     }
 
     #[test]

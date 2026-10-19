@@ -50,6 +50,7 @@ pub enum RequestOperation {
 pub enum RequestProfile {
     OpenAiCompatible,
     ChatGptPlan,
+    GoogleGenerateContent,
 }
 
 /// A bounded classification for known request option values.
