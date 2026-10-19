@@ -720,6 +720,9 @@ where
             None => None,
         };
         let mut request = json!({ "model": model.id(), "input": input });
+        if let Some(tier) = model.request_options().service_tier {
+            request["service_tier"] = Value::String(tier);
+        }
         let instructions = self
             .instructions
             .as_deref()
@@ -2724,6 +2727,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_compaction_forwards_explicit_speed_and_preserves_unset_behavior() {
+        struct TierModel(Option<&'static str>);
+        impl OpenAiModel for TierModel {
+            fn id(&self) -> &str {
+                "tier-fixture"
+            }
+            fn supports_vision(&self) -> bool {
+                false
+            }
+            fn request_options(&self) -> crate::OpenAiRequestOptions {
+                crate::OpenAiRequestOptions {
+                    service_tier: self.0.map(str::to_owned),
+                    ..Default::default()
+                }
+            }
+        }
+        for tier in [None, Some("default"), Some("priority")] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/responses/compact"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "object": "response.compaction",
+                    "output": [{"type": "compaction", "encrypted_content": "fixture-opaque"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 1, "total_tokens": 11}
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let provider =
+                OpenAiResponsesProvider::<TierModel>::new(format!("{}/v1", server.uri()))
+                    .with_native_compaction(true);
+            let mut history = Conversation::new();
+            history.push_user_message(UserMessage::new("fixture history"));
+            provider
+                .compact_context(
+                    &ResponsesContinuation::default(),
+                    &TierModel(tier),
+                    &history,
+                    CompactOptions::default(),
+                )
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(body.get("service_tier").and_then(Value::as_str), tier);
+            assert!(body.get("reasoning").is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn native_compaction_replays_the_complete_opaque_window_and_appends_new_input() {
         let server = MockServer::start().await;
         let compacted_output = json!([
@@ -2824,7 +2877,7 @@ mod tests {
         assert!(compact_request.get("stream").is_none());
         assert!(compact_request.get("store").is_none());
         assert!(compact_request.get("reasoning").is_none());
-        assert!(compact_request.get("service_tier").is_none());
+        assert_eq!(compact_request["service_tier"], "burst");
 
         let continuation_request: Value = serde_json::from_slice(&requests[1].body).unwrap();
         let request_input = continuation_request["input"].as_array().unwrap();

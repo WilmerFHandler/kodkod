@@ -36,7 +36,8 @@ pub use request_diagnostics::{
     RequestCacheDiagnostics, RequestCacheReason, RequestCacheType, RequestDiagnostic,
     RequestDiagnosticEvent, RequestFailureKind, RequestFingerprint, RequestIdentity,
     RequestInputPrefixFingerprint, RequestMetadata, RequestObserver, RequestOperation,
-    RequestOptionClass, RequestProfile, RequestPromptFingerprints, RequestUsage,
+    RequestOptionClass, RequestProfile, RequestPromptFingerprints, RequestServiceTier,
+    RequestUsage,
 };
 pub use retry::{RetryPolicy, RetryProvider, Retryable};
 pub use tool::{

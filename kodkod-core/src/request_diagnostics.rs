@@ -158,6 +158,20 @@ pub struct RequestCacheDiagnostics {
     pub cache_type: Option<RequestCacheType>,
 }
 
+/// A bounded allowlist of provider-reported service tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestServiceTier {
+    Default,
+    Fast,
+    Priority,
+    Flex,
+    Scale,
+    Auto,
+    Ultrafast,
+    Other,
+}
+
 /// Request-level usage. Cache-write tokens remain separate from `TokenUsage`
 /// to preserve source compatibility for existing `TokenUsage` struct literals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +179,8 @@ pub struct RequestUsage {
     pub token_usage: TokenUsage,
     pub cache_write_tokens: Option<u64>,
     pub cache_diagnostics: Option<RequestCacheDiagnostics>,
+    #[serde(default)]
+    pub effective_service_tier: Option<RequestServiceTier>,
 }
 
 /// A lifecycle event for one physical provider request attempt.

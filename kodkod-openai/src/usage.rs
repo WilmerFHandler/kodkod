@@ -1,5 +1,6 @@
 use kodkod_core::{
-    RequestCacheDiagnostics, RequestCacheReason, RequestCacheType, RequestUsage, TokenUsage,
+    RequestCacheDiagnostics, RequestCacheReason, RequestCacheType, RequestServiceTier,
+    RequestUsage, TokenUsage,
 };
 use serde_json::Value;
 
@@ -61,6 +62,18 @@ pub(crate) fn parse_request_usage(value: &Value) -> RequestUsage {
         token_usage: parse_usage(value),
         cache_write_tokens,
         cache_diagnostics: diagnostics,
+        effective_service_tier: value.get("service_tier").and_then(Value::as_str).map(
+            |service_tier| match service_tier {
+                "default" => RequestServiceTier::Default,
+                "fast" => RequestServiceTier::Fast,
+                "priority" => RequestServiceTier::Priority,
+                "flex" => RequestServiceTier::Flex,
+                "scale" => RequestServiceTier::Scale,
+                "auto" => RequestServiceTier::Auto,
+                "ultrafast" => RequestServiceTier::Ultrafast,
+                _ => RequestServiceTier::Other,
+            },
+        ),
     }
 }
 
@@ -168,5 +181,54 @@ mod tests {
                 cache_type: Some(RequestCacheType::Other),
             })
         );
+    }
+
+    #[test]
+    fn parses_allowlisted_effective_service_tiers() {
+        for (service_tier, expected) in [
+            ("default", RequestServiceTier::Default),
+            ("fast", RequestServiceTier::Fast),
+            ("priority", RequestServiceTier::Priority),
+            ("flex", RequestServiceTier::Flex),
+            ("scale", RequestServiceTier::Scale),
+            ("auto", RequestServiceTier::Auto),
+            ("ultrafast", RequestServiceTier::Ultrafast),
+        ] {
+            let usage = parse_request_usage(&json!({ "service_tier": service_tier }));
+            assert_eq!(usage.effective_service_tier, Some(expected));
+        }
+    }
+
+    #[test]
+    fn missing_or_unknown_effective_tiers_are_safe_and_missing_stays_unknown() {
+        let missing = parse_request_usage(&json!({ "usage": { "input_tokens": 3 } }));
+        assert_eq!(missing.effective_service_tier, None);
+
+        let unknown = parse_request_usage(&json!({
+            "service_tier": "private future provider value",
+            "usage": { "input_tokens": 3 }
+        }));
+        assert_eq!(
+            unknown.effective_service_tier,
+            Some(RequestServiceTier::Other)
+        );
+        assert!(
+            !format!("{unknown:?}").contains("private future provider value"),
+            "unknown provider values must never escape diagnostics"
+        );
+
+        let non_string = parse_request_usage(&json!({ "service_tier": 7 }));
+        assert_eq!(non_string.effective_service_tier, None);
+    }
+
+    #[test]
+    fn old_request_usage_records_deserialize_without_an_effective_tier() {
+        let usage: RequestUsage = serde_json::from_value(json!({
+            "token_usage": {},
+            "cache_write_tokens": null,
+            "cache_diagnostics": null
+        }))
+        .unwrap();
+        assert_eq!(usage.effective_service_tier, None);
     }
 }
