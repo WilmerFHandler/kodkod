@@ -127,11 +127,13 @@ where
             &self.client,
             &self.chat_completions_url,
             credentials.as_ref(),
-            model.id(),
             conversation,
             tools,
-            pdf_allowed,
-            &options,
+            completion::CompletionModel {
+                id: model.id(),
+                pdf_allowed,
+                options,
+            },
         )
         .await?;
         Ok(ProviderCompletion::new(message, (), usage))
@@ -155,11 +157,9 @@ where
                 &self.client,
                 &self.chat_completions_url,
                 credentials.as_ref(),
-                model.id(),
                 conversation,
                 tools,
-                pdf_allowed,
-                model.request_options(),
+                completion::CompletionModel { id: model.id(), pdf_allowed, options: model.request_options() },
             );
             while let Some(event) = stream.next().await {
                 match event? {

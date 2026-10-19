@@ -15,6 +15,12 @@ use super::usage::parse_usage;
 use crate::RequestCredentials;
 use kodkod_http::SseDecoder;
 
+pub(crate) struct CompletionModel<'a> {
+    pub id: &'a str,
+    pub pdf_allowed: bool,
+    pub options: OpenAiRequestOptions,
+}
+
 pub fn chat_completions_url(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     format!("{base}/chat/completions")
@@ -79,11 +85,13 @@ pub(crate) async fn complete_with_document_support(
         client,
         chat_completions_url,
         credentials,
-        model_id,
         conversation,
         tools,
-        pdf_allowed,
-        &OpenAiRequestOptions::default(),
+        CompletionModel {
+            id: model_id,
+            pdf_allowed,
+            options: OpenAiRequestOptions::default(),
+        },
     )
     .await
 }
@@ -92,13 +100,17 @@ pub(crate) async fn complete_with_request_options(
     client: &reqwest::Client,
     chat_completions_url: &str,
     credentials: Option<&RequestCredentials>,
-    model_id: &str,
     conversation: &Conversation,
     tools: &[ToolSpec],
-    pdf_allowed: bool,
-    options: &OpenAiRequestOptions,
+    model: CompletionModel<'_>,
 ) -> Result<(AssistantMessage, TokenUsage), OpenAiError> {
-    let request = build_request_with_options(model_id, conversation, tools, pdf_allowed, options)?;
+    let request = build_request_with_options(
+        model.id,
+        conversation,
+        tools,
+        model.pdf_allowed,
+        &model.options,
+    )?;
     let mut http_request = client.post(chat_completions_url).json(&request);
 
     if let Some(credentials) = credentials {
@@ -133,19 +145,17 @@ pub(crate) fn stream_with_request_options<'a>(
     client: &'a reqwest::Client,
     chat_completions_url: &'a str,
     credentials: Option<&'a RequestCredentials>,
-    model_id: &'a str,
     conversation: &'a Conversation,
     tools: &'a [ToolSpec],
-    pdf_allowed: bool,
-    options: OpenAiRequestOptions,
+    model: CompletionModel<'a>,
 ) -> ProviderStream<'a, (), OpenAiError> {
     Box::pin(async_stream::try_stream! {
         let mut request = serde_json::to_value(build_request_with_options(
-            model_id,
+            model.id,
             conversation,
             tools,
-            pdf_allowed,
-            &options,
+            model.pdf_allowed,
+            &model.options,
         )?)?;
         request["stream"] = Value::Bool(true);
         let mut http_request = client.post(chat_completions_url).json(&request);
