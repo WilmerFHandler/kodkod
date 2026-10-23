@@ -654,6 +654,12 @@ fn catalog_routes_models_by_service_and_protocol() {
             .protocol(),
         Protocol::ChatCompletions
     );
+    let minimax_m31_flash = open_code_model(OpenCodeService::Go, "minimax-m3.1-flash").unwrap();
+    assert_eq!(minimax_m31_flash.name(), "MiniMax M3.1 Flash");
+    assert_eq!(minimax_m31_flash.protocol(), Protocol::ChatCompletions);
+    assert!(minimax_m31_flash.supports_vision());
+    assert!(!minimax_m31_flash.supports_pdf());
+    assert!(open_code_model(OpenCodeService::Go, "minimax-m3.1-flash-free").is_none());
     let deepseek = open_code_model(OpenCodeService::Go, "deepseek-v4.1-flash").unwrap();
     assert_eq!(deepseek.name(), "DeepSeek V4.1 Flash");
     assert_eq!(deepseek.protocol(), Protocol::ChatCompletions);
