@@ -112,12 +112,26 @@ impl TaskControl {
 
     /// Queue a steer iff its execution turn is currently open.
     pub fn steer(&self, message: UserMessage) -> Result<(), SteerError> {
+        self.enqueue_steer(message, false)
+    }
+
+    /// Queue a correction for this one execution, including before its stream starts.
+    /// Hosts must bind the control to the intended turn before exposing it. A
+    /// cancelled or completed execution never accepts input, and opening the
+    /// execution preserves queued corrections in FIFO order.
+    pub fn queue_steer(&self, message: UserMessage) -> Result<(), SteerError> {
+        self.enqueue_steer(message, true)
+    }
+
+    fn enqueue_steer(&self, message: UserMessage, before_start: bool) -> Result<(), SteerError> {
         let mut mailbox = self
             .inner
             .steering
             .lock()
             .expect("steering mailbox poisoned");
-        if mailbox.admission != Admission::Open || self.is_cancelled() {
+        let accepting = mailbox.admission == Admission::Open
+            || (before_start && mailbox.admission == Admission::Fresh);
+        if !accepting || self.is_cancelled() {
             return Err(SteerError { message });
         }
         mailbox.pending.push_back(message.with_steered(true));
@@ -257,6 +271,41 @@ mod tests {
                 .content(),
             "late"
         );
+    }
+
+    #[test]
+    fn queued_steering_survives_start_and_never_reopens_a_closed_control() {
+        let control = TaskControl::new();
+        control
+            .queue_steer(UserMessage::new("before startup"))
+            .unwrap();
+        assert!(control.steer(UserMessage::new("open only")).is_err());
+        control.open().unwrap();
+        control
+            .queue_steer(UserMessage::new("after startup"))
+            .unwrap();
+        let messages = control.drain_pending_steers_unless_cancelled().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(UserMessage::content)
+                .collect::<Vec<_>>(),
+            ["before startup", "after startup"]
+        );
+        assert!(messages.iter().all(UserMessage::steered));
+        assert!(control.close_if_empty());
+        assert!(control.queue_steer(UserMessage::new("too late")).is_err());
+        assert!(control.open().is_err());
+    }
+
+    #[test]
+    fn cancellation_before_start_prevents_queued_steering_delivery() {
+        let control = TaskControl::new();
+        control.queue_steer(UserMessage::new("pending")).unwrap();
+        control.cancel();
+        assert!(control.queue_steer(UserMessage::new("cancelled")).is_err());
+        assert!(control.drain_pending_steers_unless_cancelled().is_none());
+        assert!(control.open().is_err());
     }
 
     #[test]

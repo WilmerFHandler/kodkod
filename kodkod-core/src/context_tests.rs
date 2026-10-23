@@ -1036,3 +1036,48 @@ async fn thirty_two_turn_screenshot_simulation_reduces_provider_input_size() {
     assert!(maintained.heuristic_input_tokens < baseline.heuristic_input_tokens);
     assert!(maintained.serialized_input_bytes < baseline.serialized_input_bytes);
 }
+
+#[tokio::test]
+async fn steering_queued_before_start_is_applied_before_the_first_provider_request() {
+    let fixture = Arc::new(Fixture::default());
+    let agent = Agent::new(Backend(fixture.clone())).with_immediate_steering();
+    let mut context = agent.context_from_history(&(), "fixture", &Conversation::new());
+    let control = TaskControl::new();
+    control
+        .queue_steer(UserMessage::new("correction during setup"))
+        .unwrap();
+    let events = agent
+        .run_turn_context(
+            &mut context,
+            &(),
+            UserMessage::new("initial request"),
+            &control,
+            None,
+        )
+        .collect::<Vec<_>>()
+        .await;
+    assert!(events.iter().all(Result::is_ok));
+    assert_eq!(events.iter().filter(|event| matches!(event, Ok(update) if matches!(update.event, AgentEvent::Steered(_)))).count(), 1);
+    let requests = fixture.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let users = requests[0]
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => Some((user.content(), user.steered())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        users,
+        [
+            ("initial request", false),
+            ("correction during setup", true)
+        ]
+    );
+    assert!(
+        control
+            .queue_steer(UserMessage::new("after completion"))
+            .is_err()
+    );
+}
