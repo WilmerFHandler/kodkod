@@ -660,6 +660,22 @@ fn catalog_routes_models_by_service_and_protocol() {
     assert!(minimax_m31_flash.supports_vision());
     assert!(!minimax_m31_flash.supports_pdf());
     assert!(open_code_model(OpenCodeService::Go, "minimax-m3.1-flash-free").is_none());
+    let kimi_k31_pro = open_code_model(OpenCodeService::Go, "kimi-k3.1-pro").unwrap();
+    assert_eq!(kimi_k31_pro.name(), "Kimi K3.1 Pro");
+    assert_eq!(kimi_k31_pro.protocol(), Protocol::ChatCompletions);
+    assert!(kimi_k31_pro.supports_vision());
+    assert!(!kimi_k31_pro.supports_pdf());
+    assert_eq!(kimi_k31_pro.context_window_tokens(), Some(1_000_000));
+    assert_eq!(
+        kimi_k31_pro
+            .reasoning_efforts()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["low", "high", "max"]
+    );
+    assert_eq!(kimi_k31_pro.default_reasoning_effort(), Some("max"));
+    assert!(open_code_model(OpenCodeService::Zen, "kimi-k3.1-pro").is_none());
     let deepseek = open_code_model(OpenCodeService::Go, "deepseek-v4.1-flash").unwrap();
     assert_eq!(deepseek.name(), "DeepSeek V4.1 Flash");
     assert_eq!(deepseek.protocol(), Protocol::ChatCompletions);

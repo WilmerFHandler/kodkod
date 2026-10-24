@@ -62,6 +62,26 @@ def main():
                 "vision": "image" in model.get("modalities", {}).get("input", []),
                 "pdf": "pdf" in model.get("modalities", {}).get("input", []),
             })
+    # The live Go model list publishes Kimi K3.1 Pro before the OpenCode
+    # endpoint table includes it. Its Chat Completions protocol, vision input,
+    # context, and thinking options come from Kimi's first-party K3.1 docs.
+    kimi_k31_pro = {
+        "service": "go",
+        "id": "kimi-k3.1-pro",
+        "name": "Kimi K3.1 Pro",
+        "protocol": "chat_completions",
+        "vision": True,
+        "pdf": False,
+        "context_window_tokens": 1000000,
+        "reasoning_efforts": ["low", "high", "max"],
+        "default_reasoning_effort": "max",
+    }
+    for index, model in enumerate(models):
+        if model["service"] == "go" and model["id"] == kimi_k31_pro["id"]:
+            models[index] = {**model, **kimi_k31_pro}
+            break
+    else:
+        models.append(kimi_k31_pro)
     if not all(any(m["service"] == service for m in models)
                for service in ("go", "zen")):
         raise ValueError("Provider endpoint tables were missing; catalog was not changed")

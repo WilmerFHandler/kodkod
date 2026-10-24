@@ -115,6 +115,9 @@ or tool side effect that already happened.
 Refresh the reviewed OpenCode snapshot with
 `python3 scripts/update-open-code-models.py`, inspect the resulting diff, and
 run the provider tests before publishing it. Protocol routing comes from the
-official OpenCode endpoint tables. Vision metadata comes from models.dev; PDF
-capabilities were reviewed against its 2026-09-08 `https://models.dev/api.json`
-snapshot. Unknown models are not guessed.
+official OpenCode endpoint tables. Kimi K3.1 Pro is the exception: OpenCode's
+live Go models endpoint publishes `kimi-k3.1-pro` before the endpoint table
+does, so its Chat Completions protocol, vision, context, and thinking metadata
+are pinned from Kimi's first-party K3.1 docs. Vision metadata for other models
+comes from models.dev; PDF capabilities were reviewed against its 2026-09-08
+`https://models.dev/api.json` snapshot. Unknown models are not guessed.
