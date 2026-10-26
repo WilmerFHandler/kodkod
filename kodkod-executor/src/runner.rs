@@ -332,6 +332,7 @@ async fn run(
     acquire_instance_lock(&instance_lock, &alive).await?;
     let executor_id = crate::access::executor_id(&journal.join("executor-id"))?;
     let mut receipts = load_receipts(&journal)?;
+    let mut pending_receipt: Option<PendingReceiptSave> = None;
     #[cfg(target_os = "macos")]
     let mut activity = None;
     while alive.load(Ordering::Acquire) {
@@ -344,12 +345,43 @@ async fn run(
             }
         }
         if active.as_ref().is_some_and(|a| a.is_finished()) {
-            if let Ok(receipt) = active.take().unwrap().await {
-                save_receipt(&journal, &receipt)?;
-                receipts.push_back(receipt);
+            let task = active.take().unwrap();
+            match task.await {
+                Ok(receipt) => {
+                    active_identity = None;
+                    retain_receipt_or_queue(
+                        &journal,
+                        receipt,
+                        &mut receipts,
+                        &mut pending_receipt,
+                        &transport_error,
+                    );
+                }
+                Err(_) => {
+                    if let Some((connection, attempt)) = active_identity.take() {
+                        retain_receipt_or_queue(
+                            &journal,
+                            DeviceReceipt {
+                                connection,
+                                attempt,
+                                result: Err(
+                                    "Executor action task stopped unexpectedly; outcome may be uncertain. Inspect before repeating.".into(),
+                                ),
+                            },
+                            &mut receipts,
+                            &mut pending_receipt,
+                            &transport_error,
+                        );
+                    }
+                }
             }
-            active_identity = None;
         }
+        retry_pending_receipt_save(
+            &journal,
+            &mut receipts,
+            &mut pending_receipt,
+            &transport_error,
+        );
         if let Some(receipt) = receipts.pop_front() {
             let id = uuid::Uuid::parse_str(&receipt.attempt)?;
             let path = journal.join(format!("{id}.receipt.json"));
@@ -382,6 +414,9 @@ async fn run(
                 }
                 Err(error) => {
                     record_transport_failure(&journal, "connect", &error, &transport_error);
+                    if pending_receipt.is_some() {
+                        report_receipt_storage_blocked(&transport_error);
+                    }
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
@@ -394,25 +429,38 @@ async fn run(
         let poll = DevicePoll {
             connection: id.clone(),
             capabilities: capabilities(&allowed, backend.as_ref(), config.capability_mask),
-            ready: active.is_none(),
+            ready: active.is_none() && pending_receipt.is_none(),
             grant_generation: epoch,
             active_attempt: active_identity.as_ref().map(|(_, attempt)| attempt.clone()),
         };
         let response = post::<_, DevicePollResult>(&client, &base, &token, "poll", &poll).await;
         match &response {
-            Ok(_) => *transport_error.lock().unwrap() = None,
+            Ok(_) if pending_receipt.is_none() => *transport_error.lock().unwrap() = None,
+            Ok(_) => {}
             Err(error) => record_transport_failure(&journal, "poll", error, &transport_error),
+        }
+        if pending_receipt.is_some() {
+            report_receipt_storage_blocked(&transport_error);
         }
         let authorized = response.as_ref().is_ok_and(|p| p.active_authorized)
             && generation.load(Ordering::Acquire) == epoch;
         if !authorized && let Some(task) = active.take() {
             generation.fetch_add(1, Ordering::AcqRel);
-            task.abort();
-            let _ = task.await;
-            if let Some((connection, attempt)) = active_identity.take() {
-                let receipt=DeviceReceipt{connection,attempt,result:Err("Device authorization was lost; action may have completed. Inspect before repeating.".into())};
-                save_receipt(&journal, &receipt)?;
-                receipts.push_back(receipt);
+            let receipt = settle_action_task(
+                task,
+                active_identity.take(),
+                "Device authorization was lost before the action result was available; outcome may be uncertain. Inspect before repeating.",
+            )
+            .await;
+            if let Some(receipt) = receipt {
+                active_identity = None;
+                retain_receipt_or_queue(
+                    &journal,
+                    receipt,
+                    &mut receipts,
+                    &mut pending_receipt,
+                    &transport_error,
+                );
             }
             bound_attachment = None;
             session = backend.app_automation_session();
@@ -422,7 +470,7 @@ async fn run(
             Ok(DevicePollResult {
                 operation: Some(op),
                 ..
-            }) => {
+            }) if pending_receipt.is_none() => {
                 if generation.load(Ordering::Acquire) != epoch {
                     let receipt = DeviceReceipt {
                         connection: id,
@@ -432,8 +480,13 @@ async fn run(
                                 .into(),
                         ),
                     };
-                    save_receipt(&journal, &receipt)?;
-                    receipts.push_back(receipt);
+                    retain_receipt_or_queue(
+                        &journal,
+                        receipt,
+                        &mut receipts,
+                        &mut pending_receipt,
+                        &transport_error,
+                    );
                     continue;
                 }
                 if bound_attachment.as_ref() != Some(&op.attachment) {
@@ -486,8 +539,8 @@ async fn run(
                         }
                     };
                     let result = tokio::select! {biased;
-                        _=revoked=>Err(anyhow::anyhow!("Local access revoked; action may have completed")),
                         result=execute_once(op.clone(),journal,access)=>result,
+                        _=revoked=>Err(anyhow::anyhow!("Local access revoked; action may have completed")),
                     };
                     DeviceReceipt {
                         connection: id,
@@ -510,24 +563,57 @@ async fn run(
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    if let Some(active) = active {
-        active.abort();
-        let _ = active.await;
-        if let Some((connection, attempt)) = active_identity {
-            save_receipt(
+    if let Some(task) = active {
+        let receipt = settle_action_task(
+            task,
+            active_identity.take(),
+            "Executor stopped before the action result was available; outcome may be uncertain. Inspect before repeating.",
+        )
+        .await;
+        if let Some(receipt) = receipt {
+            retain_receipt_or_queue(
                 &journal,
-                &DeviceReceipt {
-                    connection,
-                    attempt,
-                    result: Err(
-                        "Executor stopped during this action; outcome may be uncertain".into(),
-                    ),
-                },
-            )?;
+                receipt,
+                &mut receipts,
+                &mut pending_receipt,
+                &transport_error,
+            );
         }
     }
+    retry_pending_receipt_save_until_shutdown(
+        &journal,
+        &mut receipts,
+        &mut pending_receipt,
+        &transport_error,
+    )
+    .await;
     Ok(())
 }
+
+async fn settle_action_task(
+    mut task: tokio::task::JoinHandle<DeviceReceipt>,
+    identity: Option<(String, String)>,
+    uncertain_result: &'static str,
+) -> Option<DeviceReceipt> {
+    match tokio::time::timeout(Duration::from_millis(100), &mut task).await {
+        Ok(Ok(receipt)) => Some(receipt),
+        Ok(Err(_)) => identity.map(|(connection, attempt)| DeviceReceipt {
+            connection,
+            attempt,
+            result: Err(uncertain_result.into()),
+        }),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            identity.map(|(connection, attempt)| DeviceReceipt {
+                connection,
+                attempt,
+                result: Err(uncertain_result.into()),
+            })
+        }
+    }
+}
+
 /// Store metadata only: never the bearer, response body, command, or input value.
 fn record_transport_failure(
     journal: &std::path::Path,
@@ -611,6 +697,147 @@ fn load_receipts(journal: &std::path::Path) -> Result<std::collections::VecDeque
         }
     }
     Ok(receipts)
+}
+
+const RECEIPT_SAVE_RETRY_INITIAL: Duration = Duration::from_millis(250);
+const RECEIPT_SAVE_RETRY_MAX: Duration = Duration::from_secs(5);
+const RECEIPT_SAVE_SHUTDOWN_WINDOW: Duration = Duration::from_secs(2);
+const RECEIPT_STORAGE_BLOCKED_STATUS: &str = "Executor storage is unavailable. A completed action result is retained in memory and will be saved before new work is accepted.";
+
+struct PendingReceiptSave {
+    receipt: DeviceReceipt,
+    retry_at: tokio::time::Instant,
+    backoff: Duration,
+}
+
+fn report_receipt_storage_blocked(status: &std::sync::Mutex<Option<String>>) {
+    *status.lock().unwrap() = Some(RECEIPT_STORAGE_BLOCKED_STATUS.into());
+}
+
+fn retain_receipt_or_queue(
+    journal: &std::path::Path,
+    receipt: DeviceReceipt,
+    receipts: &mut std::collections::VecDeque<DeviceReceipt>,
+    pending: &mut Option<PendingReceiptSave>,
+    status: &std::sync::Mutex<Option<String>>,
+) {
+    debug_assert!(
+        pending.is_none(),
+        "only one completed receipt may await storage"
+    );
+    match save_receipt(journal, &receipt) {
+        Ok(()) => receipts.push_back(receipt),
+        Err(_) => {
+            eprintln!(
+                "A completed executor result could not be saved locally; it is retained in memory while storage recovers."
+            );
+            report_receipt_storage_blocked(status);
+            *pending = Some(PendingReceiptSave {
+                receipt,
+                retry_at: tokio::time::Instant::now() + RECEIPT_SAVE_RETRY_INITIAL,
+                backoff: RECEIPT_SAVE_RETRY_INITIAL.saturating_mul(2),
+            });
+        }
+    }
+}
+
+fn retry_pending_receipt_save(
+    journal: &std::path::Path,
+    receipts: &mut std::collections::VecDeque<DeviceReceipt>,
+    pending: &mut Option<PendingReceiptSave>,
+    status: &std::sync::Mutex<Option<String>>,
+) {
+    let Some(waiting) = pending.as_mut() else {
+        return;
+    };
+    if tokio::time::Instant::now() < waiting.retry_at {
+        return;
+    }
+    match save_receipt(journal, &waiting.receipt) {
+        Ok(()) => {
+            let waiting = pending.take().expect("pending receipt was just saved");
+            receipts.push_back(waiting.receipt);
+        }
+        Err(_) => {
+            let waiting = pending
+                .as_mut()
+                .expect("pending receipt remains after failure");
+            waiting.retry_at = tokio::time::Instant::now() + waiting.backoff;
+            waiting.backoff = waiting
+                .backoff
+                .saturating_mul(2)
+                .min(RECEIPT_SAVE_RETRY_MAX);
+            report_receipt_storage_blocked(status);
+            eprintln!(
+                "Executor receipt storage is still unavailable; retrying with bounded backoff."
+            );
+        }
+    }
+}
+
+async fn retry_pending_receipt_save_until_shutdown(
+    journal: &std::path::Path,
+    receipts: &mut std::collections::VecDeque<DeviceReceipt>,
+    pending: &mut Option<PendingReceiptSave>,
+    status: &std::sync::Mutex<Option<String>>,
+) {
+    if let Some(waiting) = pending.as_mut() {
+        waiting.retry_at = tokio::time::Instant::now();
+    }
+    let deadline = tokio::time::Instant::now() + RECEIPT_SAVE_SHUTDOWN_WINDOW;
+    while pending.is_some() {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.duration_since(now);
+        let retry_after = pending
+            .as_ref()
+            .expect("pending receipt checked above")
+            .retry_at
+            .saturating_duration_since(now)
+            .min(remaining);
+        if !retry_after.is_zero() {
+            tokio::time::sleep(retry_after).await;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        retry_pending_receipt_save(journal, receipts, pending, status);
+    }
+    if pending.is_some() {
+        *status.lock().unwrap() = Some(
+            "Executor stopped before a completed action result could be saved locally; its outcome may be uncertain. Inspect before repeating.".into(),
+        );
+        eprintln!(
+            "Executor stopped before a completed result could be saved; its outcome may be uncertain."
+        );
+    }
+}
+
+fn write_attempt_summary(record: &mut std::fs::File, succeeded: bool) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let summary = if succeeded {
+        b"{\"state\":\"completed\"}".as_slice()
+    } else {
+        b"{\"state\":\"failed\"}".as_slice()
+    };
+    record.set_len(0)?;
+    record.seek(SeekFrom::Start(0))?;
+    record.write_all(summary)?;
+    record.sync_all()
+}
+
+fn preserve_effect_result<T>(
+    result: Result<T>,
+    update_summary: impl FnOnce(bool) -> std::io::Result<()>,
+) -> Result<T> {
+    if update_summary(result.is_ok()).is_err() {
+        eprintln!(
+            "The action finished, but its local attempt summary could not be updated; the original result is retained for delivery."
+        );
+    }
+    result
 }
 
 #[derive(Clone)]
@@ -720,14 +947,11 @@ async fn execute_once(
             .await
             .map(|_| json!({"done":true})),
     };
-    // Keep a bounded non-secret receipt locally, not commands, values or images.
-    let receipt = json!({"state":if result.is_ok(){"completed"}else{"failed"}});
-    record.set_len(0)?;
-    use std::io::{Seek, SeekFrom};
-    record.seek(SeekFrom::Start(0))?;
-    record.write_all(serde_json::to_string(&receipt)?.as_bytes())?;
-    record.sync_all()?;
-    result
+    // Keep a bounded non-secret summary; the pre-effect marker remains the
+    // replay fence if updating it fails after the effect has completed.
+    preserve_effect_result(result, |succeeded| {
+        write_attempt_summary(&mut record, succeeded)
+    })
 }
 
 #[cfg(test)]
@@ -888,6 +1112,57 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].attempt, receipt.attempt);
         assert_eq!(restored[0].result, receipt.result);
+    }
+    #[tokio::test]
+    async fn completed_receipt_stays_pending_until_storage_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal");
+        std::fs::write(&journal, b"temporary path obstruction").unwrap();
+        let receipt = DeviceReceipt {
+            connection: "fixture-connection".into(),
+            attempt: uuid::Uuid::new_v4().to_string(),
+            result: Ok(json!({"stdout":"original output"})),
+        };
+        let status = std::sync::Mutex::new(None);
+        let mut queued = std::collections::VecDeque::new();
+        let mut pending = None;
+
+        retain_receipt_or_queue(
+            &journal,
+            receipt.clone(),
+            &mut queued,
+            &mut pending,
+            &status,
+        );
+        assert!(queued.is_empty());
+        assert_eq!(pending.as_ref().unwrap().receipt.result, receipt.result);
+        assert!(
+            status
+                .lock()
+                .unwrap()
+                .as_deref()
+                .unwrap()
+                .contains("storage")
+        );
+
+        std::fs::remove_file(&journal).unwrap();
+        std::fs::create_dir(&journal).unwrap();
+        tokio::time::sleep(RECEIPT_SAVE_RETRY_INITIAL).await;
+        retry_pending_receipt_save(&journal, &mut queued, &mut pending, &status);
+
+        assert!(pending.is_none());
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].attempt, receipt.attempt);
+        assert_eq!(queued[0].result, receipt.result);
+        assert_eq!(load_receipts(&journal).unwrap()[0].result, receipt.result);
+    }
+    #[test]
+    fn marker_write_failure_does_not_replace_the_effect_result() {
+        let output = json!({"stdout":"effect completed"});
+        let result = preserve_effect_result(Ok(output.clone()), |_| {
+            Err(std::io::Error::other("fixture write failure"))
+        });
+        assert_eq!(result.unwrap(), output);
     }
     #[test]
     fn receipt_namespaces_separate_servers_and_accounts() {

@@ -48,6 +48,10 @@ struct ServerState {
     poll_count: usize,
     operation_count: usize,
     receipt_count: usize,
+    storage_blocked_poll_count: usize,
+    revoke_next_active_poll: bool,
+    active_attempt_revoked: bool,
+    active_poll_delay: Duration,
     auth_failures: usize,
     protocol_failures: usize,
     mismatched_connections: usize,
@@ -68,6 +72,14 @@ impl FixtureServer {
         command: String,
         cwd: PathBuf,
     ) -> io::Result<(Self, mpsc::UnboundedReceiver<ServerEvent>)> {
+        Self::start_with_attempt(command, cwd, Uuid::new_v4().to_string())
+    }
+
+    fn start_with_attempt(
+        command: String,
+        cwd: PathBuf,
+        attempt: String,
+    ) -> io::Result<(Self, mpsc::UnboundedReceiver<ServerEvent>)> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
@@ -85,7 +97,7 @@ impl FixtureServer {
                 events_tx,
                 command,
                 cwd,
-                Uuid::new_v4().to_string(),
+                attempt,
             );
         });
         Ok((
@@ -212,15 +224,24 @@ fn handle_request(
         }
         "/v1/device-executor/poll" => {
             let poll: DevicePoll = serde_json::from_slice(&request.body)?;
-            let operation = {
+            let (operation, active_authorized, authorization_delay) = {
                 let mut state = state.lock().unwrap();
                 state.poll_count += 1;
+                let revoke_active_attempt = poll.active_attempt.is_some()
+                    && state.revoke_next_active_poll
+                    && !state.active_attempt_revoked;
+                if revoke_active_attempt {
+                    state.active_attempt_revoked = true;
+                }
+                if !poll.ready && poll.active_attempt.is_none() {
+                    state.storage_blocked_poll_count += 1;
+                }
                 if poll.connection != FIXTURE_CONNECTION {
                     state.mismatched_connections += 1;
                 }
                 let can_run = poll.capabilities.contains(&DeviceCapability::Commands);
                 state.saw_command_capability |= can_run;
-                if can_run && poll.ready && !state.operation_delivered {
+                let operation = if can_run && poll.ready && !state.operation_delivered {
                     state.operation_delivered = true;
                     state.operation_count += 1;
                     Some(DeviceOperation {
@@ -233,14 +254,26 @@ fn handle_request(
                     })
                 } else {
                     None
-                }
+                };
+                (
+                    operation,
+                    !revoke_active_attempt,
+                    if revoke_active_attempt {
+                        state.active_poll_delay
+                    } else {
+                        Duration::ZERO
+                    },
+                )
             };
+            if !authorization_delay.is_zero() {
+                thread::sleep(authorization_delay);
+            }
             write_json(
                 stream,
                 "200 OK",
                 &DevicePollResult {
                     operation,
-                    active_authorized: true,
+                    active_authorized,
                 },
             )?;
         }
@@ -393,9 +426,19 @@ fn fixture_command() -> &'static str {
     r#"printf 'run\n' >> execution-count.txt; printf 'outbound-executor-ok'"#
 }
 
+#[cfg(unix)]
+fn slow_fixture_command() -> &'static str {
+    r#"printf 'run\n' >> execution-count.txt; sleep 1; printf 'outbound-executor-ok'"#
+}
+
 #[cfg(windows)]
 fn fixture_command() -> &'static str {
     "echo run>>execution-count.txt & echo outbound-executor-ok"
+}
+
+#[cfg(windows)]
+fn slow_fixture_command() -> &'static str {
+    "echo run>>execution-count.txt & ping -n 3 127.0.0.1 > nul & echo outbound-executor-ok"
 }
 
 #[tokio::test]
@@ -487,6 +530,202 @@ async fn outbound_runner_retries_lost_receipt_without_replaying_the_command() ->
     anyhow::ensure!(
         first.attempt == second.attempt,
         "receipt attempt identity changed"
+    );
+    anyhow::ensure!(
+        std::fs::read_to_string(output_file)?.lines().count() == 1,
+        "the temporary command fixture should be written exactly once"
+    );
+    Ok(())
+}
+
+fn receipt_journal(state_dir: &Path, server: &str, token: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"handler-device-receipts-v1\0");
+    hash.update(server.as_bytes());
+    hash.update([0]);
+    hash.update(token.as_bytes());
+    state_dir
+        .join("device-attempts")
+        .join(format!("{:x}", hash.finalize()))
+}
+
+#[tokio::test]
+async fn completed_result_waits_for_storage_recovery_and_survives_local_disable()
+-> anyhow::Result<()> {
+    let fixture = tempdir()?;
+    let output_file = fixture.path().join("execution-count.txt");
+    let attempt = Uuid::new_v4().to_string();
+    let (mut server, mut events) = FixtureServer::start_with_attempt(
+        fixture_command().into(),
+        fixture.path().to_path_buf(),
+        attempt.clone(),
+    )?;
+    let state_dir = fixture.path().join("executor-state");
+    let journal = receipt_journal(&state_dir, &server.base_url, FIXTURE_TOKEN);
+    std::fs::create_dir_all(&journal)?;
+    let blocked_temporary = journal.join(format!("{attempt}.receipt.tmp"));
+    std::fs::create_dir(&blocked_temporary)?;
+    let mut config = ExecutorConfig::new(server.base_url.clone(), FIXTURE_TOKEN.into(), state_dir);
+    config.name = "outbound fixture".into();
+    config.capability_mask = 1;
+    config.allow_insecure_http = true;
+
+    let (first, second) = timeout(Duration::from_secs(10), async {
+        let executor = Executor::start(config);
+        executor.set_enabled(true)?;
+
+        loop {
+            if server.snapshot().storage_blocked_poll_count > 0
+                && executor
+                    .connection_error()
+                    .as_deref()
+                    .is_some_and(|status| status.contains("storage is unavailable"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Receipt persistence and delivery continue after local execution is disabled.
+        executor.set_enabled(false)?;
+        std::fs::remove_dir(&blocked_temporary)?;
+        let (first_ordinal, first) = receive_receipt(&mut events).await?;
+        anyhow::ensure!(
+            first_ordinal == 1,
+            "first recovered receipt ordinal was unexpected"
+        );
+        let (second_ordinal, second) = receive_receipt(&mut events).await?;
+        anyhow::ensure!(
+            second_ordinal == 2,
+            "recovered receipt acknowledgement was not retried"
+        );
+        anyhow::ensure!(
+            first.attempt == attempt && second.attempt == attempt,
+            "storage recovery changed the action identity"
+        );
+        anyhow::ensure!(
+            first.result == second.result,
+            "receipt retry changed the original completed result"
+        );
+        let output = second
+            .result
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("command result was lost: {error}"))?;
+        anyhow::ensure!(
+            output["exit_code"] == 0,
+            "command exit code was not returned"
+        );
+        anyhow::ensure!(
+            output["stdout"]
+                .as_str()
+                .is_some_and(|stdout| stdout.trim() == "outbound-executor-ok"),
+            "original command output was not returned"
+        );
+
+        executor.shutdown();
+        executor.join().await;
+        anyhow::ensure!(
+            !executor.enabled(),
+            "local access was unexpectedly re-enabled"
+        );
+        Ok::<_, anyhow::Error>((first, second))
+    })
+    .await
+    .expect("executor should retain and deliver its result after storage recovers")?;
+
+    server.stop();
+    let state = server.snapshot();
+    anyhow::ensure!(state.operation_count == 1, "command action was replayed");
+    anyhow::ensure!(
+        state.storage_blocked_poll_count > 0,
+        "executor did not report not-ready while blocked"
+    );
+    anyhow::ensure!(
+        state.receipt_count == 2,
+        "recovered receipt was not retried exactly once"
+    );
+    anyhow::ensure!(
+        first.result == second.result,
+        "receipt retry changed its result"
+    );
+    anyhow::ensure!(
+        std::fs::read_to_string(output_file)?.lines().count() == 1,
+        "the temporary command fixture should be written exactly once"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_result_wins_when_authorization_loss_arrives_after_the_effect()
+-> anyhow::Result<()> {
+    let fixture = tempdir()?;
+    let output_file = fixture.path().join("execution-count.txt");
+    let (mut server, mut events) =
+        FixtureServer::start(slow_fixture_command().into(), fixture.path().to_path_buf())?;
+    {
+        let mut state = server.state.lock().unwrap();
+        state.revoke_next_active_poll = true;
+        state.active_poll_delay = Duration::from_secs(2);
+    }
+    let mut config = ExecutorConfig::new(
+        server.base_url.clone(),
+        FIXTURE_TOKEN.into(),
+        fixture.path().join("executor-state"),
+    );
+    config.name = "outbound fixture".into();
+    config.capability_mask = 1;
+    config.allow_insecure_http = true;
+
+    let (first, second) = timeout(Duration::from_secs(8), async {
+        let executor = Executor::start(config);
+        executor.set_enabled(true)?;
+        let (first_ordinal, first) = receive_receipt(&mut events).await?;
+        anyhow::ensure!(first_ordinal == 1, "first receipt ordinal was unexpected");
+        let (second_ordinal, second) = receive_receipt(&mut events).await?;
+        anyhow::ensure!(
+            second_ordinal == 2,
+            "receipt acknowledgement was not retried"
+        );
+        anyhow::ensure!(
+            first.result == second.result,
+            "authorization loss replaced the completed result on receipt retry"
+        );
+        let output = second
+            .result
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("completed command was marked uncertain: {error}"))?;
+        anyhow::ensure!(
+            output["exit_code"] == 0,
+            "command exit code was not returned"
+        );
+        anyhow::ensure!(
+            output["stdout"]
+                .as_str()
+                .is_some_and(|stdout| stdout.trim() == "outbound-executor-ok"),
+            "original command output was not returned"
+        );
+        executor.shutdown();
+        executor.join().await;
+        Ok::<_, anyhow::Error>((first, second))
+    })
+    .await
+    .expect("authorization race fixture should preserve a completed result")?;
+
+    server.stop();
+    let state = server.snapshot();
+    anyhow::ensure!(
+        state.active_attempt_revoked,
+        "fixture did not revoke the active attempt"
+    );
+    anyhow::ensure!(state.operation_count == 1, "command action was replayed");
+    anyhow::ensure!(
+        state.receipt_count == 2,
+        "receipt was not retried exactly once"
+    );
+    anyhow::ensure!(
+        first.result == second.result,
+        "receipt retry changed its result"
     );
     anyhow::ensure!(
         std::fs::read_to_string(output_file)?.lines().count() == 1,
