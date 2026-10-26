@@ -231,7 +231,7 @@ async fn capture(sequence: u64) -> Result<ViewFrame> {
     #[cfg(target_os = "macos")]
     let frame = tokio::task::spawn_blocking(crate::macos::read_only_screenshot).await??;
     #[cfg(windows)]
-    let frame = crate::windows::WindowsDesktopBackend::default()
+    let frame = crate::windows::WindowsDesktopBackend
         .screenshot()
         .await?;
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
