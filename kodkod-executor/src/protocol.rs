@@ -2,6 +2,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Version 2 adds anchored scroll input. This is an HTTP announcement header,
+/// keeping existing strict JSON payloads compatible with older peers.
+pub const EXECUTOR_PROTOCOL_HEADER: &str = "x-kodkod-executor-protocol";
+pub const EXECUTOR_PROTOCOL_VERSION: u16 = 2;
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceCapability {

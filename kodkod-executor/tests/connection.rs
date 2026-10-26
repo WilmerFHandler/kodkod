@@ -210,6 +210,13 @@ fn handle_request(
 
     match request.path.as_str() {
         "/v1/device-executor/connect" => {
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-kodkod-executor-protocol")
+                    .map(String::as_str),
+                Some("2")
+            );
             let hello: DeviceHello = serde_json::from_slice(&request.body)?;
             anyhow::ensure!(hello.name == "outbound fixture", "unexpected executor name");
             anyhow::ensure!(hello.executor_id.is_some(), "executor identity was missing");

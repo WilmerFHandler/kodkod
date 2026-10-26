@@ -180,3 +180,8 @@ stops publication. The server owns viewer authorization and expiry.
 screenshot and bounded `delta_x`/`delta_y`. Positive values move content right or
 down. The anchor must be in the fresh observed frame. Backends translate these
 units to native scrolling; wheel-only systems approximate them in wheel steps.
+
+The outbound connection announces `X-Kodkod-Executor-Protocol: 2` without changing
+strict JSON contracts. Version 2 supports scroll actions; services treating a
+missing header as version 1 can reject unsupported input before dispatch. This
+version describes wire support and grants no additional OS permissions.

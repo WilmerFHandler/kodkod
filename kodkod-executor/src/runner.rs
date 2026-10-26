@@ -241,7 +241,7 @@ async fn post<T: serde::Serialize, R: serde::de::DeserializeOwned>(
 ) -> Result<R> {
     let response = client
         .post(format!("{base}/v1/device-executor/{path}"))
-        .header("X-Kodkod-Executor-Protocol", "1")
+        .header(EXECUTOR_PROTOCOL_HEADER, EXECUTOR_PROTOCOL_VERSION)
         .bearer_auth(token.trim())
         .json(body)
         .send()
