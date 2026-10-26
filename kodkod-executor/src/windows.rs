@@ -285,16 +285,18 @@ fn capture_primary_display() -> Result<DesktopScreenshot> {
     anyhow::ensure!(copied != 0, "Could not capture the primary display");
     resources.restore_bitmap()?;
 
-    let mut info = BITMAPINFO::default();
-    info.bmiHeader = BITMAPINFOHEADER {
-        biSize: size_of::<BITMAPINFOHEADER>() as u32,
-        biWidth: width as i32,
-        biHeight: -(height as i32),
-        biPlanes: 1,
-        biBitCount: 32,
-        biCompression: BI_RGB,
-        biSizeImage: u32::try_from(byte_len).context("The display bitmap is too large")?,
-        ..BITMAPINFOHEADER::default()
+    let mut info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            biSizeImage: u32::try_from(byte_len).context("The display bitmap is too large")?,
+            ..BITMAPINFOHEADER::default()
+        },
+        ..BITMAPINFO::default()
     };
     let lines = unsafe {
         GetDIBits(
@@ -313,7 +315,7 @@ fn capture_primary_display() -> Result<DesktopScreenshot> {
     );
     drop(resources);
 
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
         pixel[3] = 255;
     }

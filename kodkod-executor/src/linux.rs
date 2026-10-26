@@ -364,13 +364,20 @@ fn executable_file(path: &Path) -> bool {
 }
 
 struct HelperProcessGroup {
+    #[cfg(unix)]
     id: Option<u32>,
     armed: bool,
 }
 
 impl HelperProcessGroup {
     fn new(id: Option<u32>) -> Self {
-        Self { id, armed: true }
+        #[cfg(not(unix))]
+        let _ = id;
+        Self {
+            #[cfg(unix)]
+            id,
+            armed: true,
+        }
     }
 
     fn kill(&mut self) {

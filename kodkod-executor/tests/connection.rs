@@ -138,6 +138,8 @@ fn serve(
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                // macOS may inherit the listener's nonblocking flag on accept.
+                let _ = stream.set_nonblocking(false);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
                 if let Err(error) =
                     handle_request(&mut stream, &state, &events, &command, &cwd, &attempt)

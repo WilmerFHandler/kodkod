@@ -97,7 +97,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<ExecutorConfig
     Ok(Some(config))
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args == ["capabilities"] {

@@ -4,6 +4,7 @@ use anyhow::Context;
 use anyhow::Result;
 #[cfg(not(target_os = "macos"))]
 use futures::future::BoxFuture;
+#[cfg(not(windows))]
 use serde_json::Value;
 #[cfg(target_os = "linux")]
 use serde_json::json;

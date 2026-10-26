@@ -302,8 +302,8 @@ impl WindowsJobObject {
                 Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD},
                 JobObjects::{
                     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-                    SetInformationJobObject,
+                    JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                    JobObjectExtendedLimitInformation, SetInformationJobObject,
                 },
                 Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
             },
@@ -315,8 +315,13 @@ impl WindowsJobObject {
             handle: handle as isize,
         };
 
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                ..JOBOBJECT_BASIC_LIMIT_INFORMATION::default()
+            },
+            ..JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default()
+        };
         let configured = unsafe {
             SetInformationJobObject(
                 handle,
@@ -408,8 +413,10 @@ fn find_primary_thread(
         THREADENTRY32, Thread32First, Thread32Next,
     };
 
-    let mut entry = THREADENTRY32::default();
-    entry.dwSize = size_of::<THREADENTRY32>() as u32;
+    let mut entry = THREADENTRY32 {
+        dwSize: size_of::<THREADENTRY32>() as u32,
+        ..THREADENTRY32::default()
+    };
     let mut found = unsafe { Thread32First(snapshot, &mut entry) } != 0;
     while found {
         if entry.th32OwnerProcessID == process_id {
