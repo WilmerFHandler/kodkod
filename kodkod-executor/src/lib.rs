@@ -2,6 +2,8 @@
 pub mod access;
 pub mod command;
 pub mod computer;
+#[cfg(target_os = "linux")]
+pub mod desktop_helper;
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;

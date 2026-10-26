@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use kodkod_executor::runner::{Executor, ExecutorConfig};
 use std::path::PathBuf;
 
-const USAGE: &str = "Usage: kodkod-executor serve --server URL --token-file FILE --state-dir DIR --allow commands[,desktop,apps] [--name NAME] [--allow-http]\n       kodkod-executor capabilities\n\nRuns as the current OS user. Command access grants that user's account authority.\nUse a dedicated user/VM for isolation; a working directory is not a sandbox.\nThe token file must contain an enrolled executor credential, never a model API key.";
+const USAGE: &str = "Usage: kodkod-executor serve --server URL --token-file FILE --state-dir DIR --allow commands[,desktop,apps] [--name NAME] [--allow-http] [--desktop-helper-socket PATH]\n       kodkod-executor capabilities [--desktop-helper-socket PATH]\n\nRuns as the current OS user. Command access grants that user's account authority.\nUse a dedicated user/VM for isolation; a working directory is not a sandbox.\nOn Linux, --desktop-helper-socket opts into an already-running Wayland helper.\nThe token file must contain an enrolled executor credential, never a model API key.";
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<ExecutorConfig>> {
     let mut args = args.into_iter();
@@ -20,6 +20,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<ExecutorConfig
     let mut state_dir = None;
     let mut name = None;
     let mut allowed = None;
+    let mut desktop_helper_socket = None;
     let mut allow_http = false;
     while let Some(flag) = args.next() {
         if flag == "--allow-http" {
@@ -59,6 +60,13 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<ExecutorConfig
                 }
                 allowed = Some(mask);
             }
+            "--desktop-helper-socket" => {
+                anyhow::ensure!(
+                    desktop_helper_socket.is_none(),
+                    "Duplicate --desktop-helper-socket"
+                );
+                desktop_helper_socket = Some(PathBuf::from(value));
+            }
             _ => bail!("Unknown option: {flag}"),
         }
     }
@@ -90,6 +98,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<ExecutorConfig
     );
     config.capability_mask = allowed.context("Explicit --allow capabilities are required")?;
     config.allow_insecure_http = allow_http;
+    config.desktop_helper_socket = desktop_helper_socket;
     if let Some(name) = name {
         config.name = name;
     }
@@ -100,10 +109,28 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<ExecutorConfig
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args == ["capabilities"] {
+    if args.first().is_some_and(|arg| arg == "capabilities") {
+        let helper_socket = if args.len() == 1 {
+            None
+        } else {
+            anyhow::ensure!(
+                args.len() == 3 && args[1] == "--desktop-helper-socket",
+                "Invalid capabilities arguments. {USAGE}"
+            );
+            Some(PathBuf::from(&args[2]))
+        };
+        #[cfg(not(target_os = "linux"))]
+        anyhow::ensure!(
+            helper_socket.is_none(),
+            "The Wayland desktop helper is supported only on Linux"
+        );
         println!(
             "{}",
-            serde_json::to_string(&kodkod_executor::runner::available_capabilities())?
+            serde_json::to_string(
+                &kodkod_executor::runner::available_capabilities_with_helper(
+                    helper_socket.as_deref(),
+                )
+            )?
         );
         return Ok(());
     }

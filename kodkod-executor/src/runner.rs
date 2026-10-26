@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use serde_json::{Value, json};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -22,6 +22,7 @@ pub struct ExecutorConfig {
     pub name: String,
     pub capability_mask: u8,
     pub allow_insecure_http: bool,
+    pub desktop_helper_socket: Option<PathBuf>,
     pub env_remove: Vec<std::ffi::OsString>,
 }
 impl ExecutorConfig {
@@ -34,6 +35,7 @@ impl ExecutorConfig {
             name: device_name(),
             capability_mask: 7,
             allow_insecure_http: false,
+            desktop_helper_socket: None,
             env_remove: Vec::new(),
         }
     }
@@ -67,6 +69,14 @@ impl ExecutorConfig {
             self.capability_mask & !7 == 0,
             "Invalid capability selection"
         );
+        if let Some(socket) = &self.desktop_helper_socket {
+            anyhow::ensure!(
+                socket.is_absolute(),
+                "Desktop helper socket path must be absolute"
+            );
+            #[cfg(not(target_os = "linux"))]
+            anyhow::bail!("The Wayland desktop helper is supported only on Linux");
+        }
         anyhow::ensure!(
             !self.name.trim().is_empty()
                 && self.name.len() <= 200
@@ -169,17 +179,26 @@ impl Drop for Executor {
     }
 }
 pub fn available_capabilities() -> Vec<DeviceCapability> {
+    available_capabilities_with_helper(None)
+}
+pub fn available_capabilities_with_helper(
+    desktop_helper_socket: Option<&Path>,
+) -> Vec<DeviceCapability> {
     capabilities(
         &AtomicU8::new(7),
         crate::platform::app_backend().as_ref(),
         7,
+        desktop_helper_socket,
     )
 }
 fn capabilities(
     allowed: &AtomicU8,
     backend: &dyn AppAutomationBackend,
     mask: u8,
+    desktop_helper_socket: Option<&Path>,
 ) -> Vec<DeviceCapability> {
+    #[cfg(target_os = "macos")]
+    let _ = desktop_helper_socket;
     let bits = allowed.load(Ordering::Acquire) & mask;
     if bits & 6 == 0 {
         return if bits & 1 != 0 {
@@ -191,7 +210,7 @@ fn capabilities(
     #[allow(unused_mut)]
     let mut capabilities = crate::access::capabilities(bits, backend.permissions());
     #[cfg(not(target_os = "macos"))]
-    if bits & 4 != 0 && crate::platform::desktop_available() {
+    if bits & 4 != 0 && crate::platform::desktop_available_with_helper(desktop_helper_socket) {
         capabilities.push(DeviceCapability::Desktop);
     }
     capabilities
@@ -302,7 +321,9 @@ async fn run(
         .build()?;
     let backend = crate::platform::app_backend();
     let mut session = backend.app_automation_session();
-    let mut desktop = Arc::new(crate::platform::Desktop::default());
+    let mut desktop = Arc::new(crate::platform::new_desktop(
+        config.desktop_helper_socket.clone(),
+    ));
     let mut bound_attachment = None;
     let mut connection = None;
     let mut active: Option<tokio::task::JoinHandle<DeviceReceipt>> = None;
@@ -402,7 +423,12 @@ async fn run(
             let hello = DeviceHello {
                 executor_id: Some(executor_id),
                 name: config.name.clone(),
-                capabilities: capabilities(&allowed, backend.as_ref(), config.capability_mask),
+                capabilities: capabilities(
+                    &allowed,
+                    backend.as_ref(),
+                    config.capability_mask,
+                    config.desktop_helper_socket.as_deref(),
+                ),
                 grant_generation: generation.load(Ordering::Acquire),
             };
             match announce(&client, &base, &token, &hello).await {
@@ -410,7 +436,9 @@ async fn run(
                     connection = Some(c.connection);
                     bound_attachment = None;
                     session = backend.app_automation_session();
-                    desktop = Arc::new(crate::platform::Desktop::default());
+                    desktop = Arc::new(crate::platform::new_desktop(
+                        config.desktop_helper_socket.clone(),
+                    ));
                 }
                 Err(error) => {
                     record_transport_failure(&journal, "connect", &error, &transport_error);
@@ -428,8 +456,14 @@ async fn run(
         let epoch = generation.load(Ordering::Acquire);
         let poll = DevicePoll {
             connection: id.clone(),
-            capabilities: capabilities(&allowed, backend.as_ref(), config.capability_mask),
+            capabilities: capabilities(
+                &allowed,
+                backend.as_ref(),
+                config.capability_mask,
+                config.desktop_helper_socket.as_deref(),
+            ),
             ready: active.is_none() && pending_receipt.is_none(),
+
             grant_generation: epoch,
             active_attempt: active_identity.as_ref().map(|(_, attempt)| attempt.clone()),
         };
@@ -464,7 +498,9 @@ async fn run(
             }
             bound_attachment = None;
             session = backend.app_automation_session();
-            desktop = Arc::new(crate::platform::Desktop::default());
+            desktop = Arc::new(crate::platform::new_desktop(
+                config.desktop_helper_socket.clone(),
+            ));
         }
         match response {
             Ok(DevicePollResult {
@@ -491,7 +527,9 @@ async fn run(
                 }
                 if bound_attachment.as_ref() != Some(&op.attachment) {
                     session = backend.app_automation_session();
-                    desktop = Arc::new(crate::platform::Desktop::default());
+                    desktop = Arc::new(crate::platform::new_desktop(
+                        config.desktop_helper_socket.clone(),
+                    ));
                     bound_attachment = Some(op.attachment.clone());
                 }
                 match &op.operation {
@@ -525,6 +563,7 @@ async fn run(
                     generation: generation.clone(),
                     epoch,
                     capability_mask: config.capability_mask,
+                    desktop_helper_socket: config.desktop_helper_socket.clone(),
                     env_remove: config.env_remove.clone(),
                 };
                 active = Some(tokio::spawn(async move {
@@ -849,6 +888,7 @@ struct ExecutionAccess {
     generation: Arc<AtomicU64>,
     epoch: u64,
     capability_mask: u8,
+    desktop_helper_socket: Option<PathBuf>,
     env_remove: Vec<std::ffi::OsString>,
 }
 
@@ -865,6 +905,7 @@ async fn execute_once(
         generation,
         epoch,
         capability_mask,
+        desktop_helper_socket,
         env_remove,
     } = access;
     op.operation.validate()?;
@@ -873,8 +914,13 @@ async fn execute_once(
         "Local consent changed before execution"
     );
     anyhow::ensure!(
-        capabilities(&allowed, backend.as_ref(), capability_mask)
-            .contains(&op.operation.capability()),
+        capabilities(
+            &allowed,
+            backend.as_ref(),
+            capability_mask,
+            desktop_helper_socket.as_deref(),
+        )
+        .contains(&op.operation.capability()),
         "Device capability was revoked locally"
     );
     // Server-generated identifiers cannot select arbitrary local paths.
@@ -896,8 +942,13 @@ async fn execute_once(
     crate::access::sync_directory(&journal)?;
     anyhow::ensure!(
         generation.load(Ordering::Acquire) == epoch
-            && capabilities(&allowed, backend.as_ref(), capability_mask)
-                .contains(&op.operation.capability()),
+            && capabilities(
+                &allowed,
+                backend.as_ref(),
+                capability_mask,
+                desktop_helper_socket.as_deref(),
+            )
+            .contains(&op.operation.capability()),
         "Local consent changed before effect dispatch"
     );
     let result = match op.operation {
@@ -1009,6 +1060,70 @@ mod tests {
             Box::pin(async { anyhow::bail!("Unused fixture") })
         }
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_wayland_capability_requires_local_permission_and_a_healthy_helper() {
+        use std::{
+            io::{Read, Write},
+            os::unix::fs::PermissionsExt,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let backend = FakeBackend;
+        let allowed = AtomicU8::new(5);
+
+        for (name, granted, expected) in [("denied", false, false), ("granted", true, true)] {
+            let socket = directory.path().join(format!("{name}.sock"));
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut header = [0; 4];
+                stream.read_exact(&mut header).unwrap();
+                let length = u32::from_be_bytes(header) as usize;
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                let request: crate::desktop_helper::HelperRequest =
+                    serde_json::from_slice(&body).unwrap();
+                assert!(matches!(
+                    request.operation,
+                    crate::desktop_helper::HelperOperation::Status
+                ));
+                let reply = crate::desktop_helper::HelperReply {
+                    version: crate::desktop_helper::HELPER_PROTOCOL_VERSION,
+                    id: request.id,
+                    result: Ok(json!({
+                        "available": true,
+                        "granted": granted,
+                        "generation": "fixture-generation"
+                    })),
+                };
+                let body = serde_json::to_vec(&reply).unwrap();
+                stream
+                    .write_all(&(body.len() as u32).to_be_bytes())
+                    .unwrap();
+                stream.write_all(&body).unwrap();
+            });
+
+            let capabilities = capabilities(&allowed, &backend, 5, Some(&socket));
+            assert_eq!(capabilities.contains(&DeviceCapability::Desktop), expected);
+            assert!(capabilities.contains(&DeviceCapability::Commands));
+            server.join().unwrap();
+        }
+
+        let commands_only = AtomicU8::new(1);
+        assert!(
+            !capabilities(
+                &commands_only,
+                &backend,
+                5,
+                Some(Path::new("/missing.sock"))
+            )
+            .contains(&DeviceCapability::Desktop)
+        );
+    }
+
     #[tokio::test]
     async fn native_command_executor_writes_only_its_owned_fixture_and_refuses_replay() {
         let dir = tempfile::tempdir().unwrap();
@@ -1039,6 +1154,7 @@ mod tests {
             generation,
             epoch: 0,
             capability_mask: 7,
+            desktop_helper_socket: None,
             env_remove: Vec::new(),
         };
         let reply = execute_once(operation.clone(), journal.clone(), access.clone())

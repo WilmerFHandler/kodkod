@@ -8,6 +8,10 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 #[cfg(target_os = "linux")]
 use serde_json::json;
+#[cfg(not(target_os = "macos"))]
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub fn app_backend() -> Arc<dyn AppAutomationBackend> {
@@ -77,26 +81,40 @@ struct Observation {
 #[cfg(target_os = "linux")]
 pub struct Desktop {
     backend: crate::linux::LinuxDesktopBackend,
+    helper: Option<crate::desktop_helper::DesktopHelperClient>,
     last: std::sync::Mutex<Option<Observation>>,
 }
 #[cfg(target_os = "linux")]
 impl Default for Desktop {
     fn default() -> Self {
+        Self::with_helper_socket(None)
+    }
+}
+#[cfg(target_os = "linux")]
+impl Desktop {
+    pub fn with_helper_socket(helper_socket: Option<PathBuf>) -> Self {
         Self {
             backend: crate::linux::LinuxDesktopBackend::new(
                 std::env::var("DISPLAY").unwrap_or_default(),
                 std::env::var_os("XAUTHORITY").map(Into::into),
             ),
+            helper: helper_socket
+                .as_ref()
+                .map(|socket| crate::desktop_helper::DesktopHelperClient::new(socket.clone())),
             last: Default::default(),
         }
     }
-}
-#[cfg(target_os = "linux")]
-impl Desktop {
+
     pub fn invalidate(&self) {
         self.last.lock().unwrap().take();
+        if let Some(helper) = &self.helper {
+            helper.invalidate();
+        }
     }
     pub async fn screenshot(&self) -> Result<Value> {
+        if let Some(helper) = &self.helper {
+            return helper.screenshot().await;
+        }
         anyhow::ensure!(
             desktop_available(),
             "X11 desktop is unavailable; headless command execution remains available"
@@ -119,6 +137,14 @@ impl Desktop {
         input: ComputerInput,
         authorized: impl Fn() -> bool + Send + 'static,
     ) -> Result<Value> {
+        if let Some(helper) = &self.helper {
+            let value = helper.input(id, input, |_| authorized()).await?;
+            anyhow::ensure!(
+                authorized(),
+                "Input may have completed before access was revoked"
+            );
+            return Ok(value);
+        }
         anyhow::ensure!(authorized(), "Desktop access revoked");
         input.validate()?;
         let observed = self
@@ -153,6 +179,16 @@ impl Desktop {
             ),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+pub fn new_desktop(helper_socket: Option<PathBuf>) -> Desktop {
+    Desktop::with_helper_socket(helper_socket)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn new_desktop(_helper_socket: Option<std::path::PathBuf>) -> Desktop {
+    Desktop::default()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -195,6 +231,32 @@ pub fn desktop_available() -> bool {
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
+        false
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn desktop_available_with_helper(helper_socket: Option<&Path>) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(socket) = helper_socket {
+            return crate::desktop_helper::status(socket).is_ok_and(|status| {
+                status.get("available").and_then(Value::as_bool) == Some(true)
+                    && status.get("granted").and_then(Value::as_bool) == Some(true)
+            });
+        }
+        desktop_available()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if helper_socket.is_some() {
+            return false;
+        }
+        desktop_available()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = helper_socket;
         false
     }
 }

@@ -26,7 +26,7 @@ environment and permissions are available.
 
 | Build target | Commands | Desktop | Native app automation |
 | --- | --- | --- | --- |
-| Linux | Runs as the invoking user. | X11 only; requires `DISPLAY`, `scrot`, and `xdotool` in `PATH`, and uses `XAUTHORITY` when set. Wayland is unsupported. | Unavailable. |
+| Linux | Runs as the invoking user. | X11 requires `DISPLAY`, `scrot`, and `xdotool` in `PATH`, and uses `XAUTHORITY` when set. Wayland uses the optional user-session desktop helper with portal approval. | Unavailable. |
 | macOS | Runs as the invoking user. | Requires Screen Recording and Accessibility permissions. | App listing, observation, and actions require Accessibility permission. |
 | Windows | Runs as the invoking user. | The implementation uses GDI capture and `SendInput` on the primary desktop; live Windows runtime behavior is not yet verified. | Unavailable. |
 
@@ -96,6 +96,13 @@ This headless example grants command access only. For Linux desktop access, run
 inside the X11 user session with `DISPLAY` and optional `XAUTHORITY` set, and
 with `scrot` and `xdotool` installed; do not set `WAYLAND_DISPLAY`.
 
+For Wayland, build and start the optional
+[`kodkod-desktop-helper`](../kodkod-desktop-helper/README.md) inside the graphical
+session, approve sharing there, and pass its private socket path with
+`--desktop-helper-socket PATH`. The headless executable does not link PipeWire
+or request graphical permission. Status checks discover an already-approved
+helper; they never start one or open a permission dialog.
+
 ### macOS LaunchAgent
 
 Save a plist like this as
@@ -150,6 +157,10 @@ protocol; the executor adds no project or agent-session API of its own.
 The executor workflow runs formatting, package tests, and Clippy on Ubuntu,
 macOS, and Windows. Tests use local fixtures and do not open a desktop, make
 network calls, or require credentials.
+
+The Linux helper has a separate CI job that installs its native development
+libraries and tests protocol, input planning, and capture conversion without a
+desktop session. Real compositor compatibility requires separate live tests.
 
 ```sh
 cargo fmt --package kodkod-executor -- --check
