@@ -1,0 +1,41 @@
+name: executor
+
+on:
+  push:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - kodkod-executor/**
+      - .github/workflows/executor.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - kodkod-executor/**
+      - .github/workflows/executor.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  executor:
+    name: executor (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check formatting
+        run: cargo fmt --package kodkod-executor -- --check
+      - name: Test executor
+        run: cargo test -p kodkod-executor
+      - name: Lint executor
+        run: cargo clippy -p kodkod-executor --all-targets -- -D warnings

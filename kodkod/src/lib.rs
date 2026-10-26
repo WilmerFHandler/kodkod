@@ -16,3 +16,7 @@ pub use kodkod_google as google;
 
 #[cfg(feature = "providers")]
 pub use kodkod_providers as providers;
+
+/// Optional execution endpoint companion; no agent loop runs on the endpoint.
+#[cfg(feature = "executor")]
+pub use kodkod_executor as executor;
