@@ -188,7 +188,7 @@ fn handle_request(
     let protocol_valid = request
         .headers
         .get("x-kodkod-executor-protocol")
-        .is_some_and(|value| value == "1");
+        .is_some_and(|value| value == "2");
     {
         let mut state = state.lock().unwrap();
         if !authorization_valid {
