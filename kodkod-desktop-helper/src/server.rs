@@ -319,7 +319,8 @@ async fn process_request(
     );
     let parsed = Uuid::parse_str(&request.id).context("Invalid helper request ID")?;
     anyhow::ensure!(
-        requests.len() < 4096 && requests.insert(parsed),
+        matches!(request.operation, HelperOperation::ViewFrame)
+            || (requests.len() < 4096 && requests.insert(parsed)),
         "Duplicate request ID or connection request limit reached"
     );
     if matches!(request.operation, HelperOperation::Status) {
@@ -329,6 +330,19 @@ async fn process_request(
         state.ready(),
         "Desktop sharing is not approved or the session is unavailable"
     );
+    if matches!(request.operation, HelperOperation::ViewFrame) {
+        let desktop = state.desktop.lock().await;
+        let frame = desktop
+            .as_ref()
+            .context("Desktop sharing is unavailable")?
+            .view_frame()
+            .await?;
+        anyhow::ensure!(
+            state.ready() && alive.load(Ordering::Acquire),
+            "Viewing access was revoked"
+        );
+        return Ok(serde_json::to_value(frame)?);
+    }
     if controller.is_none() {
         *controller = Some(
             state
@@ -341,7 +355,7 @@ async fn process_request(
     let desktop = state.desktop.lock().await;
     let desktop = desktop.as_ref().context("Desktop sharing is unavailable")?;
     match request.operation {
-        HelperOperation::Status => unreachable!(),
+        HelperOperation::Status | HelperOperation::ViewFrame => unreachable!(),
         HelperOperation::Screenshot => {
             *observation = None;
             let image = desktop.screenshot().await?;

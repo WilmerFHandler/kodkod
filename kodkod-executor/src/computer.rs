@@ -425,9 +425,23 @@ pub trait AppAutomationBackend: Send + Sync {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ComputerInput {
-    Click { x: u32, y: u32 },
-    Type { text: String },
-    Key { key: String },
+    Click {
+        x: u32,
+        y: u32,
+    },
+    /// Positive deltas move the viewed content right/down; units are pixels.
+    Scroll {
+        x: u32,
+        y: u32,
+        delta_x: i32,
+        delta_y: i32,
+    },
+    Type {
+        text: String,
+    },
+    Key {
+        key: String,
+    },
 }
 impl ComputerInput {
     pub const KEYS: [&'static str; 16] = [
@@ -450,8 +464,16 @@ impl ComputerInput {
     ];
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::Click { x, y } if *x >= 8192 || *y >= 8192 => {
+            Self::Click { x, y } | Self::Scroll { x, y, .. } if *x >= 8192 || *y >= 8192 => {
                 bail!("Invalid desktop coordinates")
+            }
+            Self::Scroll {
+                delta_x, delta_y, ..
+            } if !(-4096..=4096).contains(delta_x)
+                || !(-4096..=4096).contains(delta_y)
+                || (*delta_x == 0 && *delta_y == 0) =>
+            {
+                bail!("Scroll deltas must be nonzero and within 4096 pixels")
             }
             Self::Type { text } if text.len() > 8192 => bail!("Text too long"),
             Self::Key { key } if !Self::KEYS.contains(&key.as_str()) => bail!("Unsupported key"),
@@ -461,8 +483,9 @@ impl ComputerInput {
 }
 
 pub fn validate_click_against_frame(input: &ComputerInput, dimensions: (u32, u32)) -> Result<()> {
-    let ComputerInput::Click { x, y } = input else {
-        return Ok(());
+    let (x, y) = match input {
+        ComputerInput::Click { x, y } | ComputerInput::Scroll { x, y, .. } => (x, y),
+        _ => return Ok(()),
     };
     let (width, height) = dimensions;
     if *x >= width || *y >= height {
@@ -482,6 +505,40 @@ mod tests {
         bytes.extend_from_slice(&width.to_be_bytes());
         bytes.extend_from_slice(&height.to_be_bytes());
         bytes
+    }
+
+    #[test]
+    fn scrolling_is_bounded_and_uses_the_observed_region() {
+        let input = ComputerInput::Scroll {
+            x: 20,
+            y: 10,
+            delta_x: -250,
+            delta_y: 600,
+        };
+        input.validate().unwrap();
+        assert_eq!(serde_json::to_value(&input).unwrap()["action"], "scroll");
+        assert!(validate_click_against_frame(&input, (100, 100)).is_ok());
+        assert!(validate_click_against_frame(&input, (10, 100)).is_err());
+        assert!(
+            ComputerInput::Scroll {
+                x: 0,
+                y: 0,
+                delta_x: 0,
+                delta_y: 0
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ComputerInput::Scroll {
+                x: 0,
+                y: 0,
+                delta_x: i32::MIN,
+                delta_y: 1
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]

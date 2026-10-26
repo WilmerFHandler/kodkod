@@ -7,7 +7,7 @@ description = "Optional user-session Wayland desktop helper for Kodkod Executor"
 
 [features]
 default = []
-portal = ["dep:ashpd", "dep:pipewire", "dep:reis", "dep:zbus"]
+portal = ["dep:ashpd", "dep:pipewire", "dep:reis", "dep:zbus", "dep:xkbcommon"]
 
 [[bin]]
 name = "kodkod-desktop-helper"
@@ -31,6 +31,7 @@ pipewire = { version = "0.8", features = ["v0_3_44"], optional = true }
 reis = { version = "=0.7.1", features = ["tokio"], optional = true }
 zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
 libc = "0.2"
+xkbcommon = { version = "0.8", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

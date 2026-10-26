@@ -51,6 +51,8 @@ pub struct HelperRequest {
 pub enum HelperOperation {
     Status,
     Screenshot,
+    /// Viewing never acquires control or changes input observations.
+    ViewFrame,
     Input {
         observation_id: String,
         input: ComputerInput,
@@ -78,6 +80,8 @@ pub struct StatusValue {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HelperInputs {
+    #[serde(default)]
+    pub scroll: bool,
     pub pointer: bool,
     pub keyboard: bool,
     pub text: bool,
@@ -180,6 +184,31 @@ impl DesktopHelperClient {
         state.stream = Some(stream);
         state.binding = Some(binding);
         Ok(value)
+    }
+
+    /// Capture through a separate media client without touching input leases.
+    pub async fn view_frame(&self) -> Result<crate::view::ViewFrame> {
+        let mut state = self.state.lock().await;
+        self.sync_invalidation(&mut state);
+        self.ensure_stream(&mut state).await?;
+        let mut stream = state.stream.take().context("Missing viewing connection")?;
+        let request = HelperRequest {
+            version: HELPER_PROTOCOL_VERSION,
+            id: Uuid::now_v7().to_string(),
+            operation: HelperOperation::ViewFrame,
+        };
+        let mut cancellation = CancelledExchange::new(self.invalidation_epoch.clone());
+        let reply = exchange(&mut stream, &request).await?;
+        cancellation.finish();
+        let value = validate_reply(reply, &request.id)?.map_err(anyhow::Error::msg)?;
+        let frame: crate::view::ViewFrame = serde_json::from_value(value)?;
+        frame.validate()?;
+        anyhow::ensure!(
+            self.invalidation_epoch.load(Ordering::Acquire) == state.seen_epoch,
+            "Viewing access was revoked"
+        );
+        state.stream = Some(stream);
+        Ok(frame)
     }
 
     /// Dispatch input only against the latest screenshot this client returned.

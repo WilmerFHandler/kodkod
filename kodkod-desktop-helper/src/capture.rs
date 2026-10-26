@@ -32,6 +32,7 @@ struct CaptureInner {
     ready: Arc<AtomicBool>,
     geometry_changed: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    jpeg: Mutex<Option<kodkod_executor::view::ViewFrame>>,
 }
 
 #[derive(Default)]
@@ -99,6 +100,7 @@ impl FrameCapture {
                 ready,
                 geometry_changed,
                 worker: Mutex::new(Some(worker)),
+                jpeg: Mutex::new(None),
             }),
         };
 
@@ -192,6 +194,30 @@ impl FrameCapture {
             .write_image(&rgba, frame.width, frame.height, ExtendedColorType::Rgba8)
             .context("Could not encode portal frame as PNG")?;
         DesktopScreenshot::from_png_limited(png, MAX_SCREENSHOT_BYTES)
+    }
+
+    /// One compressed frame cache shared by every viewer; no input observation.
+    pub fn view_frame(&self) -> Result<kodkod_executor::view::ViewFrame> {
+        let frame = self.latest_frame()?;
+        let mut cache = self
+            .inner
+            .jpeg
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = cache
+            .as_ref()
+            .filter(|cached| cached.sequence == frame.sequence)
+        {
+            return Ok(cached.clone());
+        }
+        let rgba = image::RgbaImage::from_raw(frame.width, frame.height, frame_to_rgba(&frame)?)
+            .context("Invalid portal frame geometry")?;
+        let encoded = kodkod_executor::view::ViewFrame::encode(
+            image::DynamicImage::ImageRgba8(rgba),
+            frame.sequence,
+        )?;
+        *cache = Some(encoded.clone());
+        Ok(encoded)
     }
 
     pub fn stop(&self) {

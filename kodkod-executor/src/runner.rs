@@ -326,6 +326,7 @@ async fn run(
     ));
     let mut bound_attachment = None;
     let mut connection = None;
+    let mut view_worker: Option<crate::view::ViewWorker> = None;
     let mut active: Option<tokio::task::JoinHandle<DeviceReceipt>> = None;
     let mut active_identity: Option<(String, String)> = None;
     let journal = config
@@ -433,6 +434,7 @@ async fn run(
             };
             match announce(&client, &base, &token, &hello).await {
                 Ok(c) => {
+                    view_worker = None;
                     connection = Some(c.connection);
                     bound_attachment = None;
                     session = backend.app_automation_session();
@@ -454,14 +456,36 @@ async fn run(
         // Capture consent before the request. A delayed response cannot inherit
         // a newer grant after disable/re-enable.
         let epoch = generation.load(Ordering::Acquire);
+        let current_capabilities = capabilities(
+            &allowed,
+            backend.as_ref(),
+            config.capability_mask,
+            config.desktop_helper_socket.as_deref(),
+        );
+        if !current_capabilities.contains(&DeviceCapability::Desktop) {
+            view_worker = None;
+        }
+        if current_capabilities.contains(&DeviceCapability::Desktop)
+            && view_worker
+                .as_ref()
+                .is_none_or(|worker| worker.is_finished())
+        {
+            view_worker = Some(crate::view::ViewWorker::start(
+                client.clone(),
+                base.clone(),
+                token.clone(),
+                id.clone(),
+                epoch,
+                allowed.clone(),
+                generation.clone(),
+                alive.clone(),
+                config.capability_mask,
+                config.desktop_helper_socket.clone(),
+            ));
+        }
         let poll = DevicePoll {
             connection: id.clone(),
-            capabilities: capabilities(
-                &allowed,
-                backend.as_ref(),
-                config.capability_mask,
-                config.desktop_helper_socket.as_deref(),
-            ),
+            capabilities: current_capabilities,
             ready: active.is_none() && pending_receipt.is_none(),
 
             grant_generation: epoch,
@@ -596,6 +620,7 @@ async fn run(
                     .downcast_ref::<HttpFailure>()
                     .is_some_and(|failure| matches!(failure.0.as_u16(), 401 | 403 | 409))
                 {
+                    view_worker = None;
                     connection = None;
                 }
             }

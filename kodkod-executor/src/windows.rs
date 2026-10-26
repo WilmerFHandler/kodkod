@@ -396,6 +396,28 @@ fn send_input(input: ComputerInput, expected_dimensions: (u32, u32)) -> Result<(
     validate_click_against_frame(&input, expected_dimensions)?;
     match input {
         ComputerInput::Click { x, y } => send_click(x, y, expected_dimensions),
+        ComputerInput::Scroll {
+            x,
+            y,
+            delta_x,
+            delta_y,
+        } => {
+            let (dx, dy) = normalized_coordinates(x, y, expected_dimensions)?;
+            let mut inputs = vec![mouse_input(dx, dy, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)];
+            for (delta, flags) in [(-delta_y, 0x0800), (delta_x, 0x1000)] {
+                if delta != 0 {
+                    let mut input = mouse_input(0, 0, flags);
+                    input.Anonymous.mi.mouseData =
+                        (delta.signum() * (delta.unsigned_abs().div_ceil(100) as i32) * 120) as u32;
+                    inputs.push(input);
+                }
+            }
+            let inserted = submit_inputs(&inputs);
+            if inserted != inputs.len() {
+                return partial_input_error(inserted, inputs.len());
+            }
+            Ok(())
+        }
         ComputerInput::Type { text } => send_unicode_text(&text),
         ComputerInput::Key { key } => send_key(&key),
     }

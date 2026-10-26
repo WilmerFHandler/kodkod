@@ -174,3 +174,12 @@ unsafe extern "C" {
 // Standalone executors do not inherit AppKit linkage from a GUI application.
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {}
+
+/// A viewing frame never creates or replaces an input observation.
+pub(crate) fn read_only_screenshot() -> anyhow::Result<crate::computer::DesktopScreenshot> {
+    unsafe extern "C" {
+        fn CGMainDisplayID() -> u32;
+    }
+    let display = unsafe { CGMainDisplayID() };
+    crate::computer::DesktopScreenshot::from_png(capture::capture_display_png(display)?)
+}

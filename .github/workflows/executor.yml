@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libxkbcommon-dev xkb-data pkg-config
       - name: Check formatting
         run: cargo fmt --package kodkod-desktop-helper -- --check
       - name: Test helper without a desktop session

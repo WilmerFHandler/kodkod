@@ -100,6 +100,26 @@ impl Desktop {
                 let up = unsafe { CGEventCreateMouseEvent(std::ptr::null(), 2, point, 0) };
                 post_pair(down, up)?;
             }
+            ComputerInput::Scroll {
+                x,
+                y,
+                delta_x,
+                delta_y,
+            } => {
+                let point = pixel_point(
+                    x,
+                    y,
+                    observation.width,
+                    observation.height,
+                    observation.bounds,
+                )?;
+                let motion = unsafe { CGEventCreateMouseEvent(std::ptr::null(), 5, point, 0) };
+                post(motion)?;
+                let scroll = unsafe {
+                    CGEventCreateScrollWheelEvent(std::ptr::null(), 0, 2, -delta_y, -delta_x)
+                };
+                post(scroll)?;
+            }
             ComputerInput::Type { text } => {
                 let text: Vec<u16> = text.encode_utf16().collect();
                 keyboard_pair(0, 0, Some(&text))?;
@@ -201,6 +221,12 @@ fn post(event: *mut c_void) -> Result<()> {
 }
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
+    fn CGEventCreateScrollWheelEvent(
+        source: *const c_void,
+        units: u32,
+        wheels: u32,
+        ...
+    ) -> *mut c_void;
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(display: u32) -> Rect;
     fn CGEventCreateMouseEvent(

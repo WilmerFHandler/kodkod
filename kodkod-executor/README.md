@@ -167,3 +167,16 @@ cargo fmt --package kodkod-executor -- --check
 cargo test -p kodkod-executor
 cargo clippy -p kodkod-executor --all-targets -- -D warnings
 ```
+
+## Read-only viewing and scrolling
+
+Desktop-enabled executors poll a separate view channel. An active viewer starts
+one latest-frame JPEG publisher, shared across viewers; no frames are stored in
+the action journal or model context. Frames are bounded to 1600 pixels wide and
+1 MiB, with one upload in flight. Losing the connection or local desktop grant
+stops publication. The server owns viewer authorization and expiry.
+
+`computer_input` accepts `scroll` with an anchor `x`/`y` in the original
+screenshot and bounded `delta_x`/`delta_y`. Positive values move content right or
+down. The anchor must be in the fresh observed frame. Backends translate these
+units to native scrolling; wheel-only systems approximate them in wheel steps.

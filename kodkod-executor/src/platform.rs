@@ -93,6 +93,7 @@ impl Default for Desktop {
 #[cfg(target_os = "linux")]
 impl Desktop {
     pub fn with_helper_socket(helper_socket: Option<PathBuf>) -> Self {
+        let helper_socket = resolve_desktop_helper_socket(helper_socket.as_deref());
         Self {
             backend: crate::linux::LinuxDesktopBackend::new(
                 std::env::var("DISPLAY").unwrap_or_default(),
@@ -239,8 +240,8 @@ pub fn desktop_available() -> bool {
 pub fn desktop_available_with_helper(helper_socket: Option<&Path>) -> bool {
     #[cfg(target_os = "linux")]
     {
-        if let Some(socket) = helper_socket {
-            return crate::desktop_helper::status(socket).is_ok_and(|status| {
+        if let Some(socket) = resolve_desktop_helper_socket(helper_socket) {
+            return crate::desktop_helper::status(&socket).is_ok_and(|status| {
                 status.get("available").and_then(Value::as_bool) == Some(true)
                     && status.get("granted").and_then(Value::as_bool) == Some(true)
             });
@@ -259,4 +260,22 @@ pub fn desktop_available_with_helper(helper_socket: Option<&Path>) -> bool {
         let _ = helper_socket;
         false
     }
+}
+
+/// A helper is discovered only for Wayland or a headless launch, so a nested
+/// desktop cannot silently replace an explicitly selected X11 session. Probing
+/// this path never starts a portal or creates a sharing grant.
+#[cfg(target_os = "linux")]
+pub(crate) fn resolve_desktop_helper_socket(explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(socket) = explicit {
+        return Some(socket.to_owned());
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_some() {
+        return None;
+    }
+    let root = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() })));
+    Some(root.join("kodkod-desktop-helper/desktop.sock"))
 }

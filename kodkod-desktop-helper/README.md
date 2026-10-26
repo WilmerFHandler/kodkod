@@ -27,9 +27,9 @@ status only. `status` never requests permission:
 kodkod-desktop-helper status
 ```
 
-Connect the executor with `--desktop-helper-socket` pointing to
-`$XDG_RUNTIME_DIR/kodkod-desktop-helper/desktop.sock`, and include `desktop` in
-its local `--allow` list. Both the executor's grant and the desktop's portal
+The executor discovers `$XDG_RUNTIME_DIR/kodkod-desktop-helper/desktop.sock`
+inside a Wayland session, or accepts an explicit `--desktop-helper-socket`.
+Include `desktop` in its local `--allow` list. Both the executor's grant and the desktop's portal
 approval are required. A headless system service cannot borrow another user's
 graphical session.
 
@@ -37,20 +37,23 @@ The helper captures only the portal-granted PipeWire stream and sends input
 through EIS. It requires an unambiguous mapping between that stream and an
 active absolute-pointer region. It rejects stale observations and stops input
 when the granted source or its geometry changes. Restart sharing after such a
-change. Arbitrary text entry requires the compositor's EIS Text interface;
-unsupported input fails explicitly instead of guessing a keyboard layout.
+change. Text entry prefers EIS Text when available. Otherwise it preflights the
+entire string against the compositor-provided XKB keymap and current modifiers,
+then sends representable keys through EIS. Unsupported characters or ambiguous
+modifier state fail before any text is inserted; there is no clipboard fallback.
+Pointer scrolling uses the granted EIS Scroll capability and stops the gesture
+explicitly. Check `supported_inputs` before choosing an action.
 
 The socket and its parent directory must belong to the invoking user and be
 private. Only one executor connection can control the desktop at a time. Losing
 that connection releases its observation lease; uncertain actions are never
 automatically replayed.
 
-This backend does not change VM desktop defaults or implement a continuous
-video stream. Those integrations need separate live verification.
+Read-only `view_frame` requests use a separate capture channel and do not acquire
+or replace the input observation lease. JPEG encoding is cached per captured
+frame. The outbound executor publishes frames only while the server has an
+active owner-authorized viewer; closing the last viewer stops publication.
 
-On GNOME 50, live checks verified portal-approved capture, pointer clicks and
-keyboard focus/activation against a disposable GTK application. That compositor
-did not negotiate EI Text, so arbitrary UTF-8 typing and letter shortcuts remain
-unavailable there. Check `supported_inputs` on the returned screenshot before
-choosing an action. This is a capability-limited backend, not grounds to switch
-existing X11 VMs to Wayland by default.
+VM defaults remain X11. Moving guests to Wayland also requires migrating their
+persistent input connection and private-entry path; starting this helper does
+not silently change that boundary.

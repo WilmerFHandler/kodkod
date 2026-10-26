@@ -107,7 +107,10 @@ impl LinuxDesktopBackend {
     async fn send_input(&self, input: ComputerInput) -> Result<()> {
         self.ensure_x11_supported()?;
         input.validate()?;
-        if matches!(input, ComputerInput::Click { .. }) {
+        if matches!(
+            input,
+            ComputerInput::Click { .. } | ComputerInput::Scroll { .. }
+        ) {
             validate_click_against_frame(&input, self.display_dimensions().await?)?;
         }
 
@@ -119,6 +122,35 @@ impl LinuxDesktopBackend {
                 OsString::from("click"),
                 OsString::from("1"),
             ],
+            ComputerInput::Scroll {
+                x,
+                y,
+                delta_x,
+                delta_y,
+            } => {
+                let mut args = vec![
+                    OsString::from("mousemove"),
+                    x.to_string().into(),
+                    y.to_string().into(),
+                ];
+                for (delta, positive, negative) in [(delta_y, "5", "4"), (delta_x, "7", "6")] {
+                    if delta != 0 {
+                        args.extend([
+                            "click".into(),
+                            "--repeat".into(),
+                            delta.unsigned_abs().div_ceil(100).to_string().into(),
+                            "--delay".into(),
+                            "15".into(),
+                            if delta > 0 {
+                                positive.into()
+                            } else {
+                                negative.into()
+                            },
+                        ]);
+                    }
+                }
+                args
+            }
             ComputerInput::Type { text } => vec![
                 OsString::from("type"),
                 OsString::from("--delay"),

@@ -3,7 +3,10 @@
 //! Portal-scoped EIS input. The actor owns the EI connection for the lifetime
 //! of the portal session and never falls back to D-Bus Notify* methods.
 
-use crate::portal::PortalHealth;
+use crate::{
+    keymap::{KeyboardMap, Modifiers, Stroke},
+    portal::PortalHealth,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use kodkod_executor::{computer::ComputerInput, desktop_helper::HelperInputs};
@@ -12,6 +15,7 @@ use reis::{
     event::{Device as EisDevice, EiEvent, EiEventConverter},
     tokio::EiEventStream,
 };
+use std::{cell::RefCell, rc::Rc};
 use std::{
     collections::HashMap,
     os::unix::net::UnixStream,
@@ -36,6 +40,7 @@ const LEFT_MOUSE_BUTTON_EVDEV: u32 = 0x110;
 pub struct InputHealth {
     open: Arc<AtomicBool>,
     pointer: Arc<AtomicBool>,
+    scroll: Arc<AtomicBool>,
     keyboard: Arc<AtomicBool>,
     text: Arc<AtomicBool>,
 }
@@ -45,6 +50,7 @@ impl InputHealth {
         Self {
             open: Arc::new(AtomicBool::new(false)),
             pointer: Arc::new(AtomicBool::new(false)),
+            scroll: Arc::new(AtomicBool::new(false)),
             keyboard: Arc::new(AtomicBool::new(false)),
             text: Arc::new(AtomicBool::new(false)),
         }
@@ -60,6 +66,7 @@ impl InputHealth {
 
     pub fn capabilities(&self) -> HelperInputs {
         HelperInputs {
+            scroll: self.scroll.load(Ordering::Acquire),
             pointer: self.pointer.load(Ordering::Acquire),
             keyboard: self.keyboard.load(Ordering::Acquire),
             text: self.text.load(Ordering::Acquire),
@@ -68,6 +75,7 @@ impl InputHealth {
 
     fn clear_capabilities(&self) {
         self.pointer.store(false, Ordering::Release);
+        self.scroll.store(false, Ordering::Release);
         self.keyboard.store(false, Ordering::Release);
         self.text.store(false, Ordering::Release);
     }
@@ -180,6 +188,7 @@ struct TrackedDevice {
     device: EisDevice,
     active: bool,
     emulating: bool,
+    modifiers: Modifiers,
 }
 
 #[derive(Clone, Copy)]
@@ -195,6 +204,7 @@ struct PointerControl {
     device: EisDevice,
     absolute: ei::PointerAbsolute,
     button: ei::Button,
+    scroll: Option<ei::Scroll>,
     region: RegionRect,
 }
 
@@ -202,6 +212,7 @@ struct PointerControl {
 struct KeyboardControl {
     device: EisDevice,
     keyboard: ei::Keyboard,
+    mapping: Option<Rc<RefCell<KeyboardMap>>>,
 }
 
 #[derive(Clone)]
@@ -403,6 +414,7 @@ fn handle_event_result(
                 use reis::event::DeviceCapability;
                 let mut capabilities = DeviceCapability::PointerAbsolute
                     | DeviceCapability::Button
+                    | DeviceCapability::Scroll
                     | DeviceCapability::Keyboard;
                 if text_negotiated {
                     capabilities |= DeviceCapability::Text;
@@ -429,6 +441,7 @@ fn handle_event_result(
                         device,
                         active: false,
                         emulating: false,
+                        modifiers: Modifiers::default(),
                     },
                 );
                 saw_initial_lifecycle = true;
@@ -483,6 +496,23 @@ fn handle_event_result(
                 }
                 saw_initial_lifecycle = true;
                 lifecycle_changed = true;
+            }
+            EiEvent::KeyboardModifiers(event) => {
+                let modifiers = Modifiers {
+                    depressed: event.depressed,
+                    latched: event.latched,
+                    locked: event.locked,
+                    group: event.group,
+                };
+                if let Some(tracked) = devices.get_mut(&event.device) {
+                    tracked.modifiers = modifiers;
+                }
+                if let Some(keyboard) = controls.keyboard.as_mut()
+                    && keyboard.device == event.device
+                    && let Some(mapping) = &keyboard.mapping
+                {
+                    mapping.borrow_mut().modifiers = modifiers;
+                }
             }
             EiEvent::Disconnected(_) => {
                 health.clear_capabilities();
@@ -542,6 +572,7 @@ fn select_controls(
                         device: device.clone(),
                         absolute: absolute.clone(),
                         button: button.clone(),
+                        scroll: device.interface::<ei::Scroll>(),
                         region: RegionRect {
                             x: region.x,
                             y: region.y,
@@ -556,6 +587,9 @@ fn select_controls(
             keyboard_candidates.push(KeyboardControl {
                 device: device.clone(),
                 keyboard,
+                mapping: read_keymap(device, tracked.modifiers)
+                    .ok()
+                    .map(|map| Rc::new(RefCell::new(map))),
             });
         }
         if text_negotiated && let Some(text) = device.interface::<ei::Text>() {
@@ -574,15 +608,27 @@ fn select_controls(
 }
 
 fn publish_capabilities(health: &InputHealth, controls: &InputControls) {
+    health.scroll.store(
+        controls
+            .pointer
+            .as_ref()
+            .is_some_and(|pointer| pointer.scroll.is_some()),
+        Ordering::Release,
+    );
     health
         .pointer
         .store(controls.pointer.is_some(), Ordering::Release);
     health
         .keyboard
         .store(controls.keyboard.is_some(), Ordering::Release);
-    health
-        .text
-        .store(controls.text.is_some(), Ordering::Release);
+    health.text.store(
+        controls.text.is_some()
+            || controls
+                .keyboard
+                .as_ref()
+                .is_some_and(|keyboard| keyboard.mapping.is_some()),
+        Ordering::Release,
+    );
 }
 
 fn controls_alive(controls: &InputControls) -> bool {
@@ -638,17 +684,57 @@ fn send_input(
                 );
             }
         }
-        ComputerInput::Type { text } => {
-            let text_control = controls
-                .text
+        ComputerInput::Scroll {
+            x,
+            y,
+            delta_x,
+            delta_y,
+        } => {
+            let pointer = controls.pointer.as_ref().context("Pointer unavailable")?;
+            let scroll = pointer
+                .scroll
                 .as_ref()
-                .context("The active keyboard does not provide negotiated ei_text support")?;
-            let chunks = prepare_utf8_chunks(&text)?;
-            for chunk in chunks {
-                ensure_authorized(authorized, portal_health, health)?;
-                text_control.text.utf8(chunk);
-                frame(context, &text_control.device, connection.serial())
-                    .context("Text may have been inserted; do not replay it")?;
+                .context("Scrolling is unavailable on this device")?;
+            let (x, y) = pixel_to_region(x, y, frame_dimensions, pointer.region)?;
+            ensure_authorized(authorized, portal_health, health)?;
+            pointer.absolute.motion_absolute(x, y);
+            frame(context, &pointer.device, connection.serial())?;
+            ensure_authorized(authorized, portal_health, health)?;
+            scroll.scroll(delta_x as f32, delta_y as f32);
+            let result = frame(context, &pointer.device, connection.serial());
+            scroll.scroll_stop(u32::from(delta_x != 0), u32::from(delta_y != 0), 0);
+            let stopped = frame(context, &pointer.device, connection.serial());
+            result.context("Scroll may have started; do not replay it")?;
+            stopped.context("Scroll stop failed; inspect before repeating")?;
+        }
+        ComputerInput::Type { text } => {
+            if let Some(text_control) = controls.text.as_ref() {
+                let chunks = prepare_utf8_chunks(&text)?;
+                for chunk in chunks {
+                    ensure_authorized(authorized, portal_health, health)?;
+                    text_control.text.utf8(chunk);
+                    frame(context, &text_control.device, connection.serial())
+                        .context("Text may have been inserted; do not replay it")?;
+                }
+            } else {
+                let keyboard = controls.keyboard.as_ref().context("Keyboard unavailable")?;
+                let strokes = keyboard
+                    .mapping
+                    .as_ref()
+                    .context("Keyboard map unavailable")?
+                    .borrow()
+                    .text(&text)?;
+                for stroke in strokes {
+                    send_stroke(
+                        context,
+                        connection,
+                        keyboard,
+                        stroke,
+                        authorized,
+                        portal_health,
+                        health,
+                    )?;
+                }
             }
         }
         ComputerInput::Key { key } => {
@@ -669,21 +755,36 @@ fn send_input(
                     bail!("Key may have completed but release failed; do not replay it: {error}");
                 }
             } else {
-                let text_control = controls
-                    .text
-                    .as_ref()
-                    .context("This named key chord requires negotiated ei_text keysym support")?;
-                let (modifier, keysym) = named_keysym(&key)?;
-                send_keysym(
-                    context,
-                    connection,
-                    text_control,
-                    modifier,
-                    keysym,
-                    authorized,
-                    portal_health,
-                    health,
-                )?;
+                if let Some(text_control) = controls.text.as_ref() {
+                    let (modifier, keysym) = named_keysym(&key)?;
+                    send_keysym(
+                        context,
+                        connection,
+                        text_control,
+                        modifier,
+                        keysym,
+                        authorized,
+                        portal_health,
+                        health,
+                    )?;
+                } else {
+                    let keyboard = controls.keyboard.as_ref().context("Keyboard unavailable")?;
+                    let stroke = keyboard
+                        .mapping
+                        .as_ref()
+                        .context("Keyboard map unavailable")?
+                        .borrow()
+                        .chord(&key)?;
+                    send_stroke(
+                        context,
+                        connection,
+                        keyboard,
+                        stroke,
+                        authorized,
+                        portal_health,
+                        health,
+                    )?;
+                }
             }
         }
     }
@@ -691,6 +792,63 @@ fn send_input(
         authorized.load(Ordering::Acquire),
         "Input may have completed before the IPC client disconnected; do not replay it"
     );
+    Ok(())
+}
+
+fn read_keymap(device: &EisDevice, modifiers: Modifiers) -> Result<KeyboardMap> {
+    use std::os::unix::fs::FileExt;
+    let keymap = device.keymap().context("No compositor keyboard map")?;
+    anyhow::ensure!(
+        keymap.type_ == ei::keyboard::KeymapType::Xkb
+            && keymap.size > 0
+            && keymap.size <= 1024 * 1024,
+        "Invalid compositor keyboard map"
+    );
+    let file = std::fs::File::from(keymap.fd.try_clone()?);
+    let mut bytes = vec![0; keymap.size as usize];
+    file.read_exact_at(&mut bytes, 0)?;
+    if bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    KeyboardMap::parse(String::from_utf8(bytes)?, modifiers)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_stroke(
+    context: &ei::Context,
+    connection: &reis::event::Connection,
+    keyboard: &KeyboardControl,
+    stroke: Stroke,
+    authorized: &AtomicBool,
+    portal_health: &PortalHealth,
+    health: &InputHealth,
+) -> Result<()> {
+    let mut pressed = Vec::new();
+    let result: Result<()> = (|| {
+        for key in stroke
+            .modifiers
+            .into_iter()
+            .chain(std::iter::once(stroke.key))
+        {
+            ensure_authorized(authorized, portal_health, health)?;
+            keyboard.keyboard.key(key, ei::keyboard::KeyState::Press);
+            pressed.push(key);
+            frame(context, &keyboard.device, connection.serial())?;
+        }
+        Ok(())
+    })();
+    // Releases are mandatory even after cancellation, and touch only keys that
+    // this helper pressed. Existing user-held modifiers are never released.
+    let mut release_error = None;
+    for key in pressed.into_iter().rev() {
+        if let Err(error) = release_evdev_key(context, connection, keyboard, key) {
+            release_error = Some(error);
+        }
+    }
+    result.context("Keyboard action may have started; do not replay it")?;
+    if let Some(error) = release_error {
+        return Err(error).context("Keyboard release failed; inspect before repeating");
+    }
     Ok(())
 }
 
@@ -900,7 +1058,10 @@ fn monotonic_micros() -> Result<u64> {
 
 fn send_input_capability_error(input: &ComputerInput, capabilities: HelperInputs) -> Result<()> {
     match input {
-        ComputerInput::Click { .. } if !capabilities.pointer => {
+        ComputerInput::Scroll { .. } if !capabilities.scroll => {
+            bail!("Scrolling is not available on this device")
+        }
+        ComputerInput::Click { .. } | ComputerInput::Scroll { .. } if !capabilities.pointer => {
             bail!("No unique active absolute-pointer region maps to this screen stream")
         }
         ComputerInput::Type { .. } if !capabilities.text => {
@@ -966,6 +1127,7 @@ mod tests {
     #[test]
     fn text_negotiation_is_independent_of_physical_keyboard() {
         let physical = HelperInputs {
+            scroll: false,
             pointer: true,
             keyboard: true,
             text: false,
@@ -998,6 +1160,7 @@ mod tests {
             .is_err()
         );
         let text_only = HelperInputs {
+            scroll: false,
             pointer: false,
             keyboard: false,
             text: true,

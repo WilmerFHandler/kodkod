@@ -10,5 +10,6 @@ pub mod macos;
 mod platform;
 pub mod protocol;
 pub mod runner;
+pub mod view;
 #[cfg(windows)]
 pub mod windows;

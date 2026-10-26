@@ -4,6 +4,8 @@ mod capture;
 #[cfg(target_os = "linux")]
 mod input;
 #[cfg(target_os = "linux")]
+mod keymap;
+#[cfg(target_os = "linux")]
 mod portal;
 #[cfg(target_os = "linux")]
 mod server;

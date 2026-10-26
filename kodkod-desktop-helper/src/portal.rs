@@ -320,6 +320,17 @@ impl PortalDesktop {
         Ok(screenshot)
     }
 
+    pub async fn view_frame(&self) -> Result<kodkod_executor::view::ViewFrame> {
+        anyhow::ensure!(self.health.is_ready(), "Desktop sharing is unavailable");
+        let capture = self.capture.clone();
+        let frame = tokio::task::spawn_blocking(move || capture.view_frame()).await??;
+        anyhow::ensure!(
+            self.health.is_ready(),
+            "Desktop sharing was revoked during capture"
+        );
+        Ok(frame)
+    }
+
     /// Sends one action against the screenshot dimensions the caller already
     /// validated by observation ID. Pointer pixels are mapped only through the
     /// unique active EIS region whose mapping_id matches this portal stream.
