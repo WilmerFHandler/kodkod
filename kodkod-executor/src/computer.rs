@@ -511,17 +511,41 @@ mod tests {
 
     #[test]
     fn a_single_scroll_axis_defaults_the_other_to_zero() {
-        for (args,expected_x,expected_y) in [
-            (serde_json::json!({"action":"scroll","x":967,"y":682,"delta_y":605}),0,605),
-            (serde_json::json!({"action":"scroll","x":10,"y":20,"delta_x":-100}),-100,0),
+        for (args, expected_x, expected_y) in [
+            (
+                serde_json::json!({"action":"scroll","x":967,"y":682,"delta_y":605}),
+                0,
+                605,
+            ),
+            (
+                serde_json::json!({"action":"scroll","x":10,"y":20,"delta_x":-100}),
+                -100,
+                0,
+            ),
         ] {
-            let input:ComputerInput=serde_json::from_value(args).unwrap();input.validate().unwrap();
-            assert!(matches!(input,ComputerInput::Scroll{delta_x,delta_y,..} if delta_x==expected_x&&delta_y==expected_y));
+            let input: ComputerInput = serde_json::from_value(args).unwrap();
+            input.validate().unwrap();
+            assert!(
+                matches!(input,ComputerInput::Scroll{delta_x,delta_y,..} if delta_x==expected_x&&delta_y==expected_y)
+            );
         }
-        for args in [serde_json::json!({"action":"scroll","x":10,"y":20}),serde_json::json!({"action":"scroll","x":10,"y":20,"delta_y":5000})] {
-            assert!(serde_json::from_value::<ComputerInput>(args).unwrap().validate().is_err());
+        for args in [
+            serde_json::json!({"action":"scroll","x":10,"y":20}),
+            serde_json::json!({"action":"scroll","x":10,"y":20,"delta_y":5000}),
+        ] {
+            assert!(
+                serde_json::from_value::<ComputerInput>(args)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
         }
-        assert!(serde_json::from_value::<ComputerInput>(serde_json::json!({"action":"scroll","x":10,"y":20,"delta_y":5,"unexpected":true})).is_err());
+        assert!(
+            serde_json::from_value::<ComputerInput>(
+                serde_json::json!({"action":"scroll","x":10,"y":20,"delta_y":5,"unexpected":true})
+            )
+            .is_err()
+        );
     }
     #[test]
     fn scrolling_is_bounded_and_uses_the_observed_region() {

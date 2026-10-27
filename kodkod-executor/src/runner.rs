@@ -367,36 +367,15 @@ async fn run(
             }
         }
         if active.as_ref().is_some_and(|a| a.is_finished()) {
-            let task = active.take().unwrap();
-            match task.await {
-                Ok(receipt) => {
-                    active_identity = None;
-                    retain_receipt_or_queue(
-                        &journal,
-                        receipt,
-                        &mut receipts,
-                        &mut pending_receipt,
-                        &transport_error,
-                    );
-                }
-                Err(_) => {
-                    if let Some((connection, attempt)) = active_identity.take() {
-                        retain_receipt_or_queue(
-                            &journal,
-                            DeviceReceipt {
-                                connection,
-                                attempt,
-                                result: Err(
-                                    "Executor action task stopped unexpectedly; outcome may be uncertain. Inspect before repeating.".into(),
-                                ),
-                            },
-                            &mut receipts,
-                            &mut pending_receipt,
-                            &transport_error,
-                        );
-                    }
-                }
-            }
+            let result = active.take().unwrap().await;
+            retain_completed_action(
+                &journal,
+                result,
+                &mut active_identity,
+                &mut receipts,
+                &mut pending_receipt,
+                &transport_error,
+            );
         }
         retry_pending_receipt_save(
             &journal,
@@ -625,7 +604,20 @@ async fn run(
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(result) = wait_for_action_or_tick(&mut active, Duration::from_millis(500)).await
+        {
+            // The join output was consumed exactly once by the completion
+            // branch. Clear its handle before admitting another operation.
+            active = None;
+            retain_completed_action(
+                &journal,
+                result,
+                &mut active_identity,
+                &mut receipts,
+                &mut pending_receipt,
+                &transport_error,
+            );
+        }
     }
     if let Some(task) = active {
         let receipt = settle_action_task(
@@ -652,6 +644,48 @@ async fn run(
     )
     .await;
     Ok(())
+}
+
+type ActionCompletion = std::result::Result<DeviceReceipt, tokio::task::JoinError>;
+
+/// The heartbeat remains bounded, but a completed action doesn't wait for it.
+/// Dropping a pending JoinHandle borrow on a tick leaves the task and result
+/// intact for the next iteration.
+async fn wait_for_action_or_tick(
+    active: &mut Option<tokio::task::JoinHandle<DeviceReceipt>>,
+    interval: Duration,
+) -> Option<ActionCompletion> {
+    match active.as_mut() {
+        Some(task) => tokio::select! { biased;
+            result = task => Some(result),
+            _ = tokio::time::sleep(interval) => None,
+        },
+        None => {
+            tokio::time::sleep(interval).await;
+            None
+        }
+    }
+}
+
+fn retain_completed_action(
+    journal: &Path,
+    result: ActionCompletion,
+    identity: &mut Option<(String, String)>,
+    receipts: &mut std::collections::VecDeque<DeviceReceipt>,
+    pending: &mut Option<PendingReceiptSave>,
+    status: &std::sync::Mutex<Option<String>>,
+) {
+    let identity = identity.take();
+    let receipt = match result {
+        Ok(receipt) => Some(receipt),
+        Err(_) => identity.map(|(connection, attempt)| DeviceReceipt {
+            connection, attempt,
+            result: Err("Executor action task stopped unexpectedly; outcome may be uncertain. Inspect before repeating.".into()),
+        }),
+    };
+    if let Some(receipt) = receipt {
+        retain_receipt_or_queue(journal, receipt, receipts, pending, status);
+    }
 }
 
 async fn settle_action_task(
@@ -1032,6 +1066,114 @@ async fn execute_once(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn completion_wakes_before_heartbeat_and_saves_one_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = DeviceReceipt {
+            connection: "fixture".into(),
+            attempt: uuid::Uuid::new_v4().to_string(),
+            result: Ok(json!({"stdout":"done"})),
+        };
+        let result = expected.clone();
+        let mut active = Some(tokio::spawn(async move { result }));
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_action_or_tick(&mut active, Duration::from_secs(3600)),
+        )
+        .await
+        .expect("completion must wake before the heartbeat")
+        .unwrap();
+        active.take();
+        let mut identity = Some((expected.connection.clone(), expected.attempt.clone()));
+        let mut queued = std::collections::VecDeque::new();
+        let mut pending = None;
+        retain_completed_action(
+            directory.path(),
+            result,
+            &mut identity,
+            &mut queued,
+            &mut pending,
+            &std::sync::Mutex::new(None),
+        );
+        assert!(identity.is_none());
+        assert!(pending.is_none());
+        assert_eq!(queued.len(), 1);
+        let durable = load_receipts(directory.path()).unwrap();
+        assert_eq!(durable.len(), 1);
+        assert_eq!(durable[0].attempt, expected.attempt);
+        assert_eq!(durable[0].result, expected.result);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_preserves_pending_action_and_its_later_result() {
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let mut active = Some(tokio::spawn(async move {
+            wait.await.unwrap();
+            DeviceReceipt {
+                connection: "fixture".into(),
+                attempt: "same-action".into(),
+                result: Ok(json!({})),
+            }
+        }));
+        assert!(
+            wait_for_action_or_tick(&mut active, Duration::ZERO)
+                .await
+                .is_none()
+        );
+        assert!(!active.as_ref().unwrap().is_finished());
+        release.send(()).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_action_or_tick(&mut active, Duration::from_secs(3600)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.attempt, "same-action");
+        active.take();
+    }
+
+    #[tokio::test]
+    async fn failed_completion_preserves_uncertain_identity_durably() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut active = Some(tokio::spawn(std::future::pending::<DeviceReceipt>()));
+        active.as_ref().unwrap().abort();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_action_or_tick(&mut active, Duration::from_secs(3600)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        active.take();
+        assert!(result.is_err());
+        let attempt = uuid::Uuid::new_v4().to_string();
+        let mut identity = Some(("fixture".into(), attempt.clone()));
+        let mut queued = std::collections::VecDeque::new();
+        let mut pending = None;
+        retain_completed_action(
+            directory.path(),
+            result,
+            &mut identity,
+            &mut queued,
+            &mut pending,
+            &std::sync::Mutex::new(None),
+        );
+        assert!(identity.is_none());
+        assert!(pending.is_none());
+        assert_eq!(queued.len(), 1);
+        let durable = load_receipts(directory.path()).unwrap();
+        assert_eq!(durable[0].attempt, attempt);
+        assert!(
+            durable[0]
+                .result
+                .as_ref()
+                .unwrap_err()
+                .contains("outcome may be uncertain")
+        );
+    }
+
     #[test]
     fn device_transport_failure_does_not_change_local_consent_controls() {
         let dir = tempfile::tempdir().unwrap();
