@@ -27,6 +27,7 @@ pub struct CommandRequest {
     pub max_output_bytes: usize,
     /// Environment variables the caller wants withheld from the child.
     pub env_remove: Vec<OsString>,
+    pub environment: std::collections::BTreeMap<String, String>,
 }
 
 impl CommandRequest {
@@ -37,6 +38,7 @@ impl CommandRequest {
             timeout_ms: DEFAULT_COMMAND_TIMEOUT_MS,
             max_output_bytes: DEFAULT_COMMAND_OUTPUT_BYTES,
             env_remove: Vec::new(),
+            environment: Default::default(),
         }
     }
 
@@ -115,6 +117,7 @@ pub async fn run(request: CommandRequest) -> Result<CommandOutput> {
     for name in &request.env_remove {
         command.env_remove(name);
     }
+    command.envs(&request.environment);
     #[cfg(unix)]
     command.process_group(0);
     #[cfg(windows)]

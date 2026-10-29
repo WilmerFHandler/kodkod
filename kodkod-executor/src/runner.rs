@@ -12,6 +12,9 @@ use std::{
     time::Duration,
 };
 
+pub type CommandEnvironment =
+    fn(&Value, &str) -> Result<std::collections::BTreeMap<String, String>>;
+
 /// Caller-owned connection and storage configuration; no model credentials are required.
 #[derive(Clone)]
 pub struct ExecutorConfig {
@@ -24,6 +27,7 @@ pub struct ExecutorConfig {
     pub allow_insecure_http: bool,
     pub desktop_helper_socket: Option<PathBuf>,
     pub env_remove: Vec<std::ffi::OsString>,
+    pub command_environment: Option<CommandEnvironment>,
 }
 impl ExecutorConfig {
     pub fn new(server: String, token: String, state_dir: PathBuf) -> Self {
@@ -37,6 +41,7 @@ impl ExecutorConfig {
             allow_insecure_http: false,
             desktop_helper_socket: None,
             env_remove: Vec::new(),
+            command_environment: None,
         }
     }
     pub fn validate(&self) -> Result<()> {
@@ -507,7 +512,7 @@ async fn run(
         }
         match response {
             Ok(DevicePollResult {
-                operation: Some(op),
+                operation: Some(mut op),
                 ..
             }) if pending_receipt.is_none() => {
                 if generation.load(Ordering::Acquire) != epoch {
@@ -558,6 +563,8 @@ async fn run(
                 let alive = alive.clone();
                 let backend = backend.clone();
                 let journal = journal.clone();
+                // The context may carry credentials, so it never reaches the journal.
+                let context = std::mem::take(&mut op.context);
                 let access = ExecutionAccess {
                     session,
                     allowed: allowed.clone(),
@@ -568,6 +575,9 @@ async fn run(
                     capability_mask: config.capability_mask,
                     desktop_helper_socket: config.desktop_helper_socket.clone(),
                     env_remove: config.env_remove.clone(),
+                    command_environment: config.command_environment,
+                    server: config.server.clone(),
+                    context,
                 };
                 active = Some(tokio::spawn(async move {
                     let revoked = async {
@@ -949,6 +959,9 @@ struct ExecutionAccess {
     capability_mask: u8,
     desktop_helper_socket: Option<PathBuf>,
     env_remove: Vec<std::ffi::OsString>,
+    command_environment: Option<CommandEnvironment>,
+    server: String,
+    context: Value,
 }
 
 async fn execute_once(
@@ -966,6 +979,9 @@ async fn execute_once(
         capability_mask,
         desktop_helper_socket,
         env_remove,
+        command_environment,
+        server,
+        context,
     } = access;
     op.operation.validate()?;
     anyhow::ensure!(
@@ -1014,6 +1030,9 @@ async fn execute_once(
         DeviceAction::RunCommand { command, cwd } => {
             let mut request = crate::command::CommandRequest::shell(command, PathBuf::from(cwd));
             request.env_remove = env_remove;
+            if let Some(build) = command_environment {
+                request.environment = build(&context, &server)?;
+            }
             crate::command::run(request)
                 .await
                 .and_then(|output| Ok(serde_json::to_value(output)?))
@@ -1297,6 +1316,7 @@ mod tests {
         let journal = dir.path().join("journal");
         std::fs::create_dir(&journal).unwrap();
         let operation = DeviceOperation {
+            context: Value::Null,
             attempt: uuid::Uuid::new_v4().to_string(),
             attachment: "test".into(),
             operation: DeviceAction::RunCommand {
@@ -1323,6 +1343,9 @@ mod tests {
             capability_mask: 7,
             desktop_helper_socket: None,
             env_remove: Vec::new(),
+            command_environment: None,
+            server: String::new(),
+            context: Value::Null,
         };
         let reply = execute_once(operation.clone(), journal.clone(), access.clone())
             .await
@@ -1344,6 +1367,45 @@ mod tests {
                 .to_string()
                 .contains("refusing replay")
         );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_environment_comes_from_trusted_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal");
+        std::fs::create_dir(&journal).unwrap();
+        let operation = DeviceOperation {
+            context: Value::Null,
+            attempt: uuid::Uuid::new_v4().to_string(),
+            attachment: "test".into(),
+            operation: DeviceAction::RunCommand {
+                command: "printf %s \"$KODKOD_CONTEXT\"".into(),
+                cwd: dir.path().to_str().unwrap().into(),
+            },
+        };
+        let backend = Arc::new(FakeBackend);
+        let access = ExecutionAccess {
+            session: backend.app_automation_session(),
+            allowed: Arc::new(AtomicU8::new(1)),
+            backend,
+            desktop: Arc::new(crate::platform::Desktop::default()),
+            generation: Arc::new(AtomicU64::new(0)),
+            epoch: 0,
+            capability_mask: 7,
+            desktop_helper_socket: None,
+            env_remove: Vec::new(),
+            command_environment: Some(|context, server| {
+                Ok([(
+                    "KODKOD_CONTEXT".into(),
+                    format!("{server}:{}", context["value"].as_str().unwrap_or_default()),
+                )]
+                .into())
+            }),
+            server: "https://server.test".into(),
+            context: json!({"value": "trusted"}),
+        };
+        let reply = execute_once(operation, journal, access).await.unwrap();
+        assert_eq!(reply["stdout"], "https://server.test:trusted");
     }
     #[tokio::test]
     async fn replacement_waits_for_the_previous_executor_to_release_its_lock() {

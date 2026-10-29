@@ -1,7 +1,7 @@
 use kodkod_executor::{
     protocol::{
         DeviceAction, DeviceCapability, DeviceConnection, DeviceHello, DeviceOperation, DevicePoll,
-        DevicePollResult, DeviceReceipt,
+        DevicePollResult, DeviceReceipt, EXECUTOR_PROTOCOL_VERSION,
     },
     runner::{Executor, ExecutorConfig},
 };
@@ -188,7 +188,7 @@ fn handle_request(
     let protocol_valid = request
         .headers
         .get("x-kodkod-executor-protocol")
-        .is_some_and(|value| value == "2");
+        .is_some_and(|value| *value == EXECUTOR_PROTOCOL_VERSION.to_string());
     {
         let mut state = state.lock().unwrap();
         if !authorization_valid {
@@ -211,11 +211,8 @@ fn handle_request(
     match request.path.as_str() {
         "/v1/device-executor/connect" => {
             assert_eq!(
-                request
-                    .headers
-                    .get("x-kodkod-executor-protocol")
-                    .map(String::as_str),
-                Some("2")
+                request.headers.get("x-kodkod-executor-protocol").cloned(),
+                Some(EXECUTOR_PROTOCOL_VERSION.to_string())
             );
             let hello: DeviceHello = serde_json::from_slice(&request.body)?;
             anyhow::ensure!(hello.name == "outbound fixture", "unexpected executor name");
@@ -252,6 +249,7 @@ fn handle_request(
                     state.operation_delivered = true;
                     state.operation_count += 1;
                     Some(DeviceOperation {
+                        context: Value::Null,
                         attempt: attempt.into(),
                         attachment: "fixture-attachment".into(),
                         operation: DeviceAction::RunCommand {
