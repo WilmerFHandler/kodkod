@@ -121,12 +121,3 @@ does, so its Chat Completions protocol, vision, context, and thinking metadata
 are pinned from Kimi's first-party K3.1 docs. Vision metadata for other models
 comes from models.dev; PDF capabilities were reviewed against its 2026-09-08
 `https://models.dev/api.json` snapshot. Unknown models are not guessed.
-
-## Execution endpoints
-
-[`kodkod-executor`](kodkod-executor/README.md) is an optional standalone execution
-endpoint and embeddable library, independent of model providers and the agent
-loop. The same bounded command and native desktop backends can run on a personal
-machine or inside a VM. A host application owns authorization, agent sessions,
-and VM provisioning. Enable the facade's `executor` feature to access the library
-as `kodkod::executor`, or depend directly on the companion crate.

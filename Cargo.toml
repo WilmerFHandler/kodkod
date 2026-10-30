@@ -3,8 +3,6 @@ resolver = "2"
 members = [
     "kodkod",
     "kodkod-core",
-    "kodkod-executor",
-    "kodkod-desktop-helper",
     "kodkod-http",
     "kodkod-openai",
     "kodkod-anthropic",

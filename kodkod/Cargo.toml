@@ -11,7 +11,6 @@ categories = ["asynchronous"]
 
 [features]
 default = []
-executor = ["dep:kodkod-executor"]
 openai = ["dep:kodkod-openai", "dep:kodkod-http"]
 anthropic = ["dep:kodkod-anthropic", "dep:kodkod-http"]
 google = ["dep:kodkod-google", "dep:kodkod-http"]
@@ -25,7 +24,6 @@ providers = [
 ]
 
 [dependencies]
-kodkod-executor = { path = "../kodkod-executor", optional = true, version = "0.1.0" }
 kodkod-core = { path = "../kodkod-core", version = "0.1.0" }
 kodkod-http = { path = "../kodkod-http", optional = true, version = "0.1.0" }
 kodkod-openai = { path = "../kodkod-openai", optional = true, version = "0.1.0" }
