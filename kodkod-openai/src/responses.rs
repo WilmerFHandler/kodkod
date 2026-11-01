@@ -1132,6 +1132,7 @@ where
             let mut bytes = response.bytes_stream();
             let mut decoder = SseDecoder::default();
             let mut output = OutputAccumulator::default();
+            let mut text_part = None;
             while let Some(chunk) = bytes.next().await {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
@@ -1169,6 +1170,7 @@ where
                         }
                     };
                     if let Some(delta) = delta {
+                        let delta = separate_text_part(&event, delta, &mut text_part);
                         yield ProviderEvent::TextDelta(delta);
                     }
                     let terminal = match handle_sse_event(event, &mut output) {
@@ -1931,6 +1933,47 @@ fn handle_sse_event(
     }
 }
 
+// Deltas are chunks of one part; only a new part starts a paragraph.
+fn separate_text_part(
+    event: &SseEvent,
+    delta: String,
+    previous: &mut Option<(u64, u64)>,
+) -> String {
+    if delta.is_empty() {
+        return delta;
+    }
+    let part = serde_json::from_str::<Value>(&event.data)
+        .ok()
+        .and_then(|value| {
+            Some((
+                value.get("output_index")?.as_u64()?,
+                value.get("content_index")?.as_u64()?,
+            ))
+        });
+    match part {
+        Some(part) => {
+            let changed = previous.is_some_and(|old| old != part);
+            *previous = Some(part);
+            if changed {
+                format!("\n\n{delta}")
+            } else {
+                delta
+            }
+        }
+        None => delta,
+    }
+}
+
+fn append_text_part(text: &mut String, part: &str) {
+    if part.is_empty() {
+        return;
+    }
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str(part);
+}
+
 fn response_text_delta(event: &SseEvent) -> Result<Option<String>, OpenAiError> {
     if event.data == "[DONE]" {
         return Ok(None);
@@ -2009,10 +2052,10 @@ fn parse_output_with_profile(
                 for part in content {
                     match part.get("type").and_then(Value::as_str) {
                         Some("output_text") => {
-                            text.push_str(&required_string(part, "text")?);
+                            append_text_part(&mut text, &required_string(part, "text")?);
                         }
                         Some("refusal") => {
-                            text.push_str(&required_string(part, "refusal")?);
+                            append_text_part(&mut text, &required_string(part, "refusal")?);
                         }
                         Some(kind) => {
                             return Err(OpenAiError::Protocol(format!(
@@ -4161,5 +4204,45 @@ mod tests {
                 if mime == "application/zip"
         ));
         server.verify().await;
+    }
+}
+
+#[cfg(test)]
+mod paragraph_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn completed_text_parts_and_messages_remain_paragraphs() {
+        let output = vec![
+            json!({"type":"message", "content":[{"type":"output_text", "text":"edges."}, {"type":"output_text", "text":"The next part."}]}),
+            json!({"type":"message", "content":[{"type":"output_text", "text":""}, {"type":"refusal", "refusal":"Another message."}]}),
+        ];
+        assert_eq!(
+            parse_output_with_profile(&output, ResponsesRequestProfile::ChatGptPlan)
+                .unwrap()
+                .content(),
+            "edges.\n\nThe next part.\n\nAnother message."
+        );
+    }
+
+    #[test]
+    fn streaming_chunks_join_but_new_parts_get_paragraph_breaks() {
+        let mut previous = None;
+        let mut text = String::new();
+        for (output, part, delta) in [
+            (0, 0, "ed"),
+            (0, 0, "ges."),
+            (0, 1, "The"),
+            (0, 1, " next."),
+            (1, 0, "Last."),
+        ] {
+            let event = SseEvent {
+                event_name: None,
+                data: json!({"output_index":output, "content_index":part}).to_string(),
+            };
+            text.push_str(&separate_text_part(&event, delta.into(), &mut previous));
+        }
+        assert_eq!(text, "edges.\n\nThe next.\n\nLast.");
     }
 }
