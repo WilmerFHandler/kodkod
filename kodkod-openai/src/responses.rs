@@ -95,6 +95,14 @@ impl std::fmt::Debug for ResponsesContinuation {
     }
 }
 
+/// Optional host observation of Responses transport metadata. It cannot alter
+/// requests, decoded output or retry policy. Implementations must be fast and
+/// must not retain response content they do not need.
+pub trait ResponseObserver: Send + Sync {
+    fn headers(&self, _headers: &reqwest::header::HeaderMap) {}
+    fn sse_event(&self, _data: &str) {}
+}
+
 /// Provider for the HTTP/SSE Responses API.
 ///
 /// It uses stateless replay (`store: false`) and does not implement the newer
@@ -107,6 +115,7 @@ pub struct OpenAiResponsesProvider<M = ()> {
     profile: ResponsesRequestProfile,
     native_compaction: bool,
     request_observer: Option<Arc<dyn RequestObserver>>,
+    response_observer: Option<Arc<dyn ResponseObserver>>,
     client: reqwest::Client,
     _model: PhantomData<M>,
 }
@@ -120,6 +129,7 @@ impl<M> OpenAiResponsesProvider<M> {
             profile: ResponsesRequestProfile::default(),
             native_compaction: false,
             request_observer: None,
+            response_observer: None,
             client: reqwest::Client::new(),
             _model: PhantomData,
         }
@@ -164,6 +174,26 @@ impl<M> OpenAiResponsesProvider<M> {
     pub fn with_request_observer(mut self, observer: Arc<dyn RequestObserver>) -> Self {
         self.request_observer = Some(observer);
         self
+    }
+
+    pub fn with_response_observer(mut self, observer: Arc<dyn ResponseObserver>) -> Self {
+        self.response_observer = Some(observer);
+        self
+    }
+
+    fn observe_headers(&self, headers: &reqwest::header::HeaderMap) {
+        if let Some(observer) = &self.response_observer {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer.headers(headers)
+            }));
+        }
+    }
+
+    fn observe_sse_event(&self, data: &str) {
+        if let Some(observer) = &self.response_observer {
+            let _ =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.sse_event(data)));
+        }
     }
 
     pub fn responses_url(&self) -> &str {
@@ -759,6 +789,7 @@ where
                 return Err(CompactError::Provider(error));
             }
         };
+        self.observe_headers(response.headers());
         let status = response.status();
         if let Some(attempt) = &attempt {
             attempt.headers(status.as_u16(), response_request_id(&response));
@@ -1079,7 +1110,8 @@ where
                     Err(error)?
                 }
             };
-            let status = response.status();
+            self.observe_headers(response.headers());
+        let status = response.status();
             if let Some(attempt) = &attempt {
                 attempt.headers(status.as_u16(), response_request_id(&response));
             }
@@ -1153,6 +1185,7 @@ where
                     }
                 };
                 for event in events {
+                    self.observe_sse_event(&event.data);
                     let event_diagnostics = terminal_event_diagnostics(&event);
                     let delta = match response_text_delta(&event) {
                         Ok(delta) => delta,
@@ -2353,6 +2386,57 @@ mod tests {
             1
         );
         server.verify().await;
+    }
+
+    #[derive(Default)]
+    struct HeaderRecorder {
+        headers: std::sync::Mutex<Vec<String>>,
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ResponseObserver for HeaderRecorder {
+        fn headers(&self, headers: &reqwest::header::HeaderMap) {
+            if let Some(value) = headers.get("x-example-limit") {
+                self.headers
+                    .lock()
+                    .unwrap()
+                    .push(value.to_str().unwrap().into());
+            }
+        }
+        fn sse_event(&self, data: &str) {
+            self.events.lock().unwrap().push(data.into());
+        }
+    }
+
+    #[tokio::test]
+    async fn response_observer_sees_headers_and_raw_events() {
+        let server = MockServer::start().await;
+        let event = json!({"type": "response.output_text.delta", "delta": "hi"}).to_string();
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .insert_header("x-example-limit", "42")
+                    .set_body_string(format!(
+                        "event: response.output_text.delta\ndata: {event}\n\n"
+                    )),
+            )
+            .mount(&server)
+            .await;
+        let observer = Arc::new(HeaderRecorder::default());
+        let provider = OpenAiResponsesProvider::<TestModel>::new(format!("{}/v1", server.uri()))
+            .with_response_observer(observer.clone());
+        let conversation = Conversation::new();
+        let continuation = ResponsesContinuation::default();
+        let mut stream = provider.complete_stream(&continuation, &TestModel, &conversation, &[]);
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            ProviderEvent::TextDelta(_)
+        ));
+        drop(stream);
+        assert_eq!(*observer.headers.lock().unwrap(), ["42"]);
+        assert_eq!(*observer.events.lock().unwrap(), [event]);
     }
 
     #[tokio::test]

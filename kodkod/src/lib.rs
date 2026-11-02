@@ -16,4 +16,3 @@ pub use kodkod_google as google;
 
 #[cfg(feature = "providers")]
 pub use kodkod_providers as providers;
-

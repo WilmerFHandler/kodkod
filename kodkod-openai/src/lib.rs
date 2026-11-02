@@ -17,5 +17,6 @@ pub use kodkod_http::{
 pub use model::{OpenAiModel, OpenAiRequestOptions};
 pub use provider::OpenAiCompatibleProvider;
 pub use responses::{
-    OpenAiResponsesProvider, ResponsesContinuation, ResponsesRequestProfile, responses_url,
+    OpenAiResponsesProvider, ResponseObserver, ResponsesContinuation, ResponsesRequestProfile,
+    responses_url,
 };
