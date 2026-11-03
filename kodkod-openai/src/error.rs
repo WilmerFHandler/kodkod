@@ -20,6 +20,8 @@ pub enum OpenAiError {
     },
     Json(serde_json::Error),
     EmptyResponse,
+    /// A Responses API stream completed with neither text nor tool calls.
+    EmptyOutput,
     Credentials(CredentialError),
     UnsupportedDocument {
         provider: &'static str,
@@ -82,6 +84,7 @@ impl fmt::Display for OpenAiError {
             },
             Self::Json(error) => write!(f, "failed to parse response: {error}"),
             Self::EmptyResponse => f.write_str("chat completion returned no choices"),
+            Self::EmptyOutput => f.write_str("completed response contained no assistant output"),
             Self::Credentials(error) => write!(f, "credentials unavailable: {error}"),
             Self::UnsupportedDocument { provider, mime } => {
                 write!(
@@ -144,6 +147,8 @@ impl Retryable for OpenAiError {
             Self::ResponseFailed { code, message } => {
                 is_retryable_response_failure(code.as_deref(), message)
             }
+            // Transient model quirk (e.g. reasoning-only output); a fresh attempt usually answers.
+            Self::EmptyOutput => true,
             Self::Json(_)
             | Self::EmptyResponse
             | Self::Credentials(_)
@@ -233,6 +238,7 @@ mod tests {
     #[test]
     fn non_retryable_parse_errors() {
         assert!(!OpenAiError::EmptyResponse.is_retryable());
+        assert!(OpenAiError::EmptyOutput.is_retryable());
     }
 
     #[test]

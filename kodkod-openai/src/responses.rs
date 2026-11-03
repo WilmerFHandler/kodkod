@@ -359,9 +359,10 @@ fn failure_kind(error: &OpenAiError) -> RequestFailureKind {
         OpenAiError::Api { status, .. } => RequestFailureKind::HttpStatus(*status),
         OpenAiError::ResponseFailed { .. } => RequestFailureKind::ProviderResponse,
         OpenAiError::Incomplete { .. } => RequestFailureKind::Incomplete,
-        OpenAiError::Json(_) | OpenAiError::EmptyResponse | OpenAiError::Protocol(_) => {
-            RequestFailureKind::Protocol
-        }
+        OpenAiError::Json(_)
+        | OpenAiError::EmptyResponse
+        | OpenAiError::EmptyOutput
+        | OpenAiError::Protocol(_) => RequestFailureKind::Protocol,
         OpenAiError::Credentials(_)
         | OpenAiError::UnsupportedDocument { .. }
         | OpenAiError::DocumentLimitExceeded { .. } => RequestFailureKind::Unknown,
@@ -2134,9 +2135,7 @@ fn parse_output_with_profile(
         }
     }
     if text.is_empty() && calls.is_empty() {
-        return Err(OpenAiError::Protocol(
-            "completed response contained no assistant output".into(),
-        ));
+        return Err(OpenAiError::EmptyOutput);
     }
     Ok(AssistantMessage::new(text).with_tool_calls(calls))
 }
@@ -2681,6 +2680,55 @@ mod tests {
             diagnostic.event,
             RequestDiagnosticEvent::Abandoned { .. }
         )));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn empty_completed_response_is_retried_once() {
+        let server = MockServer::start().await;
+        let sse = |output: Value| {
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(completed_with_usage(
+                    output,
+                    json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}),
+                ))
+        };
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(sse(json!([{"type":"reasoning","summary":[]}])))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(sse(json!([{
+                "type":"message", "role":"assistant",
+                "content":[{"type":"output_text", "text":"done"}]
+            }])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = RetryProvider::with_policy(
+            OpenAiResponsesProvider::<TestModel>::new(format!("{}/v1", server.uri())),
+            RetryPolicy {
+                max_attempts: 2,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+                backoff_multiplier: 1.0,
+            },
+        );
+        let completion = provider
+            .complete_with_usage(
+                &ResponsesContinuation::default(),
+                &TestModel,
+                &Conversation::new(),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(completion.message.content(), "done");
         server.verify().await;
     }
 
