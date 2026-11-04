@@ -106,6 +106,7 @@ impl kodkod_openai::OpenAiModel for OptionsCodexModel {
         kodkod_openai::OpenAiRequestOptions {
             reasoning_effort: Some("future-effort".into()),
             service_tier: Some("burst".into()),
+            prompt_cache_key: None,
         }
     }
 }

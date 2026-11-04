@@ -1370,6 +1370,9 @@ fn build_request_for_endpoint(
     if let Some(tier) = options.service_tier {
         request["service_tier"] = Value::String(tier);
     }
+    if let Some(key) = options.prompt_cache_key {
+        request["prompt_cache_key"] = Value::String(key);
+    }
     if let Some(instructions) = instructions {
         request["instructions"] = Value::String(instructions.to_owned());
     }
@@ -4223,6 +4226,7 @@ mod tests {
             crate::OpenAiRequestOptions {
                 reasoning_effort: Some("xhigh".into()),
                 service_tier: Some("fast".into()),
+                prompt_cache_key: Some("session-1".into()),
             },
             None,
             &conversation,
@@ -4233,6 +4237,21 @@ mod tests {
         assert_eq!(request["model"], "gpt-test");
         assert_eq!(request["reasoning"]["effort"], "xhigh");
         assert_eq!(request["service_tier"], "fast");
+        assert_eq!(request["prompt_cache_key"], "session-1");
+    }
+
+    #[test]
+    fn prompt_cache_key_is_omitted_unless_set() {
+        let request = build_request(
+            "gpt-test",
+            Default::default(),
+            None,
+            &Conversation::new(),
+            &[],
+            &ResponsesContinuation::default(),
+        )
+        .unwrap();
+        assert!(request.get("prompt_cache_key").is_none());
     }
 
     #[test]
@@ -4276,6 +4295,7 @@ mod tests {
             crate::OpenAiRequestOptions {
                 reasoning_effort: Some("future-effort".into()),
                 service_tier: Some("burst".into()),
+                prompt_cache_key: None,
             }
         }
     }

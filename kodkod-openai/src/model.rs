@@ -14,6 +14,10 @@ pub struct OpenAiRequestOptions {
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+    /// Opaque routing key that groups requests sharing a prompt prefix so the
+    /// provider can reuse its prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
 }
 
 /// Metadata for a model served by an OpenAI-compatible API.
@@ -60,6 +64,7 @@ mod tests {
         let options = OpenAiRequestOptions {
             reasoning_effort: Some("future-effort".into()),
             service_tier: Some("burst".into()),
+            prompt_cache_key: Some("session-1".into()),
         };
 
         let serialized = serde_json::to_value(&options).unwrap();
@@ -67,7 +72,8 @@ mod tests {
             serialized,
             json!({
                 "reasoning_effort": "future-effort",
-                "service_tier": "burst"
+                "service_tier": "burst",
+                "prompt_cache_key": "session-1"
             })
         );
         let restored: OpenAiRequestOptions = serde_json::from_value(serialized).unwrap();

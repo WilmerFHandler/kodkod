@@ -137,6 +137,7 @@ impl OpenCodeModel {
         OpenAiRequestOptions {
             reasoning_effort: self.selected_reasoning_effort.clone(),
             service_tier: None,
+            prompt_cache_key: None,
         }
     }
 }
