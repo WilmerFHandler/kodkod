@@ -730,6 +730,10 @@ fn catalog_routes_models_by_service_and_protocol() {
             .unwrap()
             .supports_pdf()
     );
+    let argon = open_code_model(OpenCodeService::Go, "gemini-4-argon").unwrap();
+    assert_eq!(argon.protocol(), Protocol::GenerateContent);
+    assert!(argon.supports_vision() && argon.supports_pdf());
+    assert_eq!(argon.context_window_tokens(), Some(1_048_576));
     let gemini = open_code_model(OpenCodeService::Go, "gemini-4-argon-contributor").unwrap();
     assert_eq!(gemini.protocol(), Protocol::GenerateContent);
     assert!(gemini.supports_vision());

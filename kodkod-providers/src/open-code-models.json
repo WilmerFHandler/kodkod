@@ -9,6 +9,16 @@
   },
   {
     "service": "go",
+    "id": "gemini-4-argon",
+    "name": "Gemini 4 Argon",
+    "protocol": "generate_content",
+    "vision": true,
+    "pdf": true,
+    "context_window_tokens": 1048576,
+    "max_output_tokens": 65536
+  },
+  {
+    "service": "go",
     "id": "gemini-4-argon-contributor",
     "name": "Gemini 4 Argon Contributor",
     "protocol": "generate_content",
