@@ -693,16 +693,18 @@ fn convert_tool_result(
     if let (Some(id), Some(object)) = (remote_id, function_response.as_object_mut()) {
         object.insert("id".to_owned(), Value::String(id));
     }
-    let mut parts = vec![json!({"functionResponse":function_response})];
-    if let ToolResultOutcome::Success(output) = result.outcome() {
-        parts.extend(
-            output
-                .images()
-                .iter()
-                .map(|image| inline_data(image.mime(), image.data())),
-        );
+    // Images go inside the function response: Gemini rejects inline data
+    // placed beside it as "requests ending with a model turn".
+    if let ToolResultOutcome::Success(output) = result.outcome()
+        && !output.images().is_empty()
+    {
+        function_response["parts"] = output
+            .images()
+            .iter()
+            .map(|image| inline_data(image.mime(), image.data()))
+            .collect();
     }
-    Ok(parts)
+    Ok(vec![json!({"functionResponse":function_response})])
 }
 
 fn find_tool_call(
@@ -1925,9 +1927,11 @@ mod tests {
                     "call-1"
                 );
                 assert_eq!(
-                    body["contents"][2]["parts"][1]["inlineData"]["data"],
+                    body["contents"][2]["parts"][0]["functionResponse"]["parts"][0]["inlineData"]
+                        ["data"],
                     "b3V0"
                 );
+                assert_eq!(body["contents"][2]["parts"].as_array().unwrap().len(), 1);
                 ResponseTemplate::new(200).set_body_string(second_response.clone())
             })
             .expect(1)
